@@ -1,0 +1,204 @@
+Import bevelbutton
+Import bevelshortcuts
+
+' Layout and handlers use Buoy's declarative Window and With conventions.
+Window DemoLayout
+    Title = "Buoy BevelButton"
+    Frame = (100, 100, 720, 480)
+    Control BevelButton push
+        Caption = "Push"
+        Tooltip = "Push button: Space or Return activates"
+        Frame = (20, 30, 150, 60)
+    End Control
+    Control BevelButton toggle
+        Caption = "Toggle"
+        ButtonStyle = BevelButtonStyle.ToggleButton
+        BevelStyle = BevelButtonBevel.Rounded
+        Frame = (190, 30, 150, 60)
+    End Control
+    Control BevelButton sticky
+        Caption = "Sticky"
+        ButtonStyle = BevelButtonStyle.StickyButton
+        BevelStyle = BevelButtonBevel.Large
+        Frame = (360, 30, 150, 60)
+    End Control
+    Control BevelButton below
+        Caption = "Below icon"
+        CaptionPosition = BevelButtonCaptionPosition.BelowIcon
+        Bold = True
+        Frame = (20, 110, 150, 100)
+    End Control
+    Control BevelButton disabled
+        Caption = "Disabled"
+        Enabled = False
+        Frame = (190, 110, 150, 60)
+    End Control
+    Control TextField field
+        Placeholder = "Move focus here during a held press"
+        Frame = (360, 120, 330, 36)
+    End Control
+    Control BevelButton dropdown
+        Caption = "Menu"
+        MenuStyle = BevelButtonMenuStyle.Down
+        Frame = (20, 240, 150, 50)
+    End Control
+    Control BevelButton split
+        Caption = "Split"
+        MenuStyle = BevelButtonMenuStyle.Right
+        SplitMenu = True
+        Frame = (190, 240, 150, 50)
+    End Control
+    Control BevelButton accept
+        Caption = "&Accept"
+        Default = True
+        BevelStyle = BevelButtonBevel.LargeRound
+        Frame = (360, 240, 150, 50)
+    End Control
+    Control BevelButton cancelButton
+        Caption = "Cancel"
+        Cancel = True
+        Frame = (530, 240, 150, 50)
+    End Control
+    Control BevelButton disclosure
+        Caption = "Details"
+        ButtonStyle = BevelButtonStyle.ToggleButton
+        BevelStyle = BevelButtonBevel.Disclosure
+        Frame = (20, 320, 150, 50)
+    End Control
+    Control BevelButton roundButton
+        Caption = "Go"
+        BevelStyle = BevelButtonBevel.Round
+        Frame = (200, 310, 70, 70)
+    End Control
+    Control BevelButton darkButton
+        Caption = "Dark appearance"
+        Appearance = BevelButtonAppearance.Dark
+        Italic = True
+        BevelStyle = BevelButtonBevel.Rounded
+        Frame = (360, 320, 200, 50)
+    End Control
+    Control Label hint
+        Text = "Tab to navigate; Down/F4 opens menus; Alt+A invokes Accept."
+        Frame = (20, 410, 670, 30)
+    End Control
+End Window
+
+Class DemoWindow Inherits DemoLayout
+    Private Property mShortcuts As BevelButtonShortcuts
+    Public Property PushCount As Integer = 0
+    Public Property ToggleCount As Integer = 0
+    Public Property StickyCount As Integer = 0
+    Public Property SplitCount As Integer = 0
+    Public Property AcceptCount As Integer = 0
+    Public Property CancelCount As Integer = 0
+
+    Handle Opening()
+        Dim icon As New Picture(24, 24)
+        icon.Graphics.FillOval(2, 2, 20, 20, Color.RGB(0.15, 0.5, 0.85))
+        Me.push.Icon = icon
+        Me.toggle.Icon = icon
+        Me.below.Icon = icon
+        Me.dropdown.Menu = MakeMenu()
+        Me.split.Menu = MakeMenu()
+        Me.mShortcuts = New BevelButtonShortcuts()
+        Me.mShortcuts.Add(Me.push)
+        Me.mShortcuts.Add(Me.toggle)
+        Me.mShortcuts.Add(Me.sticky)
+        Me.mShortcuts.Add(Me.below)
+        Me.mShortcuts.Add(Me.disabled)
+        Me.mShortcuts.Add(Me.dropdown)
+        Me.mShortcuts.Add(Me.split)
+        Me.mShortcuts.Add(Me.accept)
+        Me.mShortcuts.Add(Me.cancelButton)
+        Me.mShortcuts.Add(Me.disclosure)
+        Me.mShortcuts.Add(Me.roundButton)
+        Me.mShortcuts.Add(Me.darkButton)
+        Me.mShortcuts.Open(Me)
+    End Handle
+    Handle Opened()
+        Me.push.SetFocus()
+    End Handle
+    Handle Closed()
+        Me.mShortcuts.Close()
+        Me.push.Close()
+        Me.toggle.Close()
+        Me.sticky.Close()
+        Me.below.Close()
+        Me.disabled.Close()
+        Me.dropdown.Close()
+        Me.split.Close()
+        Me.accept.Close()
+        Me.cancelButton.Close()
+        Me.disclosure.Close()
+        Me.roundButton.Close()
+        Me.darkButton.Close()
+    End Handle
+    With push
+        Handle Action()
+            Me.PushCount += 1
+            Me.Title = "BevelButton: Push " + Str(Me.PushCount) + " False"
+        End Handle
+    End With
+    With toggle
+        Handle Action()
+            Me.ToggleCount += 1
+            Me.Title = "BevelButton: Toggle " + Str(Me.ToggleCount) + " " + Str(Me.toggle.Value)
+        End Handle
+    End With
+    With sticky
+        Handle Action()
+            Me.StickyCount += 1
+            Me.Title = "BevelButton: Sticky " + Str(Me.StickyCount) + " " + Str(Me.sticky.Value)
+        End Handle
+    End With
+    With dropdown
+        Handle MenuSelected(item As MenuItem)
+            Me.Title = "BevelButton menu: " + item.Tag
+        End Handle
+    End With
+    With split
+        Handle Action()
+            Me.SplitCount += 1
+            Me.Title = "BevelButton: Split " + Str(Me.SplitCount)
+        End Handle
+        Handle MenuSelected(item As MenuItem)
+            Me.Title = "BevelButton split menu: " + item.Tag
+        End Handle
+    End With
+    With accept
+        Handle Action()
+            Me.AcceptCount += 1
+            Me.Title = "BevelButton: Accept " + Str(Me.AcceptCount)
+        End Handle
+    End With
+    With cancelButton
+        Handle Action()
+            Me.CancelCount += 1
+            Me.Title = "BevelButton: Cancel " + Str(Me.CancelCount)
+        End Handle
+    End With
+End Class
+
+Function MakeMenu() As ContextMenu
+    Dim menu As New ContextMenu()
+    Dim first As New MenuItem()
+    first.Caption = "First action"
+    first.Tag = "first"
+    menu.AddItem(first)
+    menu.AddSeparator()
+    Dim disabled As New MenuItem()
+    disabled.Caption = "Unavailable"
+    disabled.Enabled = False
+    menu.AddItem(disabled)
+    Dim last As New MenuItem()
+    last.Caption = "Last action"
+    last.Tag = "last"
+    menu.AddItem(last)
+    Return menu
+End Function
+
+Sub Main()
+    Dim window As New DemoWindow()
+    window.Show()
+    Application.Run()
+End Sub

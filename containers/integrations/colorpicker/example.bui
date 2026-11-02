@@ -1,0 +1,78 @@
+Import colorpicker
+
+Class DemoPicker Inherits ColorPicker
+    Public Property Owner As Weak ColorDemo
+    Public Property AcceptCount As Integer = 0
+    Public Property CancelCount As Integer = 0
+    Handle Accepted(value As Color)
+        Me.AcceptCount += 1
+        Dim win As ColorDemo = Me.Owner
+        If win <> Nil Then win.Report("Accepted " + Str(Me.AcceptCount), value)
+    End Handle
+    Handle Cancelled()
+        Me.CancelCount += 1
+        Dim win As ColorDemo = Me.Owner
+        If win <> Nil Then win.Report("Cancelled " + Str(Me.CancelCount), Me.SelectedColor)
+    End Handle
+    Handle Changed(value As Color)
+        Dim win As ColorDemo = Me.Owner
+        If win <> Nil Then win.Report("Live change", value)
+    End Handle
+    Handle PanelClosed()
+        Dim win As ColorDemo = Me.Owner
+        If win <> Nil Then win.Report("Panel closed", Me.SelectedColor)
+    End Handle
+    Handle Failed(message As String)
+        Dim win As ColorDemo = Me.Owner
+        If win <> Nil Then win.status.Text = message
+    End Handle
+End Class
+
+Window ColorLayout
+    Title = "Buoy Native ColorPicker"
+    Frame = (120, 120, 560, 210)
+    Control Label description
+        Text = "Native system color selection"
+        Frame = (20, 15, 520, 25)
+    End Control
+    Control Button choose
+        Caption = "Choose Color"
+        Frame = (20, 55, 170, 35)
+    End Control
+    Control Label status
+        Text = "Ready"
+        Frame = (20, 110, 520, 25)
+    End Control
+    Control Label detail
+        Text = "GTK/Windows: accept or cancel. macOS: live color panel."
+        Frame = (20, 155, 520, 30)
+    End Control
+End Window
+Class ColorDemo Inherits ColorLayout
+    Private Property mPicker As DemoPicker
+    Handle Opening()
+        Me.mPicker = New DemoPicker()
+        Me.mPicker.Owner = Me
+        Me.mPicker.Title = "Native Color Selection"
+        Me.mPicker.SelectedColor = Color.RGB(0.2, 0.4, 0.6)
+        If Me.mPicker.SupportsAlpha Then Me.mPicker.WithAlpha = True
+    End Handle
+    With choose
+        Handle Action()
+            If Not Me.mPicker.IsOpen Then Me.mPicker.Show(Me)
+        End Handle
+    End With
+    Handle Closed()
+        Me.mPicker.Close()
+    End Handle
+    Public Sub Report(message As String, chosen As Color)
+        Me.Title = "ColorPicker " + message
+        Me.status.Text = "R=" + Str(chosen.R) + " G=" + Str(chosen.G) + " B=" + Str(chosen.B) + " A=" + Str(chosen.A)
+        Me.status.TextColor = chosen
+    End Sub
+End Class
+Sub Main()
+    Dim win As New ColorDemo()
+    win.Show()
+    Application.Run()
+End Sub

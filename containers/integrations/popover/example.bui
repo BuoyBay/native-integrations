@@ -1,0 +1,74 @@
+Import popover
+
+Class DemoPopover Inherits NativePopover
+    Public Sub Constructor(width As Integer, height As Integer)
+        Super.Constructor(width, height)
+    End Sub
+    Public Property Host As Weak Window
+    Public Property Dismissals As Integer = 0
+    Handle Dismissed()
+        Me.Dismissals += 1
+        Dim hostWindow As Window = Me.Host
+        If hostWindow <> Nil Then hostWindow.Title = "Popover dismissed " + Str(Me.Dismissals)
+    End Handle
+End Class
+
+Class PopoverField Inherits TextField
+    Public Property Host As Weak Window
+    Handle TextChanged()
+        Dim hostWindow As Window = Me.Host
+        If hostWindow <> Nil Then hostWindow.Title = "Popover text: " + Me.Text
+    End Handle
+End Class
+
+Window PopoverLayout
+    Title = "Buoy Native Popover"
+    Frame = (100, 100, 620, 330)
+    Control Button showOptions
+        Caption = "Show options"
+        Frame = (30, 40, 180, 36)
+    End Control
+    Control TextField outsideField
+        Placeholder = "Click here to dismiss the popover"
+        Frame = (30, 220, 550, 36)
+    End Control
+    Control Label help
+        Text = "Native content; Escape or click outside dismisses."
+        Frame = (30, 275, 550, 26)
+    End Control
+End Window
+Class PopoverDemo Inherits PopoverLayout
+    Private Property mPopover As DemoPopover
+    Handle Opening()
+        Me.mPopover = New DemoPopover(280, 150)
+        Me.mPopover.Host = Me
+        Dim heading As New Label()
+        heading.Text = "Native options"
+        heading.Move(16, 12, 240, 24)
+        Me.mPopover.Content.AddSubview(heading)
+        Dim query As New PopoverField()
+        query.Host = Me
+        query.Placeholder = "Type inside the popover"
+        query.Move(16, 48, 240, 32)
+        Me.mPopover.Content.AddSubview(query)
+        Dim enabled As New Checkbox()
+        enabled.Caption = "Include archived items"
+        enabled.Move(16, 96, 240, 30)
+        Me.mPopover.Content.AddSubview(enabled)
+    End Handle
+    With showOptions
+        Handle Action()
+            Me.mPopover.Show(Me.showOptions, New Rect(0, 0, Me.showOptions.Width, Me.showOptions.Height))
+            Me.Title = "Popover open"
+        End Handle
+    End With
+    Handle Closed()
+        If Me.mPopover <> Nil Then Me.mPopover.Close()
+        Me.mPopover = Nil
+    End Handle
+End Class
+Sub Main()
+    Dim win As New PopoverDemo()
+    win.Show()
+    Application.Run()
+End Sub

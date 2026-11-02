@@ -1,0 +1,181 @@
+' Read-only USB device records from the Linux sysfs USB bus.
+Public Class UsbDevice
+    Public Property SysfsName As String
+    Public Property SysfsPath As String
+    Public Property VendorId As Integer
+    Public Property ProductId As Integer
+    Public Property BusNumber As Integer
+    Public Property DeviceNumber As Integer
+    Public Property DevicePath As Optional Of String
+    Public Property Manufacturer As Optional Of String
+    Public Property Product As Optional Of String
+    Public Property SerialNumber As Optional Of String
+End Class
+
+#If TargetLinux Then
+Private Optional Declare Function COpenDirectory Lib "c" Alias "opendir" (name As CString) As Ptr
+Private Optional Declare Function CReadDirectory Lib "c" Alias "readdir" (directory As Ptr) As Ptr
+Private Optional Declare Function CCloseDirectory Lib "c" Alias "closedir" (directory As Ptr) As Int32
+Private Optional Declare Function COpen Lib "c" Alias "fopen" (name As CString, mode As CString) As Ptr
+Private Optional Declare Function CRead Lib "c" Alias "fread" (buffer As Ptr, size As UInt64, count As UInt64, stream As Ptr) As UInt64
+Private Optional Declare Function CError Lib "c" Alias "ferror" (stream As Ptr) As Int32
+Private Optional Declare Function CClose Lib "c" Alias "fclose" (stream As Ptr) As Int32
+Private Optional Declare Function CErrno Lib "c" Alias "__errno_location" () As Ptr
+Private Optional Declare Function CCopyOut Lib "c" Alias "memcpy" (ByRef code As Int32, source As Ptr, size As UInt64) As Ptr
+Private Optional Declare Function CCopyIn Lib "c" Alias "memcpy" (destination As Ptr, ByRef code As Int32, size As UInt64) As Ptr
+
+Private Function ErrorValue() As Integer
+    Dim code As Int32 = 0
+    CCopyOut(code, CErrno(), 4)
+    Return code
+End Function
+
+Private Sub ClearError()
+    Dim code As Int32 = 0
+    CCopyIn(CErrno(), code, 4)
+    ErrorValue()
+End Sub
+
+Private Sub Fail(operation As String)
+    Dim code As Integer = ErrorValue()
+    Throw New RuntimeException(operation + " failed (errno " + Str(code) + ")", code)
+End Sub
+
+Private Function Attribute(filePath As String) As Optional Of String
+    ClearError()
+    Dim stream As Ptr = COpen(CType(filePath, CString), CType("rb", CString))
+    If stream = Nil Then
+        If ErrorValue() = 2 Then
+            Return None
+        End If
+        Fail("fopen " + filePath)
+    End If
+    Try
+        Dim buffer As New Bytes(4097)
+        For i As Integer = 1 To 4097
+            buffer.Append(0)
+        Next
+        Dim count As Integer = CRead(buffer.DataPtr(), 1, 4096, stream)
+        If CError(stream) <> 0 Then
+            Fail("fread " + filePath)
+        End If
+        If count = 4096 Then
+            Throw New RuntimeException("USB attribute exceeds 4095 bytes")
+        End If
+        Dim text As String = CType(CType(buffer.DataPtr(), CString), String)
+        If String.EndsWith(text, "\n") Then
+            text = String.Left(text, String.Len(text) - 1)
+        End If
+        Return Some(text)
+    Finally
+        CClose(stream)
+    End Try
+End Function
+
+Private Function HexId(value As String) As Integer
+    If String.Len(value) <> 4 Then
+        Throw New RuntimeException("USB ID is not four hex digits")
+    End If
+    Dim number As Integer = 0
+    For i As Integer = 1 To 4
+        Dim character As Integer = String.Asc(String.LCase(value), i)
+        Dim digit As Integer = 0
+        If character >= 48 And character <= 57 Then
+            digit = character - 48
+        ElseIf character >= 97 And character <= 102 Then
+            digit = character - 87
+        Else
+            Throw New RuntimeException("USB ID contains invalid hex digits")
+        End If
+        number = number * 16 + digit
+    Next
+    Return number
+End Function
+
+Private Function RequiredNumber(filePath As String) As Optional Of Integer
+    Dim text As Optional Of String = Attribute(filePath)
+    If Not text.HasValue Then
+        Return None
+    End If
+    Dim parsed As Result Of Integer, String = Integer.Parse(text.Value)
+    If parsed.IsErr Then
+        Throw New RuntimeException("Invalid USB numeric attribute " + filePath)
+    End If
+    If parsed.Value < 0 Then
+        Throw New RuntimeException("Invalid USB numeric attribute " + filePath)
+    End If
+    Return Some(parsed.Value)
+End Function
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Enumerate a sysfs USB bus tree, including root hubs; missing/unreadable trees throw.
+Public Function Devices(sysfsRoot As String = "/sys/bus/usb/devices") As Array Of UsbDevice
+#If TargetLinux Then
+    If Not String.StartsWith(sysfsRoot, "/") Then
+        Throw New InvalidArgumentException("USB sysfs root must be absolute")
+    End If
+    Dim rootBytes As Bytes = Bytes.FromString(sysfsRoot, Text.Encodings.UTF8)
+    For i As Integer = 0 To rootBytes.Count - 1
+        If rootBytes.Item(i) = 0 Then
+            Throw New InvalidArgumentException("USB sysfs root cannot contain NUL")
+        End If
+    Next
+    ClearError()
+    Dim directory As Ptr = COpenDirectory(CType(sysfsRoot, CString))
+    If directory = Nil Then
+        Fail("opendir USB bus")
+    End If
+    Dim records As Array Of UsbDevice = []
+    Try
+        While True
+            ClearError()
+            Dim native As Ptr = CReadDirectory(directory)
+            If native = Nil Then
+                If ErrorValue() <> 0 Then
+                    Fail("readdir USB bus")
+                End If
+                Exit While
+            End If
+            Dim namePointer As Ptr = CType(CType(native, Integer) + 19, Ptr)
+            Dim entryName As String = CType(CType(namePointer, CString), String)
+            If entryName = "." Or entryName = ".." Or String.Contains(entryName, ":") Then
+                Continue While
+            End If
+            Dim base As String = sysfsRoot + "/" + entryName
+            Dim vendor As Optional Of String = Attribute(base + "/idVendor")
+            Dim productId As Optional Of String = Attribute(base + "/idProduct")
+            Dim bus As Optional Of Integer = RequiredNumber(base + "/busnum")
+            Dim device As Optional Of Integer = RequiredNumber(base + "/devnum")
+            ' Interfaces have no IDs; hot-unplugged devices can disappear mid-snapshot.
+            If Not vendor.HasValue Or Not productId.HasValue Or Not bus.HasValue Or Not device.HasValue Then
+                Continue While
+            End If
+            Dim info As New UsbDevice
+            info.SysfsName = entryName
+            info.SysfsPath = base
+            info.VendorId = HexId(vendor.Value)
+            info.ProductId = HexId(productId.Value)
+            info.BusNumber = bus.Value
+            info.DeviceNumber = device.Value
+            info.DevicePath = Attribute(base + "/devpath")
+            info.Manufacturer = Attribute(base + "/manufacturer")
+            info.Product = Attribute(base + "/product")
+            info.SerialNumber = Attribute(base + "/serial")
+            Array.Append(records, info)
+        End While
+        Return records
+    Finally
+        CCloseDirectory(directory)
+    End Try
+#Else
+    Throw New UnsupportedOperationException("linuxusb requires Linux")
+#End If
+End Function

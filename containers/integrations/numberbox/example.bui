@@ -1,0 +1,77 @@
+Import numberbox
+
+Window NumberBoxLayout
+    Title = "Buoy Native NumberBox"
+    Frame = (100, 100, 540, 280)
+    Control Label description
+        Text = "Native numeric entry with bounded values and stepping"
+        Frame = (20, 20, 500, 30)
+    End Control
+    Control NumberBox amount
+        Frame = (20, 65, 260, 38)
+    End Control
+    Control Button commitButton
+        Caption = "Commit"
+        Frame = (300, 65, 100, 38)
+    End Control
+    Control Label hint
+        Text = "Type a value, then Tab or Commit. Range: -10 to 100."
+        Frame = (20, 125, 500, 30)
+    End Control
+    Control NumberBox localized
+        Frame = (20, 170, 260, 38)
+    End Control
+    Control Label localizedHint
+        Text = "Comma decimal separator"
+        Frame = (300, 170, 220, 38)
+    End Control
+End Window
+Class NumberBoxDemo Inherits NumberBoxLayout
+    Private Property mChanges As Integer = 0
+    Private Property mRejected As Integer = 0
+    Handle Opening()
+        Me.amount.Minimum = -10.0
+        Me.amount.Maximum = 100.0
+        Me.amount.Increment = 0.25
+        Me.amount.Value = 12.5
+        Me.amount.InputControl.AccessibleLabel = "Amount"
+        Me.localized.DecimalSeparator = ","
+        Me.localized.Value = 3.5
+        Me.localized.InputControl.AccessibleLabel = "Localized amount"
+        Me.amount.Open()
+        Me.localized.Open()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.amount.RefreshNative()
+        Me.localized.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.amount.Close()
+        Me.localized.Close()
+    End Handle
+    With commitButton
+        Handle Action()
+            Me.amount.Commit()
+        End Handle
+    End With
+    With amount
+        Handle ValueChanged(newValue As Double)
+            Me.mChanges += 1
+            Me.Title = "NumberBox value=" + Str(newValue) + " changes=" + Str(Me.mChanges)
+        End Handle
+        Handle ValidationFailed(rejectedText As String)
+            Me.mRejected += 1
+            Me.Title = "NumberBox rejected=" + rejectedText + " count=" + Str(Me.mRejected)
+        End Handle
+    End With
+    With localized
+        Handle ValueChanged(newValue As Double)
+            Me.Title = "Localized value=" + Str(newValue)
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New NumberBoxDemo()
+    win.Show()
+    Application.Run()
+End Sub

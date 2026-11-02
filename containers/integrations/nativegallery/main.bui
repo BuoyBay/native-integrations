@@ -1,0 +1,15 @@
+Import gallery
+
+Sub Main(args As Array Of String)
+    Dim win As New NativeGallery()
+    For Each arg As String In args
+        If arg = "--smoke" Then
+            win.PerformOpen()
+            win.VerifyReady()
+            Print "Native gallery contracts passed"
+            Return
+        End If
+    Next
+    win.Show()
+    Application.Run()
+End Sub

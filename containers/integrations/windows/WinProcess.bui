@@ -1,0 +1,105 @@
+' Current-process diagnostics for 64-bit Windows. No handles escape the module.
+Sequential Structure ProcessMemory
+    Size As UInt32
+    PageFaultCount As UInt32
+    PeakWorkingSetBytes As UInt64
+    WorkingSetBytes As UInt64
+    PeakPagedPoolBytes As UInt64
+    PagedPoolBytes As UInt64
+    PeakNonPagedPoolBytes As UInt64
+    NonPagedPoolBytes As UInt64
+    CommitBytes As UInt64
+    PeakCommitBytes As UInt64
+    PrivateCommitBytes As UInt64
+End Structure
+
+Sequential Structure ProcessIO
+    ReadOperations As UInt64
+    WriteOperations As UInt64
+    OtherOperations As UInt64
+    ReadBytes As UInt64
+    WriteBytes As UInt64
+    OtherBytes As UInt64
+End Structure
+
+Sequential Structure NativeFileTime
+    Low As UInt32
+    High As UInt32
+End Structure
+
+Public Class ProcessSnapshot
+    Public Property CreationFileTime As UInt64
+    Public Property KernelSeconds As Double
+    Public Property UserSeconds As Double
+    Public Property HandleCount As Integer
+    Public Property Memory As ProcessMemory
+    Public Property IO As ProcessIO
+End Class
+
+#If TargetWindows Then
+Private Optional Declare Function CurrentProcess Lib "kernel32" Alias "GetCurrentProcess" () As Ptr
+Private Optional Declare Function ProcessTimes Lib "kernel32" Alias "GetProcessTimes" (process As Ptr, ByRef created As NativeFileTime, ByRef exited As NativeFileTime, ByRef kernel As NativeFileTime, ByRef user As NativeFileTime) As Int32
+Private Optional Declare Function ProcessHandles Lib "kernel32" Alias "GetProcessHandleCount" (process As Ptr, ByRef count As UInt32) As Int32
+Private Optional Declare Function ProcessMemoryInfo Lib "kernel32" Alias "K32GetProcessMemoryInfo" (process As Ptr, ByRef memory As ProcessMemory, size As UInt32) As Int32
+Private Optional Declare Function ProcessIOInfo Lib "kernel32" Alias "GetProcessIoCounters" (process As Ptr, ByRef counters As ProcessIO) As Int32
+' Import eagerly: lazy symbol resolution can overwrite the failure being read.
+Private Declare Function LastError Lib "kernel32" Alias "GetLastError" () As UInt32
+
+Private Sub Fail(operation As String)
+    Dim code As Integer = LastError()
+    Throw New RuntimeException(operation + " failed (Win32 error " + Str(code) + ")", code)
+End Sub
+
+Private Function FileTimeValue(value As NativeFileTime) As UInt64
+    Dim high As UInt64 = value.High
+    Return high * 4294967296 + value.Low
+End Function
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Sample CPU, memory, handles and IO for this process; fields are not atomic together.
+Public Function ReadCurrentProcess() As ProcessSnapshot
+#If TargetWindows Then
+    Dim process As Ptr = CurrentProcess()
+    Dim created As NativeFileTime
+    Dim exited As NativeFileTime
+    Dim kernel As NativeFileTime
+    Dim user As NativeFileTime
+    If ProcessTimes(process, created, exited, kernel, user) = 0 Then
+        Fail("GetProcessTimes")
+    End If
+    Dim handles As UInt32 = 0
+    If ProcessHandles(process, handles) = 0 Then
+        Fail("GetProcessHandleCount")
+    End If
+    Dim memory As ProcessMemory
+    memory.Size = 80
+    If ProcessMemoryInfo(process, memory, 80) = 0 Then
+        Fail("K32GetProcessMemoryInfo")
+    End If
+    Dim counters As ProcessIO
+    If ProcessIOInfo(process, counters) = 0 Then
+        Fail("GetProcessIoCounters")
+    End If
+    Dim snapshot As New ProcessSnapshot
+    snapshot.CreationFileTime = FileTimeValue(created)
+    Dim kernelTicks As Double = FileTimeValue(kernel)
+    Dim userTicks As Double = FileTimeValue(user)
+    snapshot.KernelSeconds = kernelTicks / 10000000.0
+    snapshot.UserSeconds = userTicks / 10000000.0
+    snapshot.HandleCount = handles
+    snapshot.Memory = memory
+    snapshot.IO = counters
+    ' GetCurrentProcess is a pseudo-handle; it must not be closed.
+    Return snapshot
+#Else
+    Throw New UnsupportedOperationException("WinProcess requires Windows")
+#End If
+End Function

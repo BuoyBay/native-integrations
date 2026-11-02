@@ -1,0 +1,495 @@
+' Native color selection, preserving each operating system's dialog semantics.
+Public Enum ColorPickerInteraction As Integer
+    AsyncChooser
+    ModalChooser
+    LivePanel
+End Enum
+
+Private Class ColorOperation
+    Public Property Owner As Weak ColorPicker
+    Public Property OwnerAddress As Ptr = Nil
+    Public Property Dialog As Ptr = Nil
+    Public Property Cancellable As Ptr = Nil
+End Class
+Private Class ColorOperations
+    Public Shared Property Items As Array Of ColorOperation = []
+    Public Shared Property PanelReference As ColorOperation = New ColorOperation()
+    Public Shared Property WindowsReference As ColorOperation = New ColorOperation()
+End Class
+
+Public Class ColorPicker
+    Event Accepted(value As Color)
+    Event Cancelled()
+    Event Changed(value As Color)
+    Event PanelClosed()
+    Event Failed(message As String)
+    Public Property Title As String = "Choose Color"
+    Public Property LastNativeError As String = ""
+    Private Property mColor As Color = Color.RGB(0.2, 0.5, 0.9)
+    Private Property mOpen As Boolean = False
+    Private Property mSilent As Boolean = False
+    Private Property mUpdating As Boolean = False
+    Private Property mAlpha As Boolean = False
+    Private Property mOperation As ColorOperation
+    Private Property mNative As Ptr = Nil
+    #If TargetWindows Then
+        Private Property mCustomColors As Bytes = New Bytes()
+    #ElseIf TargetMac Then
+        Private Property mTarget As Ptr = Nil
+        Private Property mOldTitle As Ptr = Nil
+        Private Property mOldAlpha As Boolean = False
+    #End If
+
+    Public Property Interaction As ColorPickerInteraction
+        Get
+            #If TargetMac Then
+                Return ColorPickerInteraction.LivePanel
+            #ElseIf TargetWindows Then
+                Return ColorPickerInteraction.ModalChooser
+            #Else
+                Return ColorPickerInteraction.AsyncChooser
+            #End If
+        End Get
+    End Property
+    Public Property SupportsAlpha As Boolean
+        Get
+            #If TargetWindows Then
+                Return False
+            #Else
+                Return True
+            #End If
+        End Get
+    End Property
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mOpen
+        End Get
+    End Property
+    Public Property WithAlpha As Boolean
+        Get
+            Return Me.mAlpha
+        End Get
+        Set
+            If Me.IsOpen Then Throw New InvalidArgumentException("Set WithAlpha before showing the picker")
+            If value And Not Me.SupportsAlpha Then Throw New UnsupportedOperationException("Win32 ChooseColor does not support alpha")
+            Me.mAlpha = value
+        End Set
+    End Property
+    Public Property SelectedColor As Color
+        Get
+            Return Color.RGBA(Me.mColor.R, Me.mColor.G, Me.mColor.B, Me.mColor.A)
+        End Get
+        Set
+            ValidateColor(value)
+            If Not Me.SupportsAlpha And value.A <> 1 Then Throw New UnsupportedOperationException("Win32 ChooseColor requires an opaque color")
+            If Me.IsOpen And Me.Interaction <> ColorPickerInteraction.LivePanel Then Throw New InvalidArgumentException("Set the initial color before showing the chooser")
+            Me.mColor = Color.RGBA(value.R, value.G, value.B, value.A)
+            #If TargetMac Then
+                If Me.mNative <> Nil Then
+                    Me.mUpdating = True
+                    MacSetColor(Me.mNative, MacColor(MacClass("NSColor"), value.R, value.G, value.B, value.A))
+                    Me.mUpdating = False
+                End If
+            #End If
+        End Set
+    End Property
+
+    ' Returns immediately on GTK/macOS; blocks until dismissal on Windows.
+    Public Sub Show(parent As Window)
+        If Me.IsOpen Then Throw New InvalidArgumentException("Color picker is already open")
+        If parent = Nil Then Throw New InvalidArgumentException("A parent window is required")
+        If parent.NativeWidget = Nil Then Throw New InvalidArgumentException("The parent needs a native window")
+        Me.LastNativeError = ""
+        Me.mSilent = False
+        #If TargetLinux Then
+            If GTKMajor() < 4 Or (GTKMajor() = 4 And GTKMinor() < 10) Then Throw New UnsupportedOperationException("GtkColorDialog requires GTK 4.10 or later")
+            Dim op As New ColorOperation()
+            op.Owner = Me
+            op.Dialog = GTKNew()
+            If op.Dialog = Nil Then Throw New RuntimeException("Could not create GtkColorDialog")
+            op.Cancellable = GCancelNew()
+            If op.Cancellable = Nil Then
+                GUnref(op.Dialog)
+                Throw New RuntimeException("Could not create cancellable")
+            End If
+            Dim id As Integer = -1
+            For i As Integer = 0 To Array.LastIndex(ColorOperations.Items)
+                If ColorOperations.Items(i) = Nil Then
+                    id = i
+                    Exit For
+                End If
+            Next
+            If id < 0 Then
+                id = Array.Count(ColorOperations.Items)
+                Array.Append(ColorOperations.Items, op)
+            Else
+                ColorOperations.Items(id) = op
+            End If
+            Try
+                GTKTitle(op.Dialog, Me.Title)
+                GTKModal(op.Dialog, 1)
+                GTKAlpha(op.Dialog, CType(Me.WithAlpha, Int32))
+                Dim initial As ColorRGBA
+                initial.Red = Me.mColor.R
+                initial.Green = Me.mColor.G
+                initial.Blue = Me.mColor.B
+                initial.Alpha = Me.mColor.A
+                Me.mOperation = op
+                Me.mOpen = True
+                GTKChoose(op.Dialog, parent.NativeWidget, initial, op.Cancellable, AddressOf ColorLinuxReady, CType(id + 1, Ptr))
+            Catch e As Exception
+                ColorOperations.Items(id) = Nil
+                GUnref(op.Cancellable)
+                GUnref(op.Dialog)
+                Me.mOperation = Nil
+                Me.mOpen = False
+                Throw e
+            End Try
+        #ElseIf TargetWindows Then
+            If ColorOperations.WindowsReference.Owner <> Nil Then Throw New InvalidArgumentException("Another native color chooser is already open")
+            If Me.mCustomColors.Count = 0 Then
+                For i As Integer = 1 To 64
+                    Me.mCustomColors.Append(0)
+                Next
+            End If
+            Dim info As NativeChooseColor
+            info.Size = 72
+            info.OwnerWindow = parent.NativeWidget
+            info.Instance = Nil
+            info.RGBResult = ColorRef(Me.mColor)
+            info.CustomColors = Me.mCustomColors.DataPtr()
+            info.NativeFlags = 19 ' CC_RGBINIT | CC_FULLOPEN | CC_ENABLEHOOK
+            info.UserData = 0
+            Dim hook As ColorWinHook = AddressOf ColorWindowsHook
+            info.Hook = CType(hook, Ptr)
+            info.TemplateName = Nil
+            ColorOperations.WindowsReference.Owner = Me
+            Me.mOpen = True
+            Try
+                Dim accepted As Boolean = WinChoose(info) <> 0
+                Dim failure As Integer = WinDialogError()
+                Me.mOpen = False
+                Me.mNative = Nil
+                ColorOperations.WindowsReference.Owner = Nil
+                If Me.mSilent Then Return
+                If accepted Then
+                    Me.mColor = ColorFromRef(info.RGBResult)
+                    RaiseEvent Accepted(Me.SelectedColor)
+                ElseIf failure = 0 Then
+                    RaiseEvent Cancelled()
+                Else
+                    Me.LastNativeError = "ChooseColorW failed: " + Str(failure)
+                    RaiseEvent Failed(Me.LastNativeError)
+                End If
+            Finally
+                Me.mOpen = False
+                Me.mNative = Nil
+                ColorOperations.WindowsReference.Owner = Nil
+            End Try
+        #ElseIf TargetMac Then
+            If ColorOperations.PanelReference.Owner <> Nil Then Throw New InvalidArgumentException("Another ColorPicker owns the shared macOS color panel")
+            Me.mNative = MacPanel(MacClass("NSColorPanel"))
+            If Me.mNative = Nil Then Throw New RuntimeException("Could not open NSColorPanel")
+            Me.mOldTitle = MacGetTitle(Me.mNative)
+            If Me.mOldTitle <> Nil Then MacRetain(Me.mOldTitle)
+            Me.mOldAlpha = MacGetAlpha(Me.mNative)
+            Me.mTarget = MacInit(MacAlloc(ColorMacTargetClass()))
+            If Me.mTarget = Nil Then
+                Me.CleanupMac()
+                Throw New RuntimeException("Could not create color panel action target")
+            End If
+            ColorOperations.PanelReference.Owner = Me
+            ColorOperations.PanelReference.OwnerAddress = CType(Me, Ptr)
+            Me.mOpen = True
+            Me.mUpdating = True
+            Try
+                MacSetTitle(Me.mNative, MacString(MacClass("NSString"), Me.Title))
+                MacSetAlpha(Me.mNative, Me.WithAlpha)
+                MacSetColor(Me.mNative, MacColor(MacClass("NSColor"), Me.mColor.R, Me.mColor.G, Me.mColor.B, Me.mColor.A))
+                MacObserve(MacNotifications(MacClass("NSNotificationCenter")), Me.mTarget, MacSelector("buoyColorChanged:"), MacString(MacClass("NSString"), "NSColorPanelColorDidChangeNotification"), Me.mNative)
+                MacObserve(MacNotifications(MacClass("NSNotificationCenter")), Me.mTarget, MacSelector("buoyColorPanelClosed:"), MacString(MacClass("NSString"), "NSWindowWillCloseNotification"), Me.mNative)
+                MacFront(Me.mNative, Nil)
+            Catch e As Exception
+                Me.Close()
+                Throw e
+            Finally
+                Me.mUpdating = False
+            End Try
+        #End If
+    End Sub
+
+    ' Silent cleanup. GTK completion still drains and frees its native result.
+    Public Sub Close()
+        Me.mSilent = True
+        #If TargetLinux Then
+            If Me.mOperation <> Nil Then
+                Me.mOperation.Owner = Nil
+                GCancel(Me.mOperation.Cancellable)
+                Me.mOperation = Nil
+            End If
+            Me.mOpen = False
+        #ElseIf TargetWindows Then
+            If Me.mNative <> Nil Then WinPost(Me.mNative, 16, 0, 0) ' WM_CLOSE
+        #ElseIf TargetMac Then
+            If Me.mNative <> Nil Then
+                If ColorOperations.PanelReference.OwnerAddress = CType(Me, Ptr) Then MacOrderOut(Me.mNative, Nil)
+            End If
+            Me.CleanupMac()
+        #End If
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+
+    ' Internal callback entry. Not a synthetic acceptance/test hook.
+    Public Sub NativeFinished(chosen As Color, wasCancelled As Boolean, failure As String)
+        Me.mOperation = Nil
+        Me.mOpen = False
+        If Me.mSilent Then Return
+        Try
+            If failure <> "" Then
+                Me.LastNativeError = failure
+                RaiseEvent Failed(failure)
+            ElseIf wasCancelled Then
+                RaiseEvent Cancelled()
+            Else
+                ValidateColor(chosen)
+                Me.mColor = chosen
+                RaiseEvent Accepted(Me.SelectedColor)
+            End If
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    #If TargetWindows Then
+        Public Sub NativeWindowsOpened(widget As Ptr)
+            Me.mNative = widget
+            Dim titleBytes As Bytes = Me.Title.AsUTF16LE()
+            titleBytes.Append(0)
+            titleBytes.Append(0)
+            WinSetTitle(widget, titleBytes.DataPtr())
+        End Sub
+    #ElseIf TargetMac Then
+        Public Sub NativeMacChanged()
+            If Me.mUpdating Or Not Me.mOpen Then Return
+            Try
+                Dim nativeColor As Ptr = MacConvert(MacGetColor(Me.mNative), MacSRGB(MacClass("NSColorSpace")))
+                If nativeColor = Nil Then Throw New RuntimeException("The selected color cannot convert to sRGB")
+                Me.mColor = Color.RGBA(MacRed(nativeColor), MacGreen(nativeColor), MacBlue(nativeColor), MacAlpha(nativeColor))
+                RaiseEvent Changed(Me.SelectedColor)
+            Catch e As Exception
+                Me.LastNativeError = e.Message
+            End Try
+        End Sub
+        Public Sub NativeMacClosed()
+            Me.CleanupMac()
+            If Me.mSilent Then Return
+            Try
+                RaiseEvent PanelClosed()
+            Catch e As Exception
+                Me.LastNativeError = e.Message
+            End Try
+        End Sub
+        Private Sub CleanupMac()
+            If Me.mTarget <> Nil Then
+                MacUnobserve(MacNotifications(MacClass("NSNotificationCenter")), Me.mTarget)
+            End If
+            If Me.mNative <> Nil And ColorOperations.PanelReference.OwnerAddress = CType(Me, Ptr) Then
+                MacSetAlpha(Me.mNative, Me.mOldAlpha)
+                If Me.mOldTitle <> Nil Then MacSetTitle(Me.mNative, Me.mOldTitle)
+            End If
+            If Me.mTarget <> Nil Then MacRelease(Me.mTarget)
+            If Me.mOldTitle <> Nil Then MacRelease(Me.mOldTitle)
+            Me.mTarget = Nil
+            Me.mOldTitle = Nil
+            Me.mNative = Nil
+            Me.mOpen = False
+            If ColorOperations.PanelReference.OwnerAddress = CType(Me, Ptr) Then
+                ColorOperations.PanelReference.Owner = Nil
+                ColorOperations.PanelReference.OwnerAddress = Nil
+            End If
+        End Sub
+    #End If
+End Class
+
+Private Sub ValidateColor(value As Color)
+    If value = Nil Then Throw New InvalidArgumentException("SelectedColor cannot be Nil")
+    For Each channel As Double In [value.R, value.G, value.B, value.A]
+        If channel <> channel Or channel < 0 Or channel > 1 Then Throw New InvalidArgumentException("Color channels must be finite values in [0, 1]")
+    Next
+End Sub
+
+#If TargetLinux Then
+Sequential Structure ColorRGBA
+    Red As Single
+    Green As Single
+    Blue As Single
+    Alpha As Single
+End Structure
+Sequential Structure ColorGError
+    Domain As UInt32
+    Code As Int32
+    Message As Ptr
+End Structure
+Delegate Sub ColorReadyCallback(source As Ptr, asyncResult As Ptr, data As Ptr)
+Private Optional Declare Function GTKMajor Lib "libgtk-4.so.1" Alias "gtk_get_major_version" () As UInt32
+Private Optional Declare Function GTKMinor Lib "libgtk-4.so.1" Alias "gtk_get_minor_version" () As UInt32
+Private Optional Declare Function GTKNew Lib "libgtk-4.so.1" Alias "gtk_color_dialog_new" () As Ptr
+Private Optional Declare Sub GTKTitle Lib "libgtk-4.so.1" Alias "gtk_color_dialog_set_title" (dialog As Ptr, title As String)
+Private Optional Declare Sub GTKModal Lib "libgtk-4.so.1" Alias "gtk_color_dialog_set_modal" (dialog As Ptr, modal As Int32)
+Private Optional Declare Sub GTKAlpha Lib "libgtk-4.so.1" Alias "gtk_color_dialog_set_with_alpha" (dialog As Ptr, withAlpha As Int32)
+Private Optional Declare Sub GTKChoose Lib "libgtk-4.so.1" Alias "gtk_color_dialog_choose_rgba" (dialog As Ptr, parent As Ptr, ByRef initial As ColorRGBA, cancellable As Ptr, callback As ColorReadyCallback, data As Ptr)
+Private Optional Declare Function GTKFinish Lib "libgtk-4.so.1" Alias "gtk_color_dialog_choose_rgba_finish" (dialog As Ptr, asyncResult As Ptr, ByRef failure As Ptr) As Ptr
+Private Optional Declare Function GCancelNew Lib "libgio-2.0.so.0" Alias "g_cancellable_new" () As Ptr
+Private Optional Declare Sub GCancel Lib "libgio-2.0.so.0" Alias "g_cancellable_cancel" (cancellable As Ptr)
+Private Optional Declare Sub GUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+Private Optional Declare Function GErrorMatches Lib "libglib-2.0.so.0" Alias "g_error_matches" (failure As Ptr, domain As UInt32, code As Int32) As Int32
+Private Optional Declare Function GTKErrorDomain Lib "libgtk-4.so.1" Alias "gtk_dialog_error_quark" () As UInt32
+Private Optional Declare Sub GErrorFree Lib "libglib-2.0.so.0" Alias "g_error_free" (failure As Ptr)
+Private Optional Declare Sub RGBAFree Lib "libgtk-4.so.1" Alias "gdk_rgba_free" (rgba As Ptr)
+Private Optional Declare Sub CopyRGBA Lib "c" Alias "memcpy" (ByRef destination As ColorRGBA, source As Ptr, count As Integer)
+Private Optional Declare Sub CopyError Lib "c" Alias "memcpy" (ByRef destination As ColorGError, source As Ptr, count As Integer)
+Private Sub ColorLinuxReady(source As Ptr, asyncResult As Ptr, data As Ptr)
+    Dim id As Integer = CType(data, Integer) - 1
+    If id < 0 Or id >= Array.Count(ColorOperations.Items) Then Return
+    Dim op As ColorOperation = ColorOperations.Items(id)
+    If op = Nil Then Return
+    Dim owner As ColorPicker = op.Owner
+    Dim failure As Ptr = Nil
+    Dim rgba As Ptr = Nil
+    Dim chosen As Color = Nil
+    Dim cancelled As Boolean = False
+    Dim message As String = ""
+    Try
+        rgba = GTKFinish(op.Dialog, asyncResult, failure)
+        If rgba <> Nil Then
+            Dim channels As ColorRGBA
+            CopyRGBA(channels, rgba, 16)
+            chosen = Color.RGBA(channels.Red, channels.Green, channels.Blue, channels.Alpha)
+        ElseIf failure <> Nil Then
+            cancelled = GErrorMatches(failure, GTKErrorDomain(), 1) <> 0 Or GErrorMatches(failure, GTKErrorDomain(), 2) <> 0
+            If Not cancelled Then
+                Dim record As ColorGError
+                CopyError(record, failure, 16)
+                message = CType(CType(record.Message, CString), String)
+            End If
+        Else
+            message = "GtkColorDialog returned no color or error"
+        End If
+    Catch e As Exception
+        message = e.Message
+    Finally
+        If rgba <> Nil Then RGBAFree(rgba)
+        If failure <> Nil Then GErrorFree(failure)
+        GUnref(op.Cancellable)
+        GUnref(op.Dialog)
+        ColorOperations.Items(id) = Nil
+    End Try
+    If owner <> Nil Then owner.NativeFinished(chosen, cancelled, message)
+End Sub
+#ElseIf TargetWindows Then
+Sequential Structure NativeChooseColor
+    Size As UInt32
+    OwnerWindow As Ptr
+    Instance As Ptr
+    RGBResult As UInt32
+    CustomColors As Ptr
+    NativeFlags As UInt32
+    UserData As Int64
+    Hook As Ptr
+    TemplateName As Ptr
+End Structure
+Delegate Function ColorWinHook(widget As Ptr, message As UInt32, word As UInt64, param As Int64) As UInt64
+Private Optional Declare Function WinChoose Lib "comdlg32" Alias "ChooseColorW" (ByRef info As NativeChooseColor) As Int32
+Private Optional Declare Function WinDialogError Lib "comdlg32" Alias "CommDlgExtendedError" () As UInt32
+Private Optional Declare Function WinPost Lib "user32" Alias "PostMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int32
+Private Optional Declare Function WinSetTitle Lib "user32" Alias "SetWindowTextW" (widget As Ptr, title As Ptr) As Int32
+Private Function ColorRef(value As Color) As UInt32
+    Dim red As Integer = Math.Round(value.R * 255)
+    Dim green As Integer = Math.Round(value.G * 255)
+    Dim blue As Integer = Math.Round(value.B * 255)
+    Return red + green * 256 + blue * 65536
+End Function
+Private Function ColorFromRef(value As UInt32) As Color
+    Dim bits As Integer = value
+    Return Color.FromBytes(bits And 255, (bits >> 8) And 255, (bits >> 16) And 255)
+End Function
+Private Function ColorWindowsHook(widget As Ptr, message As UInt32, word As UInt64, param As Int64) As UInt64
+    If message = 272 Then
+        Dim owner As ColorPicker = ColorOperations.WindowsReference.Owner
+        If owner <> Nil Then
+            Try
+                owner.NativeWindowsOpened(widget)
+            Catch e As Exception
+                owner.LastNativeError = e.Message
+            End Try
+        End If
+    End If
+    Return 0
+End Function
+#ElseIf TargetMac Then
+Delegate Sub ColorMacAction(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+Private Declare Function MacClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function MacAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Sub MacRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function MacAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, callback As Ptr, encoding As String) As UInt8
+Private Declare Function MacSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function MacAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function MacInit Lib "AppKit" Selector "init" (obj As Ptr) As Ptr
+Private Declare Function MacRetain Lib "Foundation" Selector "retain" (obj As Ptr) As Ptr
+Private Declare Sub MacRelease Lib "Foundation" Selector "release" (obj As Ptr)
+Private Declare Function MacString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function MacPanel Lib "AppKit" Selector "sharedColorPanel" (cls As Ptr) As Ptr
+Private Declare Function MacGetTitle Lib "AppKit" Selector "title" (panel As Ptr) As Ptr
+Private Declare Function MacGetAlpha Lib "AppKit" Selector "showsAlpha" (panel As Ptr) As Boolean
+Private Declare Sub MacSetTitle Lib "AppKit" Selector "setTitle:" (panel As Ptr, title As Ptr)
+Private Declare Sub MacSetAlpha Lib "AppKit" Selector "setShowsAlpha:" (panel As Ptr, withAlpha As Boolean)
+Private Declare Function MacColor Lib "AppKit" Selector "colorWithSRGBRed:green:blue:alpha:" (cls As Ptr, red As Double, green As Double, blue As Double, alpha As Double) As Ptr
+Private Declare Sub MacSetColor Lib "AppKit" Selector "setColor:" (panel As Ptr, color As Ptr)
+Private Declare Function MacGetColor Lib "AppKit" Selector "color" (panel As Ptr) As Ptr
+Private Declare Function MacConvert Lib "AppKit" Selector "colorUsingColorSpace:" (color As Ptr, space As Ptr) As Ptr
+Private Declare Function MacSRGB Lib "AppKit" Selector "sRGBColorSpace" (cls As Ptr) As Ptr
+Private Declare Function MacRed Lib "AppKit" Selector "redComponent" (color As Ptr) As Double
+Private Declare Function MacGreen Lib "AppKit" Selector "greenComponent" (color As Ptr) As Double
+Private Declare Function MacBlue Lib "AppKit" Selector "blueComponent" (color As Ptr) As Double
+Private Declare Function MacAlpha Lib "AppKit" Selector "alphaComponent" (color As Ptr) As Double
+Private Declare Function MacNotifications Lib "Foundation" Selector "defaultCenter" (cls As Ptr) As Ptr
+Private Declare Sub MacObserve Lib "Foundation" Selector "addObserver:selector:name:object:" (center As Ptr, target As Ptr, methodSelector As Ptr, name As Ptr, obj As Ptr)
+Private Declare Sub MacUnobserve Lib "Foundation" Selector "removeObserver:" (center As Ptr, target As Ptr)
+Private Declare Sub MacFront Lib "AppKit" Selector "orderFront:" (panel As Ptr, sender As Ptr)
+Private Declare Sub MacOrderOut Lib "AppKit" Selector "orderOut:" (panel As Ptr, sender As Ptr)
+Private Function ColorMacTargetClass() As Ptr
+    Dim cls As Ptr = MacClass("BuoyNativeColorPickerTarget")
+    If cls <> Nil Then Return cls
+    cls = MacAllocateClass(MacClass("NSObject"), "BuoyNativeColorPickerTarget", 0)
+    If cls = Nil Then Throw New RuntimeException("Could not allocate color target class")
+    Dim changed As ColorMacAction = AddressOf ColorMacChanged
+    Dim closed As ColorMacAction = AddressOf ColorMacClosed
+    If MacAddMethod(cls, MacSelector("buoyColorChanged:"), CType(changed, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not install color action")
+    If MacAddMethod(cls, MacSelector("buoyColorPanelClosed:"), CType(closed, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not install color close action")
+    MacRegisterClass(cls)
+    Return cls
+End Function
+Private Sub ColorMacChanged(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    Dim owner As ColorPicker = ColorOperations.PanelReference.Owner
+    If owner <> Nil Then
+        MacRetain(receiver)
+        Try
+            owner.NativeMacChanged()
+        Finally
+            MacRelease(receiver)
+        End Try
+    End If
+End Sub
+Private Sub ColorMacClosed(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    Dim owner As ColorPicker = ColorOperations.PanelReference.Owner
+    If owner <> Nil Then
+        MacRetain(receiver)
+        Try
+            owner.NativeMacClosed()
+        Finally
+            MacRelease(receiver)
+        End Try
+    End If
+End Sub
+#End If

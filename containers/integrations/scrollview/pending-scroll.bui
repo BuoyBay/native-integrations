@@ -1,0 +1,54 @@
+Import scrollview
+
+#If TargetLinux Then
+Private Optional Declare Function PendingChild Lib "libgtk-4.so.1" Alias "gtk_widget_get_first_child" (widget As Ptr) As Ptr
+Private Optional Declare Function PendingAdjustment Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_vadjustment" (widget As Ptr) As Ptr
+Private Optional Declare Function PendingValue Lib "libgtk-4.so.1" Alias "gtk_adjustment_get_value" (adjustment As Ptr) As Double
+Private Optional Declare Sub PendingSetValue Lib "libgtk-4.so.1" Alias "gtk_adjustment_set_value" (adjustment As Ptr, value As Double)
+#End If
+
+Class PendingVerifier Inherits Timer
+    Public Property Area As ScrollView
+
+    Public Overrides Sub NotifyTick()
+        Me.Stop()
+        #If TargetLinux Then
+            ' Read GTK directly: a cached requested OffsetY would mask the bug.
+            Dim root As Ptr = PendingChild(Area.NativeWidget)
+            Dim adjustment As Ptr = PendingAdjustment(root)
+            If Math.Abs(PendingValue(adjustment) - 180.0) > 1.0 Then Throw New Exception("Pending scroll was not applied after allocation")
+            PendingSetValue(adjustment, 240.0)
+            If Math.Abs(Area.OffsetY - 240.0) > 1.0 Then Throw New Exception("Pending state masks native user scrolling")
+        #Else
+            If Math.Abs(Area.OffsetY - 180.0) > 1.0 Then Throw New Exception("Initial offset was not applied")
+        #End If
+        Area.Close()
+        Area.ScrollTo(0.0, 75.0)
+        Area.Open()
+        Area.Close() ' Cancel a newly pending frame before it can run.
+        Area.Close()
+        If Area.IsOpen Or Area.LastNativeError <> "" Then Throw New Exception("Pending-frame cleanup failed")
+        Print "PASS pending scroll applies automatically; native offsets and cancellation remain valid"
+        StdOut.Flush()
+        Application.Quit()
+    End Sub
+End Class
+
+Sub Main()
+    Dim win As New Window()
+    win.Move(100, 100, 440, 340)
+    Dim area As New ScrollView()
+    area.Move(10, 10, 400, 250)
+    area.ContentWidth = 400
+    area.ContentHeight = 1200
+    win.AddSubview(area)
+    area.Open()
+    area.ScrollTo(0.0, 180.0) ' Before the window's first native allocation.
+    Dim verifier As New PendingVerifier()
+    verifier.Area = area
+    verifier.Period = 400
+    verifier.Count = 1
+    verifier.Start()
+    win.Show()
+    Application.Run()
+End Sub

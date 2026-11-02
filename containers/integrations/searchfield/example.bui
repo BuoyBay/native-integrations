@@ -1,0 +1,61 @@
+Import searchfield
+Window SearchLayout
+    Title = "Buoy Native SearchField"
+    Frame = (100, 100, 620, 240)
+    Control Label hint
+        Text = "Type to search; Enter commits; Escape clears and cancels."
+        Frame = (20, 15, 580, 25)
+    End Control
+    Control SearchField queryField
+        Placeholder = "Search snippets, commands, or files"
+        Frame = (20, 55, 580, 36)
+    End Control
+    Control Label statusLabel
+        Text = "Search is ready"
+        Frame = (20, 110, 580, 30)
+    End Control
+    Control TextField otherField
+        Placeholder = "Tab to this ordinary native field"
+        Frame = (20, 165, 580, 32)
+    End Control
+End Window
+Class SearchDemo Inherits SearchLayout
+    Public Property Changed As Integer = 0
+    Public Property Committed As Integer = 0
+    Public Property Cancelled As Integer = 0
+    Handle Opening()
+        Me.queryField.Open()
+        Me.queryField.FocusSearch()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.queryField.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.queryField.Close()
+    End Handle
+    Private Sub Report()
+        Me.Title = "Search: " + Me.queryField.Text + " changes=" + Str(Me.Changed) + " commits=" + Str(Me.Committed) + " cancels=" + Str(Me.Cancelled)
+    End Sub
+    With queryField
+        Handle SearchChanged(query As String)
+            Me.Changed += 1
+            Me.statusLabel.Text = "Live query: " + query
+            Me.Report()
+        End Handle
+        Handle SearchCommitted(query As String)
+            Me.Committed += 1
+            Me.statusLabel.Text = "Committed query: " + query
+            Me.Report()
+        End Handle
+        Handle SearchCancelled()
+            Me.Cancelled += 1
+            Me.statusLabel.Text = "Search cancelled"
+            Me.Report()
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New SearchDemo()
+    win.Show()
+    Application.Run()
+End Sub

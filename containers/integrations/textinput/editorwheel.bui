@@ -1,0 +1,230 @@
+''' Wheel adapter for a Canvas subclass that already inherits an input contract.
+Public Interface EditorWheelHost
+    Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+End Interface
+
+Public Class EditorWheel
+    Private Property mView As Weak Canvas
+    Private Property mHost As EditorWheelHost
+    Private Property mWheelSlot As Integer = -1
+    Private Property mWheelWidget As Ptr = Nil
+    Private Property mWheelController As Ptr = Nil
+    Private Property mWheelDestroyHandler As UInt64 = 0
+    Public Property LastWheelError As String = ""
+
+    Public Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        Dim target As EditorWheelHost = Me.mHost
+        If target = Nil Then Return False
+        Return target.NativeWheel(dx, dy, pixels)
+    End Function
+
+    Public Sub OpenWheel(view As Canvas, host As EditorWheelHost)
+        If Me.mWheelSlot >= 0 Then Return
+        If view = Nil Or host = Nil Then Return
+        If view.NativeWidget = Nil Then Return
+        Me.mView = view
+        Me.mHost = host
+        Me.LastWheelError = ""
+        Me.mWheelSlot = Array.Count(EditorWheelRegistry.Controls)
+        For i As Integer = 0 To Array.LastIndex(EditorWheelRegistry.Controls)
+            If EditorWheelRegistry.Controls(i) = Nil Then
+                Me.mWheelSlot = i
+                Exit For
+            End If
+        Next
+        If Me.mWheelSlot = Array.Count(EditorWheelRegistry.Controls) Then
+            EditorWheelRegistry.Controls.Append(Me)
+        Else
+            EditorWheelRegistry.Controls(Me.mWheelSlot) = Me
+        End If
+        Me.mWheelWidget = view.NativeWidget
+        Try
+            #If TargetLinux Then
+                Me.mWheelController = EditorWheelScrollNew(3)
+                If Me.mWheelController = Nil Then Throw New RuntimeException("Could not create GTK wheel controller")
+                EditorWheelConnect(Me.mWheelController, "scroll", AddressOf EditorWheelGtkScroll, CType(Me.mWheelSlot + 1, Ptr), Nil, 0)
+                EditorWheelAdd(Me.mWheelWidget, Me.mWheelController)
+                Me.mWheelDestroyHandler = EditorWheelConnectDestroy(Me.mWheelWidget, "destroy", AddressOf EditorWheelGtkDestroy, CType(Me.mWheelSlot + 1, Ptr), Nil, 0)
+            #ElseIf TargetWindows Then
+                Dim slot As UInt64 = Me.mWheelSlot + 1
+                If EditorWheelSetSubclass(Me.mWheelWidget, AddressOf EditorWheelWindows, 25440 + slot, slot) = 0 Then Throw New RuntimeException("Could not subclass wheel control")
+            #ElseIf TargetMac Then
+                EditorWheelInstallMonitor()
+            #End If
+        Catch e As Exception
+            Me.LastWheelError = e.Message
+            Me.CloseWheel()
+        End Try
+    End Sub
+
+    Public Sub CloseWheel()
+        If Me.mWheelSlot < 0 Then Return
+        Try
+            #If TargetLinux Then
+                If Me.mWheelWidget <> Nil Then
+                    If Me.mWheelDestroyHandler <> 0 Then EditorWheelDisconnect(Me.mWheelWidget, Me.mWheelDestroyHandler)
+                    If Me.mWheelController <> Nil Then EditorWheelRemove(Me.mWheelWidget, Me.mWheelController)
+                End If
+            #ElseIf TargetWindows Then
+                Dim slot As UInt64 = Me.mWheelSlot + 1
+                If Me.mWheelWidget <> Nil Then EditorWheelRemoveSubclass(Me.mWheelWidget, AddressOf EditorWheelWindows, 25440 + slot)
+            #End If
+        Catch e As Exception
+            Me.LastWheelError = e.Message
+        End Try
+        Me.WheelWidgetDestroyed()
+    End Sub
+
+    Public Sub WheelWidgetDestroyed()
+        Me.mWheelWidget = Nil
+        Me.mWheelController = Nil
+        Me.mWheelDestroyHandler = 0
+        If Me.mWheelSlot >= 0 Then EditorWheelRegistry.Controls(Me.mWheelSlot) = Nil
+        Me.mWheelSlot = -1
+        Me.mView = Nil
+        Me.mHost = Nil
+        #If TargetMac Then
+            If EditorWheelRegistry.Count() = 0 Then EditorWheelUninstallMonitor()
+        #End If
+    End Sub
+
+    #If TargetMac Then
+    Public Function OwnsWheel(window As Ptr, point As EditorWheelPoint) As Boolean
+        Dim view As Canvas = Me.mView
+        If view = Nil Then Return False
+        If Me.mWheelWidget = Nil Or window = Nil Or Not view.Visible Then Return False
+        If EditorWheelViewWindow(Me.mWheelWidget) <> window Then Return False
+        If EditorWheelHidden(Me.mWheelWidget) Then Return False
+        Dim local As EditorWheelPoint = EditorWheelConvert(Me.mWheelWidget, point, Nil)
+        Return local.X >= 0 And local.Y >= 0 And local.X < view.Width And local.Y < view.Height
+    End Function
+    #End If
+End Class
+
+Private Class EditorWheelRegistry
+    Public Shared Property Controls As Array Of EditorWheel = []
+    Public Shared Property Monitor As Ptr = Nil
+    Public Shared Function Find(slot As Integer) As EditorWheel
+        If slot < 0 Or slot >= Array.Count(EditorWheelRegistry.Controls) Then Return Nil
+        Return EditorWheelRegistry.Controls(slot)
+    End Function
+    Public Shared Function Count() As Integer
+        Dim count As Integer = 0
+        For Each control As EditorWheel In EditorWheelRegistry.Controls
+            If control <> Nil Then count += 1
+        Next
+        Return count
+    End Function
+End Class
+
+#If TargetLinux Then
+Delegate Function EditorWheelScrollCallback(controller As Ptr, dx As Double, dy As Double, data As Ptr) As Int32
+Delegate Sub EditorWheelDestroyCallback(widget As Ptr, data As Ptr)
+Private Optional Declare Function EditorWheelScrollNew Lib "libgtk-4.so.1" Alias "gtk_event_controller_scroll_new" (wheelFlags As Int32) As Ptr
+Private Optional Declare Function EditorWheelUnit Lib "libgtk-4.so.1" Alias "gtk_event_controller_scroll_get_unit" (controller As Ptr) As Int32
+Private Optional Declare Sub EditorWheelAdd Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Sub EditorWheelRemove Lib "libgtk-4.so.1" Alias "gtk_widget_remove_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Function EditorWheelConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As EditorWheelScrollCallback, data As Ptr, destroy As Ptr, wheelFlags As Int32) As UInt64
+Private Optional Declare Function EditorWheelConnectDestroy Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As EditorWheelDestroyCallback, data As Ptr, destroy As Ptr, wheelFlags As Int32) As UInt64
+Private Optional Declare Sub EditorWheelDisconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (instance As Ptr, identifier As UInt64)
+Sub EditorWheelGtkDestroy(widget As Ptr, data As Ptr)
+    Dim control As EditorWheel = EditorWheelRegistry.Find(CType(data, Integer) - 1)
+    If control <> Nil Then control.WheelWidgetDestroyed()
+End Sub
+Function EditorWheelGtkScroll(controller As Ptr, dx As Double, dy As Double, data As Ptr) As Int32
+    Dim control As EditorWheel = EditorWheelRegistry.Find(CType(data, Integer) - 1)
+    If control = Nil Then Return 0
+    Try
+        Dim pixels As Boolean = False
+        Try
+            pixels = EditorWheelUnit(controller) = 1
+        Catch e As Exception
+            pixels = False
+        End Try
+        If control.NativeWheel(dx, dy, pixels) Then Return 1
+    Catch e As Exception
+        control.LastWheelError = e.Message
+    End Try
+    Return 0
+End Function
+#ElseIf TargetWindows Then
+Delegate Function EditorWheelSubclass(window As Ptr, message As UInt32, word As UInt64, param As Int64, identifier As UInt64, data As UInt64) As Int64
+Private Optional Declare Function EditorWheelSetSubclass Lib "comctl32" Alias "SetWindowSubclass" (window As Ptr, callback As EditorWheelSubclass, identifier As UInt64, data As UInt64) As Int32
+Private Optional Declare Function EditorWheelRemoveSubclass Lib "comctl32" Alias "RemoveWindowSubclass" (window As Ptr, callback As EditorWheelSubclass, identifier As UInt64) As Int32
+Private Optional Declare Function EditorWheelDefault Lib "comctl32" Alias "DefSubclassProc" (window As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Function EditorWheelWindows(window As Ptr, message As UInt32, word As UInt64, param As Int64, identifier As UInt64, data As UInt64) As Int64
+    Dim slot As Integer = data
+    Dim control As EditorWheel = EditorWheelRegistry.Find(slot - 1)
+    If control = Nil Then Return EditorWheelDefault(window, message, word, param)
+    Try
+        If message = 522 Or message = 526 Then
+            Dim raw As Integer = (word \ 65536) And 65535
+            If raw >= 32768 Then raw -= 65536
+            Dim delta As Double = raw / 120.0
+            If message = 522 Then
+                If control.NativeWheel(0.0, -delta, False) Then Return 0
+            Else
+                If control.NativeWheel(delta, 0.0, False) Then Return 0
+            End If
+        ElseIf message = 130 Then
+            EditorWheelRemoveSubclass(window, AddressOf EditorWheelWindows, identifier)
+            control.WheelWidgetDestroyed()
+        End If
+    Catch e As Exception
+        control.LastWheelError = e.Message
+    End Try
+    Return EditorWheelDefault(window, message, word, param)
+End Function
+#ElseIf TargetMac Then
+Sequential Structure EditorWheelPoint
+    X As Double
+    Y As Double
+End Structure
+Private Declare Function EditorWheelClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function EditorWheelAddMonitor Lib "AppKit" Selector "addLocalMonitorForEventsMatchingMask:handler:" (cls As Ptr, mask As UInt64, handler As Block(Ptr) As Ptr) As Ptr
+Private Declare Sub EditorWheelRemoveMonitor Lib "AppKit" Selector "removeMonitor:" (cls As Ptr, monitor As Ptr)
+Private Declare Function EditorWheelRetain Lib "Foundation" Selector "retain" (value As Ptr) As Ptr
+Private Declare Sub EditorWheelRelease Lib "Foundation" Selector "release" (value As Ptr)
+Private Declare Function EditorWheelWindow Lib "AppKit" Selector "window" (nativeEvent As Ptr) As Ptr
+Private Declare Function EditorWheelLocation Lib "AppKit" Selector "locationInWindow" (nativeEvent As Ptr) As EditorWheelPoint
+Private Declare Function EditorWheelConvert Lib "AppKit" Selector "convertPoint:fromView:" (view As Ptr, point As EditorWheelPoint, source As Ptr) As EditorWheelPoint
+Private Declare Function EditorWheelViewWindow Lib "AppKit" Selector "window" (view As Ptr) As Ptr
+Private Declare Function EditorWheelHidden Lib "AppKit" Selector "isHiddenOrHasHiddenAncestor" (view As Ptr) As Boolean
+Private Declare Function EditorWheelDeltaX Lib "AppKit" Selector "scrollingDeltaX" (nativeEvent As Ptr) As Double
+Private Declare Function EditorWheelDeltaY Lib "AppKit" Selector "scrollingDeltaY" (nativeEvent As Ptr) As Double
+Private Declare Function EditorWheelPrecise Lib "AppKit" Selector "hasPreciseScrollingDeltas" (nativeEvent As Ptr) As Boolean
+Sub EditorWheelInstallMonitor()
+    If EditorWheelRegistry.Monitor <> Nil Then Return
+    Dim monitor As Ptr = EditorWheelAddMonitor(EditorWheelClass("NSEvent"), 4194304, Block(nativeEvent As Ptr) As Ptr
+        Return EditorWheelMacEvent(nativeEvent)
+    End Block)
+    If monitor = Nil Then Throw New RuntimeException("Could not install wheel monitor")
+    EditorWheelRegistry.Monitor = EditorWheelRetain(monitor)
+End Sub
+Sub EditorWheelUninstallMonitor()
+    Dim monitor As Ptr = EditorWheelRegistry.Monitor
+    If monitor = Nil Then Return
+    EditorWheelRegistry.Monitor = Nil
+    EditorWheelRemoveMonitor(EditorWheelClass("NSEvent"), monitor)
+    EditorWheelRelease(monitor)
+End Sub
+Function EditorWheelMacEvent(nativeEvent As Ptr) As Ptr
+    Dim active As EditorWheel
+    Try
+        Dim window As Ptr = EditorWheelWindow(nativeEvent)
+        If window = Nil Then Return nativeEvent
+        Dim point As EditorWheelPoint = EditorWheelLocation(nativeEvent)
+        For Each control As EditorWheel In EditorWheelRegistry.Controls
+            If control = Nil Then Continue For
+            If control.OwnsWheel(window, point) Then
+                active = control
+                If control.NativeWheel(-EditorWheelDeltaX(nativeEvent), -EditorWheelDeltaY(nativeEvent), EditorWheelPrecise(nativeEvent)) Then Return Nil
+            End If
+        Next
+    Catch e As Exception
+        If active <> Nil Then active.LastWheelError = e.Message
+        ' Preserve native event propagation when a monitor callback fails.
+    End Try
+    Return nativeEvent
+End Function
+#End If

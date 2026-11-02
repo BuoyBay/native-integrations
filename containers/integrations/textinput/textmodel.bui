@@ -1,0 +1,175 @@
+' Independent Unicode-codepoint editing state; no GUI or native dependencies.
+Public Class TextRange
+    Public Property Location As Integer
+    Public Property Length As Integer
+
+    Public Sub Constructor(location As Integer = 0, length As Integer = 0)
+        Me.Location = location
+        Me.Length = length
+    End Sub
+End Class
+
+Class EditSnapshot
+    Public Property Text As String
+    Public Property Anchor As Integer
+    Public Property Caret As Integer
+End Class
+
+Public Class TextDocument
+    Private Property mText As String = ""
+    Private Property mAnchor As Integer = 0
+    Private Property mCaret As Integer = 0
+    Private Property mUndo As Array Of EditSnapshot = []
+    Private Property mRedo As Array Of EditSnapshot = []
+    Public Property IsReadOnly As Boolean = False
+    Private Property mCompositionRange As TextRange
+    Public Property IncompleteText As String = ""
+    Public Property IncompleteCursor As Integer = 0
+
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+        Set
+            Me.mText = Me.Normalize(value)
+            Me.mAnchor = 0
+            Me.mCaret = 0
+            Array.Clear(Me.mUndo)
+            Array.Clear(Me.mRedo)
+            Me.DiscardComposition()
+        End Set
+    End Property
+
+    Public Function CompositionRange() As TextRange
+        If Me.mCompositionRange <> Nil Then Return New TextRange(Me.mCompositionRange.Location, Me.mCompositionRange.Length)
+        Return Me.Selection()
+    End Function
+
+    Public Property Caret As Integer
+        Get
+            Return Me.mCaret
+        End Get
+    End Property
+
+    Public Property Anchor As Integer
+        Get
+            Return Me.mAnchor
+        End Get
+    End Property
+
+    Public Function Normalize(text As String) As String
+        Return String.Replace(String.Replace(text, "\r\n", "\n", True), "\r", "\n", True)
+    End Function
+
+    Public Function Clamp(position As Integer) As Integer
+        Return Math.Max(0, Math.Min(position, String.Len(Me.mText)))
+    End Function
+
+    Public Function Selection() As TextRange
+        Return New TextRange(Math.Min(Me.mAnchor, Me.mCaret), Math.Abs(Me.mCaret - Me.mAnchor))
+    End Function
+
+    Public Sub SelectRange(location As Integer, length As Integer)
+        Me.DiscardComposition()
+        Me.mAnchor = Me.Clamp(location)
+        Me.mCaret = Me.mAnchor + Math.Min(Math.Max(0, length), String.Len(Me.mText) - Me.mAnchor)
+    End Sub
+
+    Public Sub MoveCaret(position As Integer, extend As Boolean = False)
+        Me.DiscardComposition()
+        Me.mCaret = Me.Clamp(position)
+        If Not extend Then Me.mAnchor = Me.mCaret
+    End Sub
+
+    Public Function TextForRange(range As TextRange) As String
+        Dim start As Integer = Me.Clamp(range.Location)
+        Dim count As Integer = Math.Min(Math.Max(0, range.Length), String.Len(Me.mText) - start)
+        Return String.Substring(Me.mText, start, count)
+    End Function
+
+    Private Function Snapshot() As EditSnapshot
+        Dim state As New EditSnapshot()
+        state.Text = Me.mText
+        state.Anchor = Me.mAnchor
+        state.Caret = Me.mCaret
+        Return state
+    End Function
+
+    Private Sub Restore(state As EditSnapshot)
+        Me.mText = state.Text
+        Me.mAnchor = state.Anchor
+        Me.mCaret = state.Caret
+        Me.DiscardComposition()
+    End Sub
+
+    Public Sub ReplaceText(text As String, range As TextRange)
+        If Me.IsReadOnly Then Exit Sub
+        If range = Nil Then range = Me.mCompositionRange
+        If range = Nil Then range = Me.Selection()
+        Dim start As Integer = Me.Clamp(range.Location)
+        Dim count As Integer = Math.Min(Math.Max(0, range.Length), String.Len(Me.mText) - start)
+        Dim normalized As String = Me.Normalize(text)
+        If count = 0 And String.Len(normalized) = 0 Then
+            Me.DiscardComposition()
+            Exit Sub
+        End If
+        Array.Append(Me.mUndo, Me.Snapshot())
+        If Array.Count(Me.mUndo) > 100 Then Array.RemoveAt(Me.mUndo, 0)
+        Array.Clear(Me.mRedo)
+        Me.mText = String.Left(Me.mText, start) + normalized + String.Substring(Me.mText, start + count)
+        Me.mCaret = start + String.Len(normalized)
+        Me.mAnchor = Me.mCaret
+        Me.DiscardComposition()
+    End Sub
+
+    Public Sub Insert(text As String)
+        Me.ReplaceText(text, Nil)
+    End Sub
+
+    Public Sub DeleteBackward()
+        Dim range As TextRange = Me.Selection()
+        If range.Length = 0 And range.Location > 0 Then
+            range.Location -= 1
+            range.Length = 1
+        End If
+        Me.ReplaceText("", range)
+    End Sub
+
+    Public Sub DeleteForward()
+        Dim range As TextRange = Me.Selection()
+        If range.Length = 0 And range.Location < String.Len(Me.mText) Then range.Length = 1
+        Me.ReplaceText("", range)
+    End Sub
+
+    Public Sub SetComposition(text As String, cursor As Integer, location As Integer = -1, length As Integer = 0)
+        If Me.IsReadOnly Then Exit Sub
+        If location >= 0 Then
+            Dim start As Integer = Me.Clamp(location)
+            Me.mCompositionRange = New TextRange(start, Math.Min(Math.Max(0, length), String.Len(Me.mText) - start))
+        End If
+        Me.IncompleteText = text
+        Me.IncompleteCursor = Math.Max(0, Math.Min(cursor, String.Len(text)))
+    End Sub
+
+    Public Sub DiscardComposition()
+        Me.mCompositionRange = Nil
+        Me.IncompleteText = ""
+        Me.IncompleteCursor = 0
+    End Sub
+
+    Public Sub Undo()
+        If Me.IsReadOnly Or Array.Count(Me.mUndo) = 0 Then Exit Sub
+        Array.Append(Me.mRedo, Me.Snapshot())
+        Dim state As EditSnapshot = Me.mUndo(Array.LastIndex(Me.mUndo))
+        Array.RemoveAt(Me.mUndo, Array.LastIndex(Me.mUndo))
+        Me.Restore(state)
+    End Sub
+
+    Public Sub Redo()
+        If Me.IsReadOnly Or Array.Count(Me.mRedo) = 0 Then Exit Sub
+        Array.Append(Me.mUndo, Me.Snapshot())
+        Dim state As EditSnapshot = Me.mRedo(Array.LastIndex(Me.mRedo))
+        Array.RemoveAt(Me.mRedo, Array.LastIndex(Me.mRedo))
+        Me.Restore(state)
+    End Sub
+End Class

@@ -1,0 +1,1099 @@
+Import bevelnative
+
+Public Enum BevelButtonStyle As Integer
+    PushButton
+    ToggleButton
+    StickyButton
+End Enum
+Public Enum BevelButtonBevel As Integer
+    None
+    Small
+    Normal
+    Large
+    Rounded
+    Round
+    LargeRound
+    Disclosure
+End Enum
+Public Enum BevelButtonCaptionPosition As Integer
+    RightOfIcon
+    LeftOfIcon
+    AboveIcon
+    BelowIcon
+    Normal
+    SystemDirection
+End Enum
+Public Enum BevelButtonCaptionAlignment As Integer
+    Centered
+    Left
+    Right
+    SystemDirection
+End Enum
+Public Enum BevelButtonIconAlignment As Integer
+    Centered
+    Left
+    Right
+    Top
+    Bottom
+    TopLeft
+    BottomLeft
+    TopRight
+    BottomRight
+    SystemDirection
+End Enum
+Public Enum BevelButtonMenuStyle As Integer
+    None
+    Down
+    Right
+End Enum
+Public Enum BevelButtonAppearance As Integer
+    System
+    Light
+    Dark
+End Enum
+Public Enum BevelButtonFontUnit As Integer
+    Point
+    Pixel
+End Enum
+Public Enum BevelButtonTextOverflow As Integer
+    Clip
+    Ellipsis
+End Enum
+
+' Measured in Buoy graphics points; also useful for custom drawing and tests.
+Public Class BevelButtonLayout
+    Public Property Text As String = ""
+    Public Property TextX As Double
+    Public Property TextY As Double
+    Public Property TextWidth As Double
+    Public Property TextHeight As Double
+    Public Property IconX As Double
+    Public Property IconY As Double
+    Public Property IconWidth As Double
+    Public Property IconHeight As Double
+    Public Property ContentX As Double
+    Public Property ContentY As Double
+    Public Property ContentWidth As Double
+    Public Property ContentHeight As Double
+    Public Property MenuX As Double
+    Public Property MenuWidth As Double
+End Class
+
+' Timer owns only a weak reference: no control/timer ARC cycle.
+Private Class BevelButtonMonitor Inherits Timer
+    Public Property Owner As Weak BevelButton
+    Public Overrides Sub NotifyTick()
+        Dim owner As BevelButton = Me.Owner
+        If owner = Nil Then
+            Me.Stop()
+        Else
+            owner.Synchronize()
+        End If
+    End Sub
+End Class
+
+' Native Buoy Canvas, MenuItem, accessibility and Event/Handle conventions.
+Public Class BevelButton Inherits Canvas
+    Event Action()
+    Event Pressed()
+    Event ValueChanged(newValue As Boolean)
+    Event MenuOpening() As Boolean
+    Event MenuSelected(item As MenuItem)
+    Event FocusReceived()
+    Event FocusLost()
+
+    Private Property mMonitor As BevelButtonMonitor
+    Private Property mTooltipBridge As BevelNativeTooltip
+    Private Property mNative As BevelNativeState
+    Private Property mPointerArmed As Boolean = False
+    Private Property mMenuArmed As Boolean = False
+    Private Property mKeyArmed As Boolean = False
+    Private Property mActivationKey As KeyName = KeyName.Other
+    Private Property mInside As Boolean = False
+    Private Property mHadFocus As Boolean = False
+    Private Property mWasEnabled As Boolean = True
+    Private Property mWasVisible As Boolean = True
+    Private Property mWasActive As Boolean = False
+    Private Property mWasDark As Boolean = False
+    Private Property mWasFocusable As Boolean = True
+    Private Property mSynchronizing As Boolean = False
+    Private Property mDisplayCaption As String = ""
+    Private Property mMnemonic As String = ""
+    Private Property mMnemonicIndex As Integer = -1
+    Private Property mClosed As Boolean = False
+    Private Property mLastNativeError As String = ""
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.Focusable = True
+        Me.AccessibleRole = AccessibleRole.Button
+        Me.mNative = New BevelNativeState()
+        Me.mTooltipBridge = New BevelNativeTooltip()
+        Me.mMonitor = New BevelButtonMonitor()
+        Me.mMonitor.Owner = Me
+        Me.mMonitor.Period = 50
+        Me.mMonitor.Start()
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+
+    ' Optional early cleanup. The destructor performs the same cleanup.
+    Public Sub Close()
+        If Me.mClosed Then Return
+        Me.mClosed = True
+        Me.CancelPress()
+        UnbindBevelMenus(CType(Me, Ptr))
+        If Me.mMonitor <> Nil Then Me.mMonitor.Stop()
+        If Me.mTooltipBridge <> Nil Then Me.mTooltipBridge.Close()
+    End Sub
+    Private Property mCaption As String = ""
+    Public Property Caption As String
+        Get
+            Return Me.mCaption
+        End Get
+        Set
+            Me.mCaption = value
+            Me.ParseCaption()
+            Me.UpdateAccessibleText()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mIcon As Picture = Nil
+    Public Property Icon As Picture
+        Get
+            Return Me.mIcon
+        End Get
+        Set
+            Me.mIcon = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mIconSize As Double = 24.0
+    Public Property IconSize As Double
+        Get
+            Return Me.mIconSize
+        End Get
+        Set
+            If value <> value Or value < 0 Or value > 100000 Then Throw New InvalidArgumentException("Invalid IconSize")
+            Me.mIconSize = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mFontName As String = ""
+    Public Property FontName As String
+        Get
+            Return Me.mFontName
+        End Get
+        Set
+            Me.mFontName = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mFontSize As Double = 0.0
+    Public Property FontSize As Double
+        Get
+            Return Me.mFontSize
+        End Get
+        Set
+            If value <> value Or value < 0 Or value > 100000 Then Throw New InvalidArgumentException("Invalid FontSize")
+            Me.mFontSize = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mFontUnit As BevelButtonFontUnit = BevelButtonFontUnit.Point
+    Public Property FontUnit As BevelButtonFontUnit
+        Get
+            Return Me.mFontUnit
+        End Get
+        Set
+            Me.mFontUnit = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mBold As Boolean = False
+    Public Property Bold As Boolean
+        Get
+            Return Me.mBold
+        End Get
+        Set
+            Me.mBold = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mItalic As Boolean = False
+    Public Property Italic As Boolean
+        Get
+            Return Me.mItalic
+        End Get
+        Set
+            Me.mItalic = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mUnderline As Boolean = False
+    Public Property Underline As Boolean
+        Get
+            Return Me.mUnderline
+        End Get
+        Set
+            Me.mUnderline = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mButtonStyle As BevelButtonStyle = BevelButtonStyle.PushButton
+    Public Property ButtonStyle As BevelButtonStyle
+        Get
+            Return Me.mButtonStyle
+        End Get
+        Set
+            Me.mButtonStyle = value
+            Me.CancelPress()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mBevelStyle As BevelButtonBevel = BevelButtonBevel.Normal
+    Public Property BevelStyle As BevelButtonBevel
+        Get
+            Return Me.mBevelStyle
+        End Get
+        Set
+            Me.mBevelStyle = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mCaptionPosition As BevelButtonCaptionPosition = BevelButtonCaptionPosition.RightOfIcon
+    Public Property CaptionPosition As BevelButtonCaptionPosition
+        Get
+            Return Me.mCaptionPosition
+        End Get
+        Set
+            Me.mCaptionPosition = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mCaptionAlignment As BevelButtonCaptionAlignment = BevelButtonCaptionAlignment.Centered
+    Public Property CaptionAlignment As BevelButtonCaptionAlignment
+        Get
+            Return Me.mCaptionAlignment
+        End Get
+        Set
+            Me.mCaptionAlignment = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mIconAlignment As BevelButtonIconAlignment = BevelButtonIconAlignment.Centered
+    Public Property IconAlignment As BevelButtonIconAlignment
+        Get
+            Return Me.mIconAlignment
+        End Get
+        Set
+            Me.mIconAlignment = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mCaptionDelta As Double = 0.0
+    Public Property CaptionDelta As Double
+        Get
+            Return Me.mCaptionDelta
+        End Get
+        Set
+            If value <> value Or Math.Abs(value) > 100000 Then Throw New InvalidArgumentException("Invalid CaptionDelta")
+            Me.mCaptionDelta = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mIconDeltaX As Double = 0.0
+    Public Property IconDeltaX As Double
+        Get
+            Return Me.mIconDeltaX
+        End Get
+        Set
+            If value <> value Or Math.Abs(value) > 100000 Then Throw New InvalidArgumentException("Invalid IconDeltaX")
+            Me.mIconDeltaX = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mIconDeltaY As Double = 0.0
+    Public Property IconDeltaY As Double
+        Get
+            Return Me.mIconDeltaY
+        End Get
+        Set
+            If value <> value Or Math.Abs(value) > 100000 Then Throw New InvalidArgumentException("Invalid IconDeltaY")
+            Me.mIconDeltaY = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mValue As Boolean = False
+    Public Property Value As Boolean
+        Get
+            Return Me.mValue
+        End Get
+        Set
+            If Me.mValue = value Then Return
+            Me.mValue = value
+            Me.NotifyAccessibilityChanged()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mMenu As ContextMenu = Nil
+    Public Property Menu As ContextMenu
+        Get
+            Return Me.mMenu
+        End Get
+        Set
+            Me.mMenu = value
+            Me.CancelPress()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mMenuStyle As BevelButtonMenuStyle = BevelButtonMenuStyle.None
+    Public Property MenuStyle As BevelButtonMenuStyle
+        Get
+            Return Me.mMenuStyle
+        End Get
+        Set
+            Me.mMenuStyle = value
+            Me.CancelPress()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mSplitMenu As Boolean = False
+    Public Property SplitMenu As Boolean
+        Get
+            Return Me.mSplitMenu
+        End Get
+        Set
+            Me.mSplitMenu = value
+            Me.CancelPress()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mTooltip As String = ""
+    Public Property Tooltip As String
+        Get
+            Return Me.mTooltip
+        End Get
+        Set
+            Me.mTooltip = value
+            Me.UpdateAccessibleText()
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mAppearance As BevelButtonAppearance = BevelButtonAppearance.System
+    Public Property Appearance As BevelButtonAppearance
+        Get
+            Return Me.mAppearance
+        End Get
+        Set
+            Me.mAppearance = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mHasBackgroundColor As Boolean = True
+    Public Property HasBackgroundColor As Boolean
+        Get
+            Return Me.mHasBackgroundColor
+        End Get
+        Set
+            Me.mHasBackgroundColor = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mTransparent As Boolean = False
+    Public Property Transparent As Boolean
+        Get
+            Return Me.mTransparent
+        End Get
+        Set
+            Me.mTransparent = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mPadding As Double = 6.0
+    Public Property Padding As Double
+        Get
+            Return Me.mPadding
+        End Get
+        Set
+            If value <> value Or value < 0 Or value > 100000 Then Throw New InvalidArgumentException("Invalid Padding")
+            Me.mPadding = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mGap As Double = 6.0
+    Public Property Gap As Double
+        Get
+            Return Me.mGap
+        End Get
+        Set
+            If value <> value Or value < 0 Or value > 100000 Then Throw New InvalidArgumentException("Invalid Gap")
+            Me.mGap = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mTextOverflow As BevelButtonTextOverflow = BevelButtonTextOverflow.Ellipsis
+    Public Property TextOverflow As BevelButtonTextOverflow
+        Get
+            Return Me.mTextOverflow
+        End Get
+        Set
+            Me.mTextOverflow = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mDefault As Boolean = False
+    Public Property Default As Boolean
+        Get
+            Return Me.mDefault
+        End Get
+        Set
+            Me.mDefault = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mCancel As Boolean = False
+    Public Property Cancel As Boolean
+        Get
+            Return Me.mCancel
+        End Get
+        Set
+            Me.mCancel = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mAllowAutoDeactivate As Boolean = True
+    Public Property AllowAutoDeactivate As Boolean
+        Get
+            Return Me.mAllowAutoDeactivate
+        End Get
+        Set
+            Me.mAllowAutoDeactivate = value
+            Me.Invalidate()
+        End Set
+    End Property
+
+    Private Property mBackgroundColor As Color = Nil
+    Public Property BackgroundColor As Color
+        Get
+            If Me.mBackgroundColor <> Nil Then Return Me.mBackgroundColor
+            If Me.IsDark Then Return Color.RGB(0.21, 0.22, 0.24)
+            Return Color.RGB(0.88, 0.89, 0.91)
+        End Get
+        Set
+            Me.mBackgroundColor = value
+            Me.Invalidate()
+        End Set
+    End Property
+    Private Property mTextColor As Color = Nil
+    Public Property TextColor As Color
+        Get
+            If Me.mTextColor <> Nil Then Return Me.mTextColor
+            If Me.IsDark Then Return Color.RGB(0.94, 0.94, 0.95)
+            Return Color.RGB(0.08, 0.08, 0.09)
+        End Get
+        Set
+            Me.mTextColor = value
+            Me.Invalidate()
+        End Set
+    End Property
+
+    Public Property DisplayCaption As String
+        Get
+            Return Me.mDisplayCaption
+        End Get
+    End Property
+    Public Property Mnemonic As String
+        Get
+            Return Me.mMnemonic
+        End Get
+    End Property
+    Public Property LastNativeError As String
+        Get
+            Return Me.mLastNativeError
+        End Get
+    End Property
+    Public Property IsDark As Boolean
+        Get
+            Select Case Me.Appearance
+                Case BevelButtonAppearance.Dark
+                    Return True
+                Case BevelButtonAppearance.Light
+                    Return False
+            End Select
+            Return System.IsDarkMode
+        End Get
+    End Property
+    Public Property Active As Boolean
+        Get
+            If Me.ParentWindow = Nil Then Return False
+            Return Me.mNative.Active
+        End Get
+    End Property
+    Public Property IsPressed As Boolean
+        Get
+            Return Me.Enabled And Not Me.mClosed And ((Me.mPointerArmed And Me.mInside) Or Me.mKeyArmed Or Me.Value)
+        End Get
+    End Property
+    Public Property HasPendingPress As Boolean
+        Get
+            Return Me.mPointerArmed Or Me.mKeyArmed
+        End Get
+    End Property
+    Public Property HasMenu As Boolean
+        Get
+            Return Me.Menu <> Nil And Me.MenuStyle <> BevelButtonMenuStyle.None
+        End Get
+    End Property
+
+    Private Sub ParseCaption()
+        Me.mDisplayCaption = ""
+        Me.mMnemonic = ""
+        Me.mMnemonicIndex = -1
+        Dim i As Integer = 1
+        While i <= String.Len(Me.Caption)
+            Dim ch As String = String.Mid(Me.Caption, i, 1)
+            If ch = "&" And i < String.Len(Me.Caption) Then
+                i += 1
+                ch = String.Mid(Me.Caption, i, 1)
+                If ch <> "&" And Me.mMnemonic = "" Then
+                    Me.mMnemonic = String.LCase(ch)
+                    Me.mMnemonicIndex = String.Len(Me.mDisplayCaption)
+                End If
+            End If
+            Me.mDisplayCaption += ch
+            i += 1
+        End While
+    End Sub
+
+    Private Sub UpdateAccessibleText()
+        ' Buoy's own sticky default-label path preserves explicit overrides,
+        ' including an explicit label equal to the current caption.
+        Me.SetDefaultAccessibleLabel(Me.DisplayCaption)
+        Me.NotifyAccessibilityChanged()
+    End Sub
+
+    ' The compiler has no Canvas focus event. Observe actual native focus and
+    ' activity without requiring a special host window or retaining the control.
+    @Hidden
+    Public Sub Synchronize()
+        If Me.mClosed Or Me.mSynchronizing Then Return
+        Me.mSynchronizing = True
+        Try
+            Me.mNative = ReadBevelNativeState(Me.NativeWidget)
+            Me.mTooltipBridge.Apply(Me.NativeWidget, Me.Tooltip)
+            Me.mLastNativeError = ""
+            Dim focused As Boolean = Me.HasFocus() And Me.mNative.Active And Me.Focusable
+            Dim enabled As Boolean = Me.Enabled And Me.mNative.Enabled
+            Dim visible As Boolean = Me.Visible And (Not Me.mNative.Attached Or Me.mNative.Visible)
+            Dim dark As Boolean = Me.IsDark
+            If Not enabled Or Not visible Or (Me.mNative.Attached And Not Me.mNative.Active) Or (Me.mHadFocus And Not focused) Then
+                If Me.mPointerArmed Or Me.mKeyArmed Then Me.CancelPress()
+            ElseIf Not Me.Focusable And Me.mKeyArmed Then
+                Me.CancelPress()
+            End If
+            If focused <> Me.mHadFocus Then
+                Me.mHadFocus = focused
+                Me.Invalidate()
+                If focused Then
+                    RaiseEvent FocusReceived()
+                Else
+                    RaiseEvent FocusLost()
+                End If
+            End If
+            If enabled <> Me.mWasEnabled Or visible <> Me.mWasVisible Or dark <> Me.mWasDark Or Me.mNative.Active <> Me.mWasActive Or Me.Focusable <> Me.mWasFocusable Then Me.Invalidate()
+            Me.mWasEnabled = enabled
+            Me.mWasVisible = visible
+            Me.mWasDark = dark
+            Me.mWasActive = Me.mNative.Active
+            Me.mWasFocusable = Me.Focusable
+        Catch e As Exception
+            Me.mLastNativeError = e.Message
+            Me.CancelPress()
+        Finally
+            Me.mSynchronizing = False
+        End Try
+    End Sub
+
+    Private Function CanActivate() As Boolean
+        If Me.mClosed Or Not Me.Enabled Or Not Me.Visible Then Return False
+        If Me.ParentWindow <> Nil Then
+            Me.Synchronize()
+            Return Me.mNative.Attached And Me.mNative.Enabled And Me.mNative.Visible
+        End If
+        Return True
+    End Function
+
+    Public Sub Press()
+        If Not Me.CanActivate() Then Return
+        Me.CancelPress()
+        If Me.HasMenu And Not Me.SplitMenu Then
+            Me.ShowMenu()
+            Return
+        End If
+        Dim previous As Boolean = Me.Value
+        Select Case Me.ButtonStyle
+            Case BevelButtonStyle.ToggleButton
+                Me.Value = Not Me.Value
+            Case BevelButtonStyle.StickyButton
+                Me.Value = True
+        End Select
+        Me.Invalidate()
+        If previous <> Me.Value Then RaiseEvent ValueChanged(Me.Value)
+        RaiseEvent Action()
+        RaiseEvent Pressed()
+    End Sub
+
+    ' Same spelling as Buoy's native Button test hook.
+    @Hidden
+    Public Sub PerformClick()
+        Me.Press()
+    End Sub
+
+    Public Sub CancelPress()
+        Me.mPointerArmed = False
+        Me.mMenuArmed = False
+        Me.mKeyArmed = False
+        Me.mActivationKey = KeyName.Other
+        Me.Invalidate()
+    End Sub
+
+    Public Function ShowMenu() As Boolean
+        If Not Me.CanActivate() Or Not Me.HasMenu Or Me.ParentWindow = Nil Then Return False
+        Me.CancelPress()
+        If RaiseEvent MenuOpening() Then Return False
+        If Not Me.CanActivate() Or Not Me.HasMenu Then Return False
+        If Me.Menu.Count() = 0 Then Return False
+        Dim location As Point
+        If Me.MenuStyle = BevelButtonMenuStyle.Right Then
+            location.X = Me.Width
+            location.Y = 0
+        Else
+            location.X = 0
+            location.Y = Me.Height
+        End If
+        BindBevelMenu(Me.Menu, Me)
+        Me.Menu.Show(Me, location)
+        FocusBevelMenu(Me.NativeWidget)
+        Return True
+    End Function
+
+    Private Function HasMenuItem(menu As MenuItem, item As MenuItem) As Boolean
+        If Not menu.Enabled Then Return False
+        If menu Is item Then Return True
+        For i As Integer = 0 To menu.Count() - 1
+            If Me.HasMenuItem(menu.Item(i), item) Then Return True
+        Next
+        Return False
+    End Function
+
+    Handle ContextualMenuAction(hitItem As MenuItem)
+        If Not Me.CanActivate() Or Me.Menu = Nil Or hitItem = Nil Then Return
+        For i As Integer = 0 To Me.Menu.Count() - 1
+            If Me.HasMenuItem(Me.Menu.Item(i), hitItem) Then
+                RaiseEvent MenuSelected(hitItem)
+                Return
+            End If
+        Next
+    End Handle
+
+    ' Forward a Window KeyDown event here to route default/cancel/mnemonic keys.
+    ' The caller chooses button precedence; already-handled input is ignored.
+    Public Function HandleShortcut(e As KeyEvent) As Boolean
+        If e.Handled Or Not Me.CanActivate() Then Return False
+        Dim matches As Boolean = (Me.Default And e.Key = KeyName.Return) Or (Me.Cancel And e.Key = KeyName.Escape)
+        If e.Modifiers <> Nil And e.Character > 0 Then
+            If e.Modifiers.Option And Not e.Modifiers.Control And Not e.Modifiers.Command Then
+                matches = matches Or (Me.Mnemonic <> "" And String.LCase(String.Chr(e.Character)) = Me.Mnemonic)
+            End If
+        End If
+        If Not matches Then Return False
+        e.Handled = True
+        If Not e.IsRepeat Then Me.Press()
+        Return True
+    End Function
+
+    Public Function ContainsPoint(x As Double, y As Double) As Boolean
+        If x < 0 Or y < 0 Or x >= Me.Width Or y >= Me.Height Then Return False
+        If Me.BevelStyle = BevelButtonBevel.Round Then
+            Dim diameter As Double = Math.Min(Me.Width, Me.Height)
+            If diameter <= 0 Then Return False
+            Dim dx As Double = (x - Me.Width / 2.0) / (diameter / 2.0)
+            Dim dy As Double = (y - Me.Height / 2.0) / (diameter / 2.0)
+            Return dx * dx + dy * dy <= 1.0
+        End If
+        Return True
+    End Function
+
+    Private Function InMenuPart(x As Double) As Boolean
+        If Not Me.HasMenu Or Not Me.SplitMenu Then Return False
+        If Me.mNative.RightToLeft Then Return x < 22
+        Return x >= Me.Width - 22
+    End Function
+
+    Handle MouseDown(e As MouseEvent)
+        If Not Me.CanActivate() Or e.Button <> MouseButton.Left Or Me.mKeyArmed Then Return
+        Me.mInside = Me.ContainsPoint(e.X, e.Y)
+        Me.mPointerArmed = Me.mInside
+        Me.mMenuArmed = Me.InMenuPart(e.X)
+        e.Handled = Me.mInside
+        If Me.Focusable Then Me.SetFocus()
+        Me.Invalidate()
+    End Handle
+    Handle MouseDrag(e As MouseEvent)
+        Me.mInside = Me.ContainsPoint(e.X, e.Y) And (Me.mMenuArmed = Me.InMenuPart(e.X))
+        Me.Invalidate()
+    End Handle
+    Handle MouseEnter(e As MouseEvent)
+        Me.mInside = Me.ContainsPoint(e.X, e.Y)
+        Me.Invalidate()
+    End Handle
+    Handle MouseExit(e As MouseEvent)
+        Me.mInside = False
+        Me.Invalidate()
+    End Handle
+    Handle MouseUp(e As MouseEvent)
+        If e.Button <> MouseButton.Left Then Return
+        ' Synchronize may cancel a press lost to another window/control.
+        If Me.ParentWindow <> Nil Then Me.Synchronize()
+        Dim activate As Boolean = Me.mPointerArmed And Me.ContainsPoint(e.X, e.Y) And (Me.mMenuArmed = Me.InMenuPart(e.X))
+        Dim menuPart As Boolean = Me.mMenuArmed
+        Me.CancelPress()
+        If activate Then
+            If menuPart Then
+                Me.ShowMenu()
+            Else
+                Me.Press()
+            End If
+        End If
+        e.Handled = activate
+    End Handle
+    Handle TabPressed(shiftHeld As Boolean) As Boolean
+        Me.CancelPress()
+        Return False
+    End Handle
+    Handle KeyDown(e As KeyEvent)
+        If e.Handled Or Not Me.CanActivate() Then Return
+        If e.Key <> KeyName.Return Then
+            If Me.HandleShortcut(e) Then Return
+        End If
+        If e.Key = KeyName.Escape Or e.Key = KeyName.Tab Then
+            Me.CancelPress()
+            e.Handled = e.Key = KeyName.Escape
+        ElseIf Me.HasMenu And (e.Key = KeyName.Down Or e.Key = KeyName.F4 Or (e.Key = KeyName.Right And Me.MenuStyle = BevelButtonMenuStyle.Right)) Then
+            e.Handled = True
+            If Not e.IsRepeat Then Me.ShowMenu()
+        ElseIf Me.Focusable And (e.Key = KeyName.Space Or e.Key = KeyName.Return) Then
+            If Not Me.mPointerArmed And Not Me.mKeyArmed And Not e.IsRepeat Then
+                Me.mKeyArmed = True
+                Me.mActivationKey = e.Key
+                Me.Invalidate()
+            End If
+            e.Handled = True
+        End If
+    End Handle
+    Handle KeyUp(e As KeyEvent)
+        If Me.ParentWindow <> Nil Then Me.Synchronize()
+        If Me.mKeyArmed And e.Key = Me.mActivationKey Then
+            Me.CancelPress()
+            Me.Press()
+            e.Handled = True
+        End If
+    End Handle
+
+    Private Function ResolvedFontName() As String
+        If Me.FontName <> "" And Me.FontName <> "System" And Me.FontName <> "SmallSystem" Then Return Me.FontName
+        #If TargetWindows Then
+            Return "Segoe UI"
+        #ElseIf TargetMac Then
+            Return "Helvetica"
+        #Else
+            Return "Sans"
+        #End If
+    End Function
+
+    Private Function ResolvedFontSize() As Double
+        Dim size As Double = Me.FontSize
+        If size = 0 Then
+            size = 14
+            If Me.FontName = "SmallSystem" Then size = 12
+        End If
+        If Me.FontUnit = BevelButtonFontUnit.Pixel And Me.ParentWindow <> Nil Then
+            size /= Math.Max(1.0, Me.ParentWindow.ScaleFactor)
+        End If
+        Return size
+    End Function
+
+    Private Sub ApplyFont(g As Graphics)
+        g.Bold = Me.Bold
+        g.Italic = Me.Italic
+        g.Underline = Me.Underline
+    End Sub
+
+    Private Function FitText(g As Graphics, text As String, available As Double) As String
+        If Me.TextOverflow = BevelButtonTextOverflow.Clip Then Return text
+        If g.MeasureStringWidth(text, Me.ResolvedFontName(), Me.ResolvedFontSize()) <= available Then Return text
+        Dim suffix As String = "…"
+        If g.MeasureStringWidth(suffix, Me.ResolvedFontName(), Me.ResolvedFontSize()) > available Then Return ""
+        Dim lo As Integer = 0
+        Dim hi As Integer = String.Len(text)
+        While lo < hi
+            Dim mid As Integer = (lo + hi + 1) \ 2
+            If g.MeasureStringWidth(String.Left(text, mid) + suffix, Me.ResolvedFontName(), Me.ResolvedFontSize()) <= available Then
+                lo = mid
+            Else
+                hi = mid - 1
+            End If
+        End While
+        Return String.Left(text, lo) + suffix
+    End Function
+
+    ' Caller supplies a live Graphics (Paint or Picture.Graphics).
+    Public Function MeasureLayout(g As Graphics) As BevelButtonLayout
+        Dim layout As New BevelButtonLayout()
+        Dim pad As Double = Math.Min(Me.Padding, Math.Max(0.0, Math.Min(Me.Width, Me.Height) / 2.0))
+        layout.ContentX = pad
+        layout.ContentY = pad
+        layout.ContentWidth = Math.Max(0.0, Me.Width - 2.0 * pad)
+        layout.ContentHeight = Math.Max(0.0, Me.Height - 2.0 * pad)
+        If Me.HasMenu Then
+            layout.MenuWidth = Math.Min(22.0, Math.Max(0.0, Me.Width))
+            layout.MenuX = Me.Width - layout.MenuWidth
+            layout.ContentWidth = Math.Max(0.0, layout.ContentWidth - layout.MenuWidth)
+            If Me.mNative.RightToLeft Then
+                layout.MenuX = 0
+                layout.ContentX += layout.MenuWidth
+            End If
+        End If
+        g.Save()
+        Me.ApplyFont(g)
+        Dim position As BevelButtonCaptionPosition = Me.CaptionPosition
+        If position = BevelButtonCaptionPosition.Normal Then position = BevelButtonCaptionPosition.RightOfIcon
+        If position = BevelButtonCaptionPosition.SystemDirection Then
+            position = BevelButtonCaptionPosition.RightOfIcon
+            If Me.mNative.RightToLeft Then position = BevelButtonCaptionPosition.LeftOfIcon
+        End If
+        Dim alignment As BevelButtonCaptionAlignment = Me.CaptionAlignment
+        If alignment = BevelButtonCaptionAlignment.SystemDirection Then
+            alignment = BevelButtonCaptionAlignment.Left
+            If Me.mNative.RightToLeft Then alignment = BevelButtonCaptionAlignment.Right
+        End If
+        Dim iconAlignment As BevelButtonIconAlignment = Me.IconAlignment
+        If iconAlignment = BevelButtonIconAlignment.SystemDirection Then
+            iconAlignment = BevelButtonIconAlignment.Left
+            If Me.mNative.RightToLeft Then iconAlignment = BevelButtonIconAlignment.Right
+        End If
+        Dim iw As Double = 0
+        Dim ih As Double = 0
+        If Me.Icon <> Nil Then
+            Dim requested As Double = Me.IconSize
+            If requested = 0 Then requested = Math.Max(Me.Icon.Width, Me.Icon.Height)
+            Dim longest As Double = Math.Max(1.0, Math.Max(Me.Icon.Width, Me.Icon.Height))
+            Dim scale As Double = Math.Min(requested / longest, Math.Min(layout.ContentWidth / Math.Max(1.0, Me.Icon.Width), layout.ContentHeight / Math.Max(1.0, Me.Icon.Height)))
+            iw = Me.Icon.Width * scale
+            ih = Me.Icon.Height * scale
+        End If
+        Dim gap As Double = 0
+        If iw > 0 And Me.DisplayCaption <> "" Then gap = Me.Gap
+        Dim horizontal As Boolean = position = BevelButtonCaptionPosition.RightOfIcon Or position = BevelButtonCaptionPosition.LeftOfIcon
+        Dim available As Double = layout.ContentWidth
+        If horizontal Then available = Math.Max(0.0, available - iw - gap)
+        layout.Text = Me.FitText(g, Me.DisplayCaption, available)
+        Dim tw As Double = g.MeasureStringWidth(layout.Text, Me.ResolvedFontName(), Me.ResolvedFontSize())
+        Dim th As Double = 0
+        If layout.Text <> "" Then th = g.MeasureStringHeight(layout.Text, Me.ResolvedFontName(), Me.ResolvedFontSize())
+        Dim gw As Double = Math.Max(iw, tw)
+        Dim gh As Double = ih + gap + th
+        If horizontal Then
+            gw = iw + gap + tw
+            gh = Math.Max(ih, th)
+        End If
+        Dim left As Boolean = iconAlignment = BevelButtonIconAlignment.Left Or iconAlignment = BevelButtonIconAlignment.TopLeft Or iconAlignment = BevelButtonIconAlignment.BottomLeft
+        Dim right As Boolean = iconAlignment = BevelButtonIconAlignment.Right Or iconAlignment = BevelButtonIconAlignment.TopRight Or iconAlignment = BevelButtonIconAlignment.BottomRight
+        Dim top As Boolean = iconAlignment = BevelButtonIconAlignment.Top Or iconAlignment = BevelButtonIconAlignment.TopLeft Or iconAlignment = BevelButtonIconAlignment.TopRight
+        Dim bottom As Boolean = iconAlignment = BevelButtonIconAlignment.Bottom Or iconAlignment = BevelButtonIconAlignment.BottomLeft Or iconAlignment = BevelButtonIconAlignment.BottomRight
+        Dim gx As Double = layout.ContentX + (layout.ContentWidth - gw) / 2.0
+        Dim gy As Double = layout.ContentY + (layout.ContentHeight - gh) / 2.0
+        If left Then gx = layout.ContentX + Me.IconDeltaX
+        If right Then gx = layout.ContentX + layout.ContentWidth - gw - Me.IconDeltaX
+        If top Then gy = layout.ContentY + Me.IconDeltaY
+        If bottom Then gy = layout.ContentY + layout.ContentHeight - gh - Me.IconDeltaY
+        layout.IconX = gx + (gw - iw) / 2.0
+        layout.IconY = gy + (gh - ih) / 2.0
+        layout.TextX = gx + (gw - tw) / 2.0
+        layout.TextY = gy + (gh - th) / 2.0
+        Dim textLeft As Double = layout.ContentX
+        Dim textRight As Double = layout.ContentX + layout.ContentWidth
+        If horizontal Then
+            If position = BevelButtonCaptionPosition.RightOfIcon Then
+                layout.IconX = gx
+                layout.TextX = gx + iw + gap
+                textLeft = layout.TextX
+            Else
+                layout.TextX = gx
+                layout.IconX = gx + tw + gap
+                textRight = layout.IconX - gap
+            End If
+        ElseIf position = BevelButtonCaptionPosition.AboveIcon Then
+            layout.TextY = gy
+            layout.IconY = gy + th + gap
+        Else
+            layout.IconY = gy
+            layout.TextY = gy + ih + gap
+        End If
+        If Me.Icon = Nil Then
+            layout.TextX = layout.ContentX + (layout.ContentWidth - tw) / 2.0
+            layout.TextY = layout.ContentY + (layout.ContentHeight - th) / 2.0
+        End If
+        If alignment = BevelButtonCaptionAlignment.Left Then layout.TextX = textLeft + Me.CaptionDelta
+        If alignment = BevelButtonCaptionAlignment.Right Then layout.TextX = textRight - tw - Me.CaptionDelta
+        layout.TextWidth = tw
+        layout.TextHeight = th
+        layout.IconWidth = iw
+        layout.IconHeight = ih
+        g.Restore()
+        Return layout
+    End Function
+
+    Private Sub Triangle(g As Graphics, x As Double, y As Double, direction As Integer, ink As Color)
+        g.BeginPath()
+        If direction = 0 Then ' down
+            g.MoveTo(x - 4, y - 2)
+            g.LineTo(x + 4, y - 2)
+            g.LineTo(x, y + 3)
+        ElseIf direction = 1 Then ' right
+            g.MoveTo(x - 2, y - 4)
+            g.LineTo(x + 3, y)
+            g.LineTo(x - 2, y + 4)
+        Else ' left
+            g.MoveTo(x + 2, y - 4)
+            g.LineTo(x - 3, y)
+            g.LineTo(x + 2, y + 4)
+        End If
+        g.ClosePath()
+        g.FillPath(ink)
+    End Sub
+
+    ' Draws at the graphics origin; use Graphics.Translate for placement.
+    Public Sub Draw(g As Graphics)
+        Dim w As Double = Me.Width
+        Dim h As Double = Me.Height
+        If w < 2 Or h < 2 Then Return
+        Dim down As Boolean = Me.IsPressed
+        Dim face As Color = Me.BackgroundColor
+        If Not Me.HasBackgroundColor Then
+            face = Color.RGB(0.88, 0.89, 0.91)
+            If Me.IsDark Then face = Color.RGB(0.21, 0.22, 0.24)
+        End If
+        Dim ink As Color = Me.TextColor
+        Dim edge As Color = Color.RGB(0.45, 0.46, 0.48)
+        Dim light As Color = Color.White
+        If Me.IsDark Then
+            edge = Color.RGB(0.08, 0.09, 0.1)
+            light = Color.RGB(0.4, 0.41, 0.43)
+        End If
+        Dim enabled As Boolean = Me.Enabled And Me.mNative.Enabled And Not Me.mClosed
+        If down Then
+            face = MixBevelColor(face, ink, 0.18)
+        ElseIf Me.mInside And enabled Then
+            face = MixBevelColor(face, ink, 0.07)
+        End If
+        If Not enabled Then
+            ink = MixBevelColor(ink, face, 0.6)
+        ElseIf Me.AllowAutoDeactivate And Me.ParentWindow <> Nil And Not Me.Active Then
+            ink = MixBevelColor(ink, face, 0.35)
+        End If
+        g.Save()
+        If Me.BevelStyle = BevelButtonBevel.Round Then
+            Dim d As Double = Math.Min(w, h) - 2
+            If Not Me.Transparent Then g.FillOval((w - d) / 2.0, (h - d) / 2.0, d, d, face)
+            g.StrokeOval((w - d) / 2.0, (h - d) / 2.0, d, d, 1, edge)
+        ElseIf Me.BevelStyle = BevelButtonBevel.Rounded Or Me.BevelStyle = BevelButtonBevel.LargeRound Then
+            Dim radius As Double = 7
+            If Me.BevelStyle = BevelButtonBevel.LargeRound Then radius = Math.Min(w, h) / 2.0
+            If Not Me.Transparent Then g.FillRoundedRect(1, 1, w - 2, h - 2, radius, face)
+            g.StrokeRoundedRect(1, 1, w - 2, h - 2, radius, 1, edge)
+        Else
+            If Not Me.Transparent Then g.FillRect(0, 0, w, h, face)
+            Dim depth As Integer = 2
+            Select Case Me.BevelStyle
+                Case BevelButtonBevel.None, BevelButtonBevel.Disclosure
+                    depth = 0
+                Case BevelButtonBevel.Small
+                    depth = 1
+                Case BevelButtonBevel.Large
+                    depth = 3
+            End Select
+            Dim shadow As Color = edge
+            If down Then
+                shadow = light
+                light = edge
+            End If
+            For i As Integer = 0 To depth - 1
+                If w > 2 * i And h > 2 * i Then
+                    g.DrawLine(i, h - i - 1, i, i, 1, light)
+                    g.DrawLine(i, i, w - i - 1, i, 1, light)
+                    g.DrawLine(w - i - 1, i, w - i - 1, h - i - 1, 1, shadow)
+                    g.DrawLine(w - i - 1, h - i - 1, i, h - i - 1, 1, shadow)
+                End If
+            Next
+            If Me.BevelStyle = BevelButtonBevel.None And Me.mInside And enabled Then g.StrokeRect(0.5, 0.5, w - 1, h - 1, 1, edge)
+        End If
+        Dim accent As Color = Color.RGB(0.2, 0.5, 0.95)
+        If Me.Default Then g.StrokeRoundedRect(1, 1, w - 2, h - 2, 3, 2, accent)
+        If enabled And Me.HasFocus() And Me.Focusable And Me.Active And w > 8 And h > 8 Then
+            g.LineStyle = Graphics.LineStyle.Dot
+            g.StrokeRect(3, 3, w - 6, h - 6, 1, accent)
+            g.LineStyle = Graphics.LineStyle.Solid
+        End If
+        Dim layout As BevelButtonLayout = Me.MeasureLayout(g)
+        If Me.HasMenu Then
+            Dim direction As Integer = 0
+            If Me.MenuStyle = BevelButtonMenuStyle.Right Then
+                direction = 1
+                If Me.mNative.RightToLeft Then direction = 2
+            End If
+            Me.Triangle(g, layout.MenuX + layout.MenuWidth / 2.0, h / 2.0, direction, ink)
+            If Me.SplitMenu Then
+                Dim divider As Double = layout.MenuX
+                If Me.mNative.RightToLeft Then divider += layout.MenuWidth
+                g.DrawLine(divider, 5, divider, h - 5, 1, edge)
+            End If
+        End If
+        g.ClipToRect(layout.ContentX, layout.ContentY, layout.ContentWidth, layout.ContentHeight)
+        Dim offset As Double = 0
+        If down Then offset = 1
+        If Me.BevelStyle = BevelButtonBevel.Disclosure Then
+            Dim direction As Integer = 1
+            If Me.mNative.RightToLeft Then direction = 2
+            If Me.Value Then direction = 0
+            Me.Triangle(g, layout.ContentX + 5, h / 2.0, direction, ink)
+            layout.TextX = Math.Max(layout.TextX, layout.ContentX + 15)
+        End If
+        If Me.Icon <> Nil And layout.IconWidth > 0 And layout.IconHeight > 0 Then
+            g.DrawPicture(Me.Icon, layout.IconX + offset, layout.IconY + offset, layout.IconWidth, layout.IconHeight)
+            If Not enabled Then g.FillRect(layout.IconX + offset, layout.IconY + offset, layout.IconWidth, layout.IconHeight, Color.RGBA(face.R, face.G, face.B, 0.6))
+        End If
+        Me.ApplyFont(g)
+        Dim baseline As Double = layout.TextY + layout.TextHeight * 0.8 + offset
+        g.DrawString(layout.Text, layout.TextX + offset, baseline, Me.ResolvedFontName(), Me.ResolvedFontSize(), ink)
+        If Not Me.Underline And Me.mMnemonicIndex >= 0 And Me.mMnemonicIndex < String.Len(layout.Text) And String.Mid(layout.Text, Me.mMnemonicIndex + 1, 1) = String.Mid(Me.DisplayCaption, Me.mMnemonicIndex + 1, 1) Then
+            Dim prefix As String = String.Left(layout.Text, Me.mMnemonicIndex)
+            Dim start As Double = layout.TextX + offset + g.MeasureStringWidth(prefix, Me.ResolvedFontName(), Me.ResolvedFontSize())
+            Dim letter As String = String.Mid(layout.Text, Me.mMnemonicIndex + 1, 1)
+            Dim length As Double = g.MeasureStringWidth(letter, Me.ResolvedFontName(), Me.ResolvedFontSize())
+            g.DrawLine(start, baseline + 2, start + length, baseline + 2, 1, ink)
+        End If
+        g.Restore()
+    End Sub
+
+    Handle Paint(g As Graphics)
+        Me.Draw(g)
+    End Handle
+End Class
+
+Private Function MixBevelColor(a As Color, b As Color, fraction As Double) As Color
+    Return Color.RGBA(a.R + (b.R - a.R) * fraction, a.G + (b.G - a.G) * fraction, a.B + (b.B - a.B) * fraction, a.A)
+End Function

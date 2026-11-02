@@ -1,0 +1,19 @@
+' Shared display-list records used by the native printing backends.
+' Coordinates, page sizes and font sizes are in points (72 points per inch).
+Public Class BuoyPrintText
+    Public Property Content As String
+    Public Property X As Double
+    Public Property Y As Double
+    Public Property FontName As String = "sans-serif"
+    Public Property FontSize As Double = 12.0
+End Class
+
+Public Class BuoyPrintPage
+    Public Property Items As Array Of BuoyPrintText = []
+End Class
+
+Public Class BuoyPrintDocument
+    Public Property PageWidth As Double = 595.275590551
+    Public Property PageHeight As Double = 841.88976378
+    Public Property Pages As Array Of BuoyPrintPage = []
+End Class

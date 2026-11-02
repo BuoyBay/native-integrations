@@ -1,0 +1,273 @@
+' Shared native printing API for Linux and Windows.
+Import printingtypes
+#If TargetLinux Then
+Import "../linux/linuxprinting" As PrintBackend
+#ElseIf TargetWindows Then
+Import "../windows/WinPrinting" As PrintBackend
+#End If
+
+Public Class PrinterInfo
+    Public Property Name As String
+    Public Property IsDefault As Boolean
+End Class
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Or TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Private Sub ValidatePrintString(value As String, allowEmpty As Boolean)
+    If Not allowEmpty And value = "" Then
+        Throw New InvalidArgumentException("Printing input must be nonempty")
+    End If
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Printing input cannot contain NUL")
+        End If
+    Next
+End Sub
+
+''' Xojo-inspired setup. Page dimensions are a logical canvas in 72-point inches.
+Public Class PrinterSetup
+    Public Property PrinterName As String = ""
+    Public Property JobName As String = "Buoy document"
+    Public Property Landscape As Boolean = False
+    Public Property PageWidth As Double = 595.275590551
+    Public Property PageHeight As Double = 841.88976378
+
+    Public Property HorizontalResolution As Integer
+        Get
+            Return 72
+        End Get
+    End Property
+
+    Public Property VerticalResolution As Integer
+        Get
+            Return 72
+        End Get
+    End Property
+
+    Public Shared Function OpenPrinter() As PrinterGraphics
+        Dim defaults As New PrinterSetup
+        Return PrinterSetup.OpenPrinter(defaults)
+    End Function
+
+    Public Shared Function OpenPrinter(setup As PrinterSetup) As PrinterGraphics
+        If Not IsSupported() Then
+            Throw New UnsupportedOperationException("Native printing requires Linux or Windows")
+        End If
+        If setup = Nil Then
+            Dim defaults As New PrinterSetup
+            Return New PrinterGraphics(defaults)
+        End If
+        Return New PrinterGraphics(setup)
+    End Function
+End Class
+
+''' Legacy REALbasic-style global spelling, alongside PrinterSetup.OpenPrinter.
+Public Function OpenPrinter(setup As PrinterSetup) As PrinterGraphics
+    Return PrinterSetup.OpenPrinter(setup)
+End Function
+
+Public Function OpenPrinter() As PrinterGraphics
+    Return PrinterSetup.OpenPrinter()
+End Function
+
+''' Buffered text drawing. Explicit Close submits; Cancel/destruction never submits.
+Public Class PrinterGraphics
+    Public Property FontName As String = "System"
+    Public Property FontSize As Double = 12.0
+    Private Property Document As BuoyPrintDocument
+    Private Property SelectedPrinter As String
+    Private Property SelectedTitle As String
+    Private Property Finished As Boolean = False
+    Private Property Cancelled As Boolean = False
+    Private Property AcceptedJob As Integer = 0
+    Private Property ItemCount As Integer = 0
+    Private Property ContentBytes As Integer = 0
+
+    Public Sub Constructor(setup As PrinterSetup)
+        If Not IsSupported() Then
+            Throw New UnsupportedOperationException("Native printing requires Linux or Windows")
+        End If
+        If setup = Nil Then
+            Throw New InvalidArgumentException("PrinterSetup must not be Nil")
+        End If
+        ValidatePrintString(setup.PrinterName, True)
+        ValidatePrintString(setup.JobName, False)
+        If Not (setup.PageWidth >= 1.0 And setup.PageWidth <= 14400.0 And setup.PageHeight >= 1.0 And setup.PageHeight <= 14400.0) Then
+            Throw New InvalidArgumentException("Page dimensions must be within 1..14400 points")
+        End If
+        SelectedPrinter = setup.PrinterName
+        If SelectedPrinter = "" Then
+            Dim selected As Optional Of String = DefaultPrinter()
+            If Not selected.HasValue Then
+                Throw New RuntimeException("No default printer; set PrinterName explicitly")
+            End If
+            SelectedPrinter = selected.Value
+        End If
+        SelectedTitle = setup.JobName
+        Document = New BuoyPrintDocument
+        Document.PageWidth = setup.PageWidth
+        Document.PageHeight = setup.PageHeight
+        If setup.Landscape And Document.PageHeight > Document.PageWidth Then
+            Document.PageWidth = setup.PageHeight
+            Document.PageHeight = setup.PageWidth
+        End If
+        Array.Append(Document.Pages, New BuoyPrintPage)
+    End Sub
+
+    Private Sub RequireOpen()
+        If Finished Then
+            Throw New InvalidArgumentException("Printer graphics is closed")
+        End If
+    End Sub
+
+    Public Property Width As Double
+        Get
+            Return Document.PageWidth
+        End Get
+    End Property
+
+    Public Property Height As Double
+        Get
+            Return Document.PageHeight
+        End Get
+    End Property
+
+    Public Property PageCount As Integer
+        Get
+            Return Array.Count(Document.Pages)
+        End Get
+    End Property
+
+    Public Property IsClosed As Boolean
+        Get
+            Return Finished
+        End Get
+    End Property
+
+    Public Property PrintingCancelled As Boolean
+        Get
+            Return Cancelled
+        End Get
+    End Property
+
+    Public Property JobId As Integer
+        Get
+            Return AcceptedJob
+        End Get
+    End Property
+
+    ''' Single-line text at x and baseline y, in points; no automatic wrapping.
+    Public Sub DrawText(str As String, x As Double, y As Double)
+        RequireOpen()
+        ValidatePrintString(str, True)
+        ValidatePrintString(FontName, False)
+        If String.Contains(str, "\n") Or String.Contains(str, "\r") Or String.Contains(str, "\t") Then
+            Throw New InvalidArgumentException("DrawText accepts one line without tabs; use multiple drawing calls")
+        End If
+        Dim fontBytes As Bytes = FontName.AsUTF16LE()
+        If fontBytes.Count > 62 Then
+            Throw New InvalidArgumentException("Font name exceeds 31 UTF-16 code units")
+        End If
+        If Not (x >= 0.0 And x <= Width And y >= 0.0 And y <= Height And FontSize >= 1.0 And FontSize <= 1000.0) Then
+            Throw New InvalidArgumentException("Invalid text position or font size")
+        End If
+        Dim encoded As Bytes = Bytes.FromString(str, Text.Encodings.UTF8)
+        If ItemCount >= 100000 Or ContentBytes + encoded.Count > 16777216 Then
+            Throw New InvalidArgumentException("Print document exceeds its text limit")
+        End If
+        Dim item As New BuoyPrintText
+        item.Content = str
+        item.X = x
+        item.Y = y
+        item.FontName = FontName
+        item.FontSize = FontSize
+        Dim page As BuoyPrintPage = Document.Pages(Array.Count(Document.Pages) - 1)
+        Array.Append(page.Items, item)
+        ItemCount += 1
+        ContentBytes += encoded.Count
+    End Sub
+
+    Public Sub NextPage()
+        RequireOpen()
+        If Array.Count(Document.Pages) >= 1000 Then
+            Throw New InvalidArgumentException("Print document exceeds 1000 pages")
+        End If
+        Array.Append(Document.Pages, New BuoyPrintPage)
+    End Sub
+
+    Public Sub Cancel()
+        If Not Finished Then
+            Finished = True
+            Cancelled = True
+            If Document <> Nil Then
+                Document.Pages = []
+            End If
+        End If
+    End Sub
+
+    ''' Submit once. A failed submission is terminal to prevent accidental retries.
+    Public Function Close() As Integer
+        If Finished Then
+            Return AcceptedJob
+        End If
+        Finished = True
+#If TargetLinux Or TargetWindows Then
+        AcceptedJob = PrintBackend.PrintPages(SelectedPrinter, SelectedTitle, Document)
+        Return AcceptedJob
+#Else
+        Throw New UnsupportedOperationException("Native printing requires Linux or Windows")
+#End If
+    End Function
+
+    Public Sub Destructor()
+        ' Dropping an object must never create a surprise physical print job.
+        Cancel()
+    End Sub
+End Class
+
+Public Function IsAvailable() As Boolean
+#If TargetLinux Or TargetWindows Then
+    Return PrintBackend.IsAvailable()
+#Else
+    Return False
+#End If
+End Function
+
+Public Function Printers() As Array Of PrinterInfo
+#If TargetLinux Or TargetWindows Then
+    Dim records As Array Of PrinterInfo = []
+    For Each native In PrintBackend.Printers()
+        Dim entry As New PrinterInfo
+        entry.Name = native.Name
+        entry.IsDefault = native.IsDefault
+        Array.Append(records, entry)
+    Next
+    Return records
+#Else
+    Throw New UnsupportedOperationException("Native printing requires Linux or Windows")
+#End If
+End Function
+
+Public Function DefaultPrinter() As Optional Of String
+#If TargetLinux Or TargetWindows Then
+    Return PrintBackend.DefaultPrinter()
+#Else
+    Throw New UnsupportedOperationException("Native printing requires Linux or Windows")
+#End If
+End Function
+
+''' Submit UTF-8 text to an explicitly selected printer; returns the spool job ID.
+Public Function PrintText(printerName As String, title As String, text As String) As Integer
+#If TargetLinux Or TargetWindows Then
+    Return PrintBackend.PrintText(printerName, title, text)
+#Else
+    Throw New UnsupportedOperationException("Native printing requires Linux or Windows")
+#End If
+End Function

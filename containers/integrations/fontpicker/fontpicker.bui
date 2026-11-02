@@ -1,0 +1,535 @@
+' Native font selection. GTK/Win32 commit on OK; AppKit is a live shared panel.
+Public Class FontSelection
+    Public Property Family As String = "Sans"
+    Public Property Size As Double = 12.0
+    Public Property Bold As Boolean = False
+    Public Property Italic As Boolean = False
+    Public Sub Constructor(family As String = "Sans", size As Double = 12.0, bold As Boolean = False, italic As Boolean = False)
+        Me.Family = family
+        Me.Size = size
+        Me.Bold = bold
+        Me.Italic = italic
+    End Sub
+    Public Function Copy() As FontSelection
+        Return New FontSelection(Me.Family, Me.Size, Me.Bold, Me.Italic)
+    End Function
+End Class
+
+Private Class FontRequest
+    Public Property Owner As Weak FontPicker
+    Public Property Dialog As Ptr = Nil
+    Public Property Cancellable As Ptr = Nil
+End Class
+Private Class FontRequests
+    Public Shared Property Items As Array Of FontRequest = []
+    Public Shared Property Panel As FontRequest = New FontRequest()
+End Class
+
+Public Class FontPicker
+    Event Selected(font As FontSelection)
+    Event SelectionChanged(font As FontSelection)
+    Event Cancelled()
+    Private Property mValue As FontSelection = New FontSelection()
+    Private Property mID As Integer = -1
+    Private Property mOpen As Boolean = False
+    Private Property mDialog As Ptr = Nil
+    Private Property mTarget As Ptr = Nil
+    Private Property mPreviousTarget As Ptr = Nil
+    Private Property mPreviousAction As Ptr = Nil
+    Private Property mPreviousTitle As Ptr = Nil
+    Private Property mOriginalFont As Ptr = Nil
+    Private Property mParent As Weak Window
+    Public Property Title As String = "Choose Font"
+    Public Property LastNativeError As String = ""
+
+    Public Property Value As FontSelection
+        Get
+            Return Me.mValue.Copy()
+        End Get
+        Set
+            If Me.mOpen Then Throw New InvalidArgumentException("Close FontPicker before changing Value")
+            ValidateFont(value)
+            Me.mValue = value.Copy()
+        End Set
+    End Property
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mOpen
+        End Get
+    End Property
+    Public Property IsModeless As Boolean
+        Get
+            #If TargetMac Then
+                Return True
+            #Else
+                Return False
+            #End If
+        End Get
+    End Property
+    Public Shared Function IsSupported() As Boolean
+        #If TargetLinux Then
+            Return FontGTKMajor() > 4 Or (FontGTKMajor() = 4 And FontGTKMinor() >= 10)
+        #Else
+            Return True
+        #End If
+    End Function
+
+    Public Sub Show(parent As Window)
+        If parent = Nil Then Throw New InvalidArgumentException("FontPicker requires a parent window")
+        If parent.NativeWidget = Nil Then Throw New InvalidArgumentException("FontPicker parent has no native window")
+        If Me.mOpen Then Throw New InvalidArgumentException("FontPicker is already open")
+        ValidateFont(Me.mValue)
+        If Not FontPicker.IsSupported() Then Throw New UnsupportedOperationException("FontPicker requires GTK 4.10 or later")
+        Me.LastNativeError = ""
+        Me.mParent = parent
+        #If TargetLinux Then
+            Me.ShowGTK(parent)
+        #ElseIf TargetWindows Then
+            Me.ShowWindows(parent)
+        #ElseIf TargetMac Then
+            Try
+                Me.ShowMac(parent)
+            Catch e As Exception
+                Me.Close()
+                Throw e
+            End Try
+        #End If
+    End Sub
+
+    ' Silent programmatic dismissal. It does not mean the user cancelled.
+    Public Sub Close()
+        #If TargetLinux Then
+            If Me.mID >= 0 Then
+                Dim request As FontRequest = FontRequests.Items(Me.mID)
+                request.Owner = Nil
+                If request.Cancellable <> Nil Then FontCancel(request.Cancellable)
+            End If
+            Me.mID = -1
+        #ElseIf TargetWindows Then
+            If Me.mOpen And Me.mDialog <> Nil Then FontEndDialog(Me.mDialog, 0)
+            Me.mDialog = Nil
+        #ElseIf TargetMac Then
+            If Me.mTarget <> Nil Then
+                Dim manager As Ptr = FontManager(FontClass("NSFontManager"))
+                If FontGetTarget(manager) = Me.mTarget Then
+                    FontSetTarget(manager, Me.mPreviousTarget)
+                    FontSetAction(manager, Me.mPreviousAction)
+                    If Me.mDialog <> Nil Then
+                        If Me.mPreviousTitle <> Nil Then FontPanelTitle(Me.mDialog, Me.mPreviousTitle)
+                        FontOrderOut(Me.mDialog, Nil)
+                    End If
+                End If
+                FontRemoveObserver(FontCenter(FontClass("NSNotificationCenter")), Me.mTarget)
+                FontRelease(Me.mTarget)
+                FontRequests.Panel.Owner = Nil
+            End If
+            If Me.mPreviousTarget <> Nil Then FontRelease(Me.mPreviousTarget)
+            If Me.mPreviousTitle <> Nil Then FontRelease(Me.mPreviousTitle)
+            If Me.mOriginalFont <> Nil Then FontRelease(Me.mOriginalFont)
+            Me.mTarget = Nil
+            Me.mPreviousTarget = Nil
+            Me.mPreviousAction = Nil
+            Me.mPreviousTitle = Nil
+            Me.mOriginalFont = Nil
+            Me.mDialog = Nil
+        #End If
+        Me.mOpen = False
+        Me.mParent = Nil
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+
+    #If TargetLinux Then
+    Private Sub ShowGTK(parent As Window)
+        Dim request As New FontRequest()
+        request.Dialog = FontGTKNew()
+        If request.Dialog = Nil Then Throw New RuntimeException("Could not create native font dialog")
+        request.Cancellable = FontCancellable()
+        request.Owner = Me
+        Me.mID = -1
+        For i As Integer = 0 To Array.LastIndex(FontRequests.Items)
+            If FontRequests.Items(i) = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(FontRequests.Items)
+            Array.Append(FontRequests.Items, request)
+        Else
+            FontRequests.Items(Me.mID) = request
+        End If
+        Dim initial As Ptr = FontPangoNew()
+        Try
+            FontPangoFamily(initial, Me.mValue.Family)
+            FontPangoSize(initial, Me.mValue.Size * 1024)
+            Dim weight As Integer = 400
+            If Me.mValue.Bold Then weight = 700
+            FontPangoWeight(initial, weight)
+            Dim style As Integer = 0
+            If Me.mValue.Italic Then style = 2
+            FontPangoStyle(initial, style)
+            FontGTKTitle(request.Dialog, Me.Title)
+            FontGTKModal(request.Dialog, 1)
+            Me.mOpen = True
+            FontGTKChoose(request.Dialog, parent.NativeWidget, initial, request.Cancellable, AddressOf FontGTKCompleted, CType(Me.mID + 1, Ptr))
+        Catch e As Exception
+            Dim failedID As Integer = Me.mID
+            Me.Close()
+            FontUnref(request.Dialog)
+            FontUnref(request.Cancellable)
+            FontRequests.Items(failedID) = Nil
+            Throw e
+        Finally
+            FontPangoFree(initial)
+        End Try
+    End Sub
+    Public Sub CompleteGTK(id As Integer, selection As FontSelection, cancelled As Boolean, message As String)
+        If Me.mID <> id Then Return
+        Me.mID = -1
+        Me.mOpen = False
+        Me.mParent = Nil
+        If message <> "" Then
+            Me.LastNativeError = message
+            Return
+        End If
+        Try
+            If cancelled Then
+                RaiseEvent Cancelled()
+            Else
+                Me.Value = selection
+                RaiseEvent Selected(Me.Value)
+            End If
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    #ElseIf TargetWindows Then
+    Private Sub ShowWindows(parent As Window)
+        If FontRequests.Panel.Owner <> Nil Then Throw New InvalidArgumentException("Another native FontPicker is open")
+        Dim name As Bytes = Me.mValue.Family.AsUTF16LE()
+        If name.Count > 62 Then Throw New InvalidArgumentException("Windows font families must fit 31 UTF-16 units")
+        Dim buffer As Bytes = FontZeroes(92)
+        ' Sans is a portable generic family, not an installed Windows face.
+        ' Seed it from the system's native UI font before applying requested traits.
+        If Me.mValue.Family = "Sans" Then
+            If FontSystemParameters(31, 92, buffer.DataPtr(), 0) = 0 Then Throw New RuntimeException("Could not resolve the native Windows UI font")
+        End If
+        Dim dc As Ptr = FontGetDC(parent.NativeWidget)
+        Dim dpi As Integer = FontCaps(dc, 90)
+        FontReleaseDC(parent.NativeWidget, dc)
+        Dim height As Integer = -(Me.mValue.Size * dpi / 72.0)
+        FontWrite32(buffer, 0, height)
+        Dim weight As Integer = 400
+        If Me.mValue.Bold Then weight = 700
+        FontWrite32(buffer, 16, weight)
+        buffer.SetItem(20, 0)
+        buffer.SetItem(21, 0)
+        buffer.SetItem(22, 0)
+        If Me.mValue.Italic Then buffer.SetItem(20, 1)
+        buffer.SetItem(23, 1) ' DEFAULT_CHARSET
+        If Me.mValue.Family <> "Sans" Then
+            For i As Integer = 0 To name.Count - 1
+                buffer.SetItem(28 + i, name.Item(i))
+            Next
+        End If
+        Dim options As FontChoose
+        options.StructSize = 104
+        options.Owner = parent.NativeWidget
+        options.LogFont = buffer.DataPtr()
+        options.PointSize = Me.mValue.Size * 10
+        options.Options = 65609 ' CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_ENABLEHOOK | CF_FORCEFONTEXIST
+        Dim callback As FontWindowsHook = AddressOf FontWindowsMessage
+        options.Hook = CType(callback, Ptr)
+        FontRequests.Panel.Owner = Me
+        Me.mOpen = True
+        Try
+            Dim accepted As Boolean = FontChooseWindows(options) <> 0
+            Dim errorCode As Integer = FontCommonError()
+            Dim notify As Boolean = Me.mOpen
+            Me.mOpen = False
+            Me.mDialog = Nil
+            Me.mParent = Nil
+            FontRequests.Panel.Owner = Nil
+            If Not notify Then Return
+            If Not accepted Then
+                If errorCode <> 0 Then Throw New RuntimeException("ChooseFontW failed: " + Str(errorCode))
+                RaiseEvent Cancelled()
+                Return
+            End If
+            Dim family As New Bytes()
+            For i As Integer = 28 To 90 Step 2
+                If buffer.Item(i) = 0 And buffer.Item(i + 1) = 0 Then Exit For
+                family.Append(buffer.Item(i))
+                family.Append(buffer.Item(i + 1))
+            Next
+            Dim selected As New FontSelection(String.FromUTF16LE(family), options.PointSize / 10.0, FontRead32(buffer, 16) >= 600, buffer.Item(20) <> 0)
+            Me.Value = selected
+            RaiseEvent Selected(Me.Value)
+        Finally
+            Me.mOpen = False
+            Me.mDialog = Nil
+            Me.mParent = Nil
+            FontRequests.Panel.Owner = Nil
+        End Try
+    End Sub
+    Public Sub AttachWindows(widget As Ptr)
+        Me.mDialog = widget
+        Dim title As Bytes = Me.Title.AsUTF16LE()
+        title.Append(0)
+        title.Append(0)
+        FontWindowTitle(widget, title.DataPtr())
+    End Sub
+    #ElseIf TargetMac Then
+    Private Sub ShowMac(parent As Window)
+        If FontRequests.Panel.Owner <> Nil Then Throw New InvalidArgumentException("Another FontPicker owns the shared font panel")
+        Dim manager As Ptr = FontManager(FontClass("NSFontManager"))
+        Me.mDialog = FontPanel(manager, True)
+        Dim traits As Integer = 0
+        If Me.mValue.Bold Then traits += 2
+        If Me.mValue.Italic Then traits += 1
+        Dim initial As Ptr = FontWithFamily(manager, FontString(FontClass("NSString"), Me.mValue.Family), traits, 5, Me.mValue.Size)
+        If initial = Nil Then initial = FontSystem(FontClass("NSFont"), Me.mValue.Size)
+        If initial = Nil Then Throw New RuntimeException("Could not create the initial native font")
+        Me.mOriginalFont = FontRetain(initial)
+        Me.mTarget = FontInit(FontAlloc(FontMacTargetClass()))
+        If Me.mTarget = Nil Then Throw New RuntimeException("Could not create native font target")
+        Me.mPreviousTitle = FontRetain(FontGetTitle(Me.mDialog))
+        Me.mPreviousTarget = FontGetTarget(manager)
+        If Me.mPreviousTarget <> Nil Then FontRetain(Me.mPreviousTarget)
+        Me.mPreviousAction = FontGetAction(manager)
+        FontSetTarget(manager, Me.mTarget)
+        FontSetAction(manager, FontSelector("changeFont:"))
+        FontSetSelected(manager, initial, False)
+        FontAddObserver(FontCenter(FontClass("NSNotificationCenter")), Me.mTarget, FontSelector("fontPanelClosed:"), FontString(FontClass("NSString"), "NSWindowWillCloseNotification"), Me.mDialog)
+        FontRequests.Panel.Owner = Me
+        Me.mOpen = True
+        FontPanelTitle(Me.mDialog, FontString(FontClass("NSString"), Me.Title))
+        FontOrderFront(Me.mDialog, Nil)
+    End Sub
+    Public Sub MacChanged(target As Ptr, manager As Ptr)
+        If target <> Me.mTarget Or Not Me.mOpen Then Return
+        Try
+            Dim selected As Ptr = FontConvert(manager, Me.mOriginalFont)
+            If selected = Nil Then Throw New RuntimeException("NSFontManager returned no font")
+            Dim family As String = FontUTF8(FontFamily(selected))
+            Dim traits As Integer = FontTraits(manager, selected)
+            Dim value As New FontSelection(family, FontPointSize(selected), (traits And 2) <> 0, (traits And 1) <> 0)
+            ValidateFont(value)
+            Me.mValue = value
+            FontRetain(selected)
+            FontRelease(Me.mOriginalFont)
+            Me.mOriginalFont = selected
+            RaiseEvent SelectionChanged(Me.Value)
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    Public Sub MacClosed(target As Ptr)
+        If target = Me.mTarget Then Me.Close()
+    End Sub
+    #End If
+End Class
+
+Private Sub ValidateFont(font As FontSelection)
+    If font = Nil Then Throw New InvalidArgumentException("Font selection cannot be Nil")
+    If String.Len(String.Trim(font.Family)) = 0 Then Throw New InvalidArgumentException("Font family cannot be empty")
+    Dim bytes As Bytes = Bytes.FromString(font.Family, Text.Encodings.UTF8)
+    For i As Integer = 0 To bytes.Count - 1
+        If bytes.Item(i) = 0 Then Throw New InvalidArgumentException("Font family cannot contain NUL")
+    Next
+    If font.Size <> font.Size Or font.Size <= 0 Or font.Size > 1000 Then Throw New InvalidArgumentException("Font size must be between 0 and 1000 points")
+End Sub
+
+#If TargetLinux Then
+Delegate Sub FontGTKReady(source As Ptr, asyncResult As Ptr, data As Ptr)
+Sequential Structure FontError
+    Domain As UInt32
+    Code As Int32
+    Message As Ptr
+End Structure
+Private Optional Declare Function FontGTKMajor Lib "libgtk-4.so.1" Alias "gtk_get_major_version" () As UInt32
+Private Optional Declare Function FontGTKMinor Lib "libgtk-4.so.1" Alias "gtk_get_minor_version" () As UInt32
+Private Optional Declare Function FontGTKNew Lib "libgtk-4.so.1" Alias "gtk_font_dialog_new" () As Ptr
+Private Optional Declare Sub FontGTKTitle Lib "libgtk-4.so.1" Alias "gtk_font_dialog_set_title" (dialog As Ptr, title As String)
+Private Optional Declare Sub FontGTKModal Lib "libgtk-4.so.1" Alias "gtk_font_dialog_set_modal" (dialog As Ptr, modal As Int32)
+Private Optional Declare Sub FontGTKChoose Lib "libgtk-4.so.1" Alias "gtk_font_dialog_choose_font" (dialog As Ptr, parent As Ptr, initial As Ptr, cancellable As Ptr, callback As FontGTKReady, data As Ptr)
+Private Optional Declare Function FontGTKFinish Lib "libgtk-4.so.1" Alias "gtk_font_dialog_choose_font_finish" (dialog As Ptr, asyncResult As Ptr, ByRef error As Ptr) As Ptr
+Private Optional Declare Function FontGTKError Lib "libgtk-4.so.1" Alias "gtk_dialog_error_quark" () As UInt32
+Private Optional Declare Function FontCancellable Lib "libgio-2.0.so.0" Alias "g_cancellable_new" () As Ptr
+Private Optional Declare Sub FontCancel Lib "libgio-2.0.so.0" Alias "g_cancellable_cancel" (cancellable As Ptr)
+Private Optional Declare Sub FontUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+Private Optional Declare Function FontErrorMatches Lib "libglib-2.0.so.0" Alias "g_error_matches" (error As Ptr, domain As UInt32, code As Int32) As Int32
+Private Optional Declare Sub FontErrorFree Lib "libglib-2.0.so.0" Alias "g_error_free" (error As Ptr)
+Private Optional Declare Function FontCopyError Lib "c" Alias "memcpy" (ByRef dest As FontError, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function FontPangoNew Lib "libpango-1.0.so.0" Alias "pango_font_description_new" () As Ptr
+Private Optional Declare Sub FontPangoFree Lib "libpango-1.0.so.0" Alias "pango_font_description_free" (font As Ptr)
+Private Optional Declare Sub FontPangoFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_set_family" (font As Ptr, family As String)
+Private Optional Declare Sub FontPangoSize Lib "libpango-1.0.so.0" Alias "pango_font_description_set_size" (font As Ptr, size As Int32)
+Private Optional Declare Sub FontPangoWeight Lib "libpango-1.0.so.0" Alias "pango_font_description_set_weight" (font As Ptr, weight As Int32)
+Private Optional Declare Sub FontPangoStyle Lib "libpango-1.0.so.0" Alias "pango_font_description_set_style" (font As Ptr, style As Int32)
+Private Optional Declare Function FontPangoGetFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_get_family" (font As Ptr) As String
+Private Optional Declare Function FontPangoGetSize Lib "libpango-1.0.so.0" Alias "pango_font_description_get_size" (font As Ptr) As Int32
+Private Optional Declare Function FontPangoGetWeight Lib "libpango-1.0.so.0" Alias "pango_font_description_get_weight" (font As Ptr) As Int32
+Private Optional Declare Function FontPangoGetStyle Lib "libpango-1.0.so.0" Alias "pango_font_description_get_style" (font As Ptr) As Int32
+Private Sub FontGTKCompleted(source As Ptr, asyncResult As Ptr, data As Ptr)
+    Dim id As Integer = CType(data, Integer) - 1
+    If id < 0 Or id >= Array.Count(FontRequests.Items) Then Return
+    Dim request As FontRequest = FontRequests.Items(id)
+    If request = Nil Then Return
+    Dim error As Ptr = Nil
+    Dim selected As Ptr = Nil
+    Dim owner As FontPicker = request.Owner
+    Try
+        selected = FontGTKFinish(source, asyncResult, error)
+        If owner <> Nil Then
+            If selected <> Nil Then
+                Dim selection As New FontSelection(FontPangoGetFamily(selected), FontPangoGetSize(selected) / 1024.0, FontPangoGetWeight(selected) >= 600, FontPangoGetStyle(selected) <> 0)
+                owner.CompleteGTK(id, selection, False, "")
+            ElseIf error <> Nil Then
+                If FontErrorMatches(error, FontGTKError(), 1) <> 0 Or FontErrorMatches(error, FontGTKError(), 2) <> 0 Then
+                    owner.CompleteGTK(id, Nil, True, "")
+                Else
+                    Dim nativeError As FontError
+                    FontCopyError(nativeError, error, 16)
+                    Dim message As String = CType(CType(nativeError.Message, CString), String)
+                    owner.CompleteGTK(id, Nil, False, message)
+                End If
+            Else
+                owner.CompleteGTK(id, Nil, False, "Native GTK font chooser returned no result")
+            End If
+        End If
+    Catch e As Exception
+        If owner <> Nil Then owner.LastNativeError = e.Message
+    Finally
+        If selected <> Nil Then FontPangoFree(selected)
+        If error <> Nil Then FontErrorFree(error)
+        FontUnref(request.Dialog)
+        FontUnref(request.Cancellable)
+        FontRequests.Items(id) = Nil
+    End Try
+End Sub
+#ElseIf TargetWindows Then
+Sequential Structure FontChoose
+    StructSize As UInt32
+    Owner As Ptr
+    Device As Ptr
+    LogFont As Ptr
+    PointSize As Int32
+    Options As UInt32
+    Colors As UInt32
+    Data As Int64
+    Hook As Ptr
+    TemplateName As Ptr
+    Instance As Ptr
+    Style As Ptr
+    FontType As UInt16
+    Alignment As UInt16
+    Minimum As Int32
+    Maximum As Int32
+End Structure
+Delegate Function FontWindowsHook(widget As Ptr, message As UInt32, word As UInt64, param As Int64) As UInt64
+Private Optional Declare Function FontChooseWindows Lib "comdlg32" Alias "ChooseFontW" (ByRef options As FontChoose) As Int32
+Private Optional Declare Function FontCommonError Lib "comdlg32" Alias "CommDlgExtendedError" () As UInt32
+Private Optional Declare Function FontWindowTitle Lib "user32" Alias "SetWindowTextW" (widget As Ptr, title As Ptr) As Int32
+Private Optional Declare Function FontEndDialog Lib "user32" Alias "EndDialog" (widget As Ptr, dialogResult As Int64) As Int32
+Private Optional Declare Function FontGetDC Lib "user32" Alias "GetDC" (widget As Ptr) As Ptr
+Private Optional Declare Function FontReleaseDC Lib "user32" Alias "ReleaseDC" (widget As Ptr, dc As Ptr) As Int32
+Private Optional Declare Function FontCaps Lib "gdi32" Alias "GetDeviceCaps" (dc As Ptr, index As Int32) As Int32
+Private Optional Declare Function FontSystemParameters Lib "user32" Alias "SystemParametersInfoW" (action As UInt32, size As UInt32, buffer As Ptr, nativeFlags As UInt32) As Int32
+Private Function FontWindowsMessage(widget As Ptr, message As UInt32, word As UInt64, param As Int64) As UInt64
+    If message = 272 Then ' WM_INITDIALOG
+        Dim owner As FontPicker = FontRequests.Panel.Owner
+        If owner <> Nil Then
+            Try
+                owner.AttachWindows(widget)
+            Catch e As Exception
+                owner.LastNativeError = e.Message
+            End Try
+        End If
+    End If
+    Return 0
+End Function
+Private Function FontZeroes(count As Integer) As Bytes
+    Dim buffer As New Bytes()
+    For i As Integer = 1 To count
+        buffer.Append(0)
+    Next
+    Return buffer
+End Function
+Private Sub FontWrite32(buffer As Bytes, offset As Integer, value As Integer)
+    For i As Integer = 0 To 3
+        buffer.SetItem(offset + i, (value >> (i * 8)) And 255)
+    Next
+End Sub
+Private Function FontRead32(buffer As Bytes, offset As Integer) As Integer
+    Return buffer.Item(offset) + buffer.Item(offset + 1) * 256 + buffer.Item(offset + 2) * 65536 + buffer.Item(offset + 3) * 16777216
+End Function
+#ElseIf TargetMac Then
+Delegate Sub FontMacAction(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+Delegate Function FontMacModes(receiver As Ptr, methodSelector As Ptr, panel As Ptr) As Integer
+Private Declare Function FontClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function FontAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Function FontSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function FontAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, callback As Ptr, encoding As String) As UInt8
+Private Declare Sub FontRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function FontAlloc Lib "Foundation" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function FontInit Lib "Foundation" Selector "init" (instance As Ptr) As Ptr
+Private Declare Function FontRetain Lib "Foundation" Selector "retain" (instance As Ptr) As Ptr
+Private Declare Sub FontRelease Lib "Foundation" Selector "release" (instance As Ptr)
+Private Declare Function FontManager Lib "AppKit" Selector "sharedFontManager" (cls As Ptr) As Ptr
+Private Declare Function FontPanel Lib "AppKit" Selector "fontPanel:" (manager As Ptr, create As Boolean) As Ptr
+Private Declare Function FontWithFamily Lib "AppKit" Selector "fontWithFamily:traits:weight:size:" (manager As Ptr, family As Ptr, traits As Integer, weight As Integer, size As Double) As Ptr
+Private Declare Function FontSystem Lib "AppKit" Selector "systemFontOfSize:" (cls As Ptr, size As Double) As Ptr
+Private Declare Function FontGetTarget Lib "AppKit" Selector "target" (manager As Ptr) As Ptr
+Private Declare Sub FontSetTarget Lib "AppKit" Selector "setTarget:" (manager As Ptr, target As Ptr)
+Private Declare Function FontGetAction Lib "AppKit" Selector "action" (manager As Ptr) As Ptr
+Private Declare Sub FontSetAction Lib "AppKit" Selector "setAction:" (manager As Ptr, methodSelector As Ptr)
+Private Declare Sub FontSetSelected Lib "AppKit" Selector "setSelectedFont:isMultiple:" (manager As Ptr, font As Ptr, multiple As Boolean)
+Private Declare Function FontGetTitle Lib "AppKit" Selector "title" (panel As Ptr) As Ptr
+Private Declare Sub FontPanelTitle Lib "AppKit" Selector "setTitle:" (panel As Ptr, title As Ptr)
+Private Declare Sub FontOrderFront Lib "AppKit" Selector "orderFront:" (panel As Ptr, sender As Ptr)
+Private Declare Sub FontOrderOut Lib "AppKit" Selector "orderOut:" (panel As Ptr, sender As Ptr)
+Private Declare Function FontString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function FontCenter Lib "Foundation" Selector "defaultCenter" (cls As Ptr) As Ptr
+Private Declare Sub FontAddObserver Lib "Foundation" Selector "addObserver:selector:name:object:" (center As Ptr, observer As Ptr, methodSelector As Ptr, name As Ptr, obj As Ptr)
+Private Declare Sub FontRemoveObserver Lib "Foundation" Selector "removeObserver:" (center As Ptr, observer As Ptr)
+Private Declare Function FontConvert Lib "AppKit" Selector "convertFont:" (manager As Ptr, font As Ptr) As Ptr
+Private Declare Function FontFamily Lib "AppKit" Selector "familyName" (font As Ptr) As Ptr
+Private Declare Function FontUTF8 Lib "Foundation" Selector "UTF8String" (value As Ptr) As String
+Private Declare Function FontTraits Lib "AppKit" Selector "traitsOfFont:" (manager As Ptr, font As Ptr) As Integer
+Private Declare Function FontPointSize Lib "AppKit" Selector "pointSize" (font As Ptr) As Double
+Private Function FontMacTargetClass() As Ptr
+    Dim cls As Ptr = FontClass("BuoyNativeFontPickerTarget")
+    If cls <> Nil Then Return cls
+    cls = FontAllocateClass(FontClass("NSObject"), "BuoyNativeFontPickerTarget", 0)
+    If cls = Nil Then Throw New RuntimeException("Could not allocate native font target")
+    Dim changed As FontMacAction = AddressOf FontMacChanged
+    Dim closed As FontMacAction = AddressOf FontMacClosed
+    Dim modes As FontMacModes = AddressOf FontMacValidModes
+    Dim attributes As FontMacAction = AddressOf FontMacAttributes
+    If FontAddMethod(cls, FontSelector("changeFont:"), CType(changed, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not bind native font change")
+    If FontAddMethod(cls, FontSelector("fontPanelClosed:"), CType(closed, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not bind native font panel close")
+    If FontAddMethod(cls, FontSelector("validModesForFontPanel:"), CType(modes, Ptr), "Q@:@") = 0 Then Throw New RuntimeException("Could not restrict native font panel modes")
+    If FontAddMethod(cls, FontSelector("changeAttributes:"), CType(attributes, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not bind native font attribute action")
+    FontRegisterClass(cls)
+    Return cls
+End Function
+Private Function FontMacValidModes(receiver As Ptr, methodSelector As Ptr, panel As Ptr) As Integer
+    Return 7 ' NSFontPanelFaceModeMask | SizeModeMask | CollectionModeMask
+End Function
+Private Sub FontMacAttributes(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    ' Font-only API: typographic effects are excluded by validModesForFontPanel.
+End Sub
+Private Sub FontMacChanged(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    Dim owner As FontPicker = FontRequests.Panel.Owner
+    If owner <> Nil Then owner.MacChanged(receiver, sender)
+End Sub
+Private Sub FontMacClosed(receiver As Ptr, methodSelector As Ptr, notification As Ptr)
+    FontRetain(receiver)
+    Dim owner As FontPicker = FontRequests.Panel.Owner
+    If owner <> Nil Then owner.MacClosed(receiver)
+    FontRelease(receiver)
+End Sub
+#End If

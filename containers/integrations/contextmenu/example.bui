@@ -1,0 +1,66 @@
+Import gtkcontextmenu
+
+Class DemoMenu Inherits GTKContextMenu
+    Public Property HostWindow As Window
+    Public Property Calls As Integer = 0
+    Handle Selected(item As PopupItem)
+        Me.Calls += 1
+        Me.HostWindow.Title = "Menu: " + item.Tag + " " + Str(Me.Calls)
+        If item.Tag = "dynamic" Then Me.HostWindow.Title = Me.HostWindow.Title + " " + item.Caption
+        If item.Tag = "throw" Then Throw New Exception("selection failure contained")
+    End Handle
+End Class
+
+Class MenuCanvas Inherits Canvas
+    Public Property Menu As DemoMenu
+    Public Property Builds As Integer = 0
+    Handle ConstructContextualMenu(base As MenuItem, location As Point)
+        Me.Builds += 1
+        Dim root As New PopupItem()
+        Dim open As New PopupItem("Open", "open")
+        open.IconName = "document-open-symbolic"
+        root.AddItem(open)
+        Dim disabled As New PopupItem("Unavailable", "disabled")
+        disabled.Enabled = False
+        root.AddItem(disabled)
+        Dim checked As New PopupItem("Show Details", "checked")
+        checked.Checkable = True
+        checked.Checked = True
+        root.AddItem(checked)
+        root.AddSeparator()
+        Dim more As New PopupItem("More", "more")
+        Dim nested As New PopupItem("Nested Action", "nested")
+        more.AddItem(nested)
+        Dim deeper As New PopupItem("Deeper", "deeper")
+        deeper.AddItem(New PopupItem("Deep Action", "deep"))
+        more.AddItem(deeper)
+        root.AddItem(more)
+        root.AddItem(New PopupItem("Build " + Str(Me.Builds), "dynamic"))
+        Dim disabledMore As New PopupItem("Disabled Submenu")
+        disabledMore.Enabled = False
+        disabledMore.AddItem(New PopupItem("Must not run", "disabled-submenu"))
+        root.AddItem(disabledMore)
+        root.AddItem(New PopupItem("Throw in handler", "throw"))
+        Me.Menu.Show(Me, location, root)
+        ' Leave Buoy's base empty, suppressing its built-in popup.
+    End Handle
+End Class
+
+Sub Main()
+    Dim w As New Window()
+    w.Title = "Buoy GTK Context Menu"
+    w.Move(100, 100, 600, 360)
+    Dim label As New Label()
+    label.Text = "Right-click below. More contains two levels of nested commands."
+    label.Move(15, 10, 570, 30)
+    w.AddSubview(label)
+    Dim menu As New DemoMenu()
+    menu.HostWindow = w
+    Dim canvas As New MenuCanvas()
+    canvas.Menu = menu
+    canvas.Move(15, 50, 570, 290)
+    w.AddSubview(canvas)
+    w.Show()
+    Application.Run()
+    menu.Close()
+End Sub

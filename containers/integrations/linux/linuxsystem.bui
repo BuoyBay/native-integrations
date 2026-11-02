@@ -1,0 +1,101 @@
+' Original Buoy bindings for the Linux/glibc system-information APIs.
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+#If TargetLinux Then
+' Linux LP64 ABI: sizeof(struct sysinfo) = 112, alignment = 8.
+' Flatten loads[3] into adjacent unsigned 64-bit fields.
+Sequential Structure NativeSysinfo
+    Uptime As Int64
+    Load1 As UInt64
+    Load5 As UInt64
+    Load15 As UInt64
+    TotalRam As UInt64
+    FreeRam As UInt64
+    SharedRam As UInt64
+    BufferRam As UInt64
+    TotalSwap As UInt64
+    FreeSwap As UInt64
+    Processes As UInt16
+    Padding As UInt16
+    TotalHigh As UInt64
+    FreeHigh As UInt64
+    MemoryUnit As UInt32
+End Structure
+
+Private Optional Declare Function CSysinfo Lib "c" Alias "sysinfo" (ByRef value As NativeSysinfo) As Int32
+Private Optional Declare Function COnlineProcessors Lib "c" Alias "get_nprocs" () As Int32
+Private Optional Declare Function CConfiguredProcessors Lib "c" Alias "get_nprocs_conf" () As Int32
+
+''' A single sysinfo sample; byte counts have already been scaled by mem_unit.
+Public Class SystemSnapshot
+    Public Property UptimeSeconds As Integer
+    Public Property LoadAverage1Minute As Double
+    Public Property LoadAverage5Minutes As Double
+    Public Property LoadAverage15Minutes As Double
+    Public Property TotalRamBytes As UInt64
+    Public Property FreeRamBytes As UInt64
+    Public Property SharedRamBytes As UInt64
+    Public Property BufferRamBytes As UInt64
+    Public Property TotalSwapBytes As UInt64
+    Public Property FreeSwapBytes As UInt64
+    Public Property TotalHighRamBytes As UInt64
+    Public Property FreeHighRamBytes As UInt64
+    Public Property ProcessCount As Integer
+    Public Property MemoryUnitBytes As Integer
+End Class
+
+Public Function ReadSystemInfo() As SystemSnapshot
+    Dim native As NativeSysinfo
+    If CSysinfo(native) <> 0 Then
+        Throw New RuntimeException("sysinfo failed")
+    End If
+    If native.MemoryUnit = 0 Then
+        Throw New RuntimeException("sysinfo returned a zero memory unit")
+    End If
+    Dim sample As New SystemSnapshot
+    sample.UptimeSeconds = native.Uptime
+    ' Explicit Double operands avoid integer division in Buoy 0.72.0.
+    Dim load1 As Double = native.Load1
+    Dim load5 As Double = native.Load5
+    Dim load15 As Double = native.Load15
+    sample.LoadAverage1Minute = load1 / 65536.0
+    sample.LoadAverage5Minutes = load5 / 65536.0
+    sample.LoadAverage15Minutes = load15 / 65536.0
+    Dim unit As UInt64 = native.MemoryUnit
+    sample.TotalRamBytes = native.TotalRam * unit
+    sample.FreeRamBytes = native.FreeRam * unit
+    sample.SharedRamBytes = native.SharedRam * unit
+    sample.BufferRamBytes = native.BufferRam * unit
+    sample.TotalSwapBytes = native.TotalSwap * unit
+    sample.FreeSwapBytes = native.FreeSwap * unit
+    sample.TotalHighRamBytes = native.TotalHigh * unit
+    sample.FreeHighRamBytes = native.FreeHigh * unit
+    sample.ProcessCount = native.Processes
+    sample.MemoryUnitBytes = native.MemoryUnit
+    Return sample
+End Function
+
+''' Online system CPUs, not the process affinity mask or a container's CPU quota.
+Public Function OnlineProcessorCount() As Integer
+    Dim count As Integer = COnlineProcessors()
+    If count < 1 Then
+        Throw New RuntimeException("get_nprocs returned an invalid processor count")
+    End If
+    Return count
+End Function
+
+''' Configured system CPUs, including offline CPUs.
+Public Function ConfiguredProcessorCount() As Integer
+    Dim count As Integer = CConfiguredProcessors()
+    If count < 1 Then
+        Throw New RuntimeException("get_nprocs_conf returned an invalid processor count")
+    End If
+    Return count
+End Function
+#End If

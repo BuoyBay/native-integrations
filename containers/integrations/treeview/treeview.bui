@@ -1,0 +1,1512 @@
+' Native tree/outline control. All UI calls must occur on the GUI thread.
+Public Class TreeNode
+    Private Property mCaption As String = ""
+    Private Property mIconPath As String = ""
+    Private Property mChildren As Array Of TreeNode = []
+    Private Property mParent As Weak TreeNode
+    Private Property mOwner As Weak TreeView
+    Public Property Tag As String = ""
+    ' Initial expansion state; use TreeView.SetExpanded after opening.
+    Public Property Expanded As Boolean = False
+
+    Public Sub Constructor(caption As String = "")
+        Me.mCaption = caption
+    End Sub
+    Public Property Caption As String
+        Get
+            Return Me.mCaption
+        End Get
+        Set
+            Me.mCaption = value
+            Dim owner As TreeView = Me.mOwner
+            If owner <> Nil Then owner.Reload()
+        End Set
+    End Property
+    ''' Optional native image file: PNG on macOS/Linux, ICO on Windows.
+    Public Property IconPath As String
+        Get
+            Return Me.mIconPath
+        End Get
+        Set
+            If value = Me.mIconPath Then Return
+            Me.mIconPath = value
+            Dim owner As TreeView = Me.mOwner
+            If owner <> Nil Then owner.Reload()
+        End Set
+    End Property
+    Public Property ParentNode As TreeNode
+        Get
+            Return Me.mParent
+        End Get
+    End Property
+    Public Property OwnerTree As TreeView
+        Get
+            Return Me.mOwner
+        End Get
+    End Property
+    Public Property ChildCount As Integer
+        Get
+            Return Array.Count(Me.mChildren)
+        End Get
+    End Property
+    Public Function ChildAt(index As Integer) As TreeNode
+        If index < 0 Or index >= Me.ChildCount Then Throw New OutOfBoundsException("Invalid child index")
+        Return Me.mChildren(index)
+    End Function
+    Public Function Contains(node As TreeNode) As Boolean
+        If Me Is node Then Return True
+        For Each child As TreeNode In Me.mChildren
+            If child.Contains(node) Then Return True
+        Next
+        Return False
+    End Function
+    Public Sub AddChild(node As TreeNode)
+        If node = Nil Then Throw New InvalidArgumentException("Child cannot be Nil")
+        If node.Contains(Me) Then Throw New InvalidArgumentException("Tree cycles are not allowed")
+        If node.mParent <> Nil Or node.mOwner <> Nil Then Throw New InvalidArgumentException("Detach the node before adding it")
+        node.mParent = Me
+        node.AttachTree(Me.mOwner)
+        Array.Append(Me.mChildren, node)
+        Dim owner As TreeView = Me.mOwner
+        If owner <> Nil Then owner.Reload()
+    End Sub
+    Public Sub RemoveChild(node As TreeNode)
+        For i As Integer = 0 To Me.ChildCount - 1
+            If Me.mChildren(i) Is node Then
+                Array.RemoveAt(Me.mChildren, i)
+                node.mParent = Nil
+                node.AttachTree(Nil)
+                Dim owner As TreeView = Me.mOwner
+                If owner <> Nil Then owner.Reload()
+                Return
+            End If
+        Next
+        Throw New InvalidArgumentException("Node is not an immediate child")
+    End Sub
+    ' Integration plumbing: applications should use AddRoot/AddChild instead.
+    Public Sub AttachTree(owner As TreeView)
+        Me.mOwner = owner
+        For Each child As TreeNode In Me.mChildren
+            child.AttachTree(owner)
+        Next
+    End Sub
+End Class
+
+Private Class TreeReference
+    Public Property Owner As Weak TreeView
+End Class
+Private Class TreeRegistry
+    Public Shared Property Items As Array Of TreeReference = []
+End Class
+
+Public Class TreeView Inherits View
+    Event SelectionChanged(node As TreeNode)
+    Event ContextRequested(node As TreeNode, location As Point)
+    Event KeyboardCommand(node As TreeNode, command As String)
+    Public Property NavigatorShortcuts As Boolean = False
+    Private Property mRoots As Array Of TreeNode = []
+    Private Property mNodes As Array Of TreeNode = []
+    Private Property mItems As Array Of Ptr = []
+    Private Property mSelected As TreeNode
+    Private Property mHost As Ptr = Nil
+    Private Property mWidget As Ptr = Nil
+    Private Property mID As Integer = -1
+    Private Property mNativeHostDestroyed As Boolean = False
+    Private Property mUpdating As Boolean = False
+    Public Property LastNativeError As String = ""
+    Private Property mIndentation As Integer = 16
+    Private Property mIconSize As Integer = 20
+
+    ''' Logical row indentation; changing it preserves node identity and selection.
+    Public Property Indentation As Integer
+        Get
+            Return Me.mIndentation
+        End Get
+        Set
+            If value < 0 Or value > 64 Then Throw New InvalidArgumentException("Tree indentation must be between 0 and 64")
+            If value = Me.mIndentation Then Return
+            Me.mIndentation = value
+            Me.Reload()
+        End Set
+    End Property
+
+    ''' Logical icon side length. Files are scaled by the native image control.
+    Public Property IconSize As Integer
+        Get
+            Return Me.mIconSize
+        End Get
+        Set
+            If value < 12 Or value > 48 Then Throw New InvalidArgumentException("Tree icon size must be between 12 and 48")
+            If value = Me.mIconSize Then Return
+            Me.mIconSize = value
+            Me.Reload()
+        End Set
+    End Property
+
+    Private Property mShowsFocusRing As Boolean = True
+
+    ''' Whether the macOS outline draws the system focus ring while it holds keyboard
+    ''' focus. The selected row's highlight still tracks focus either way.
+    Public Property ShowsFocusRing As Boolean
+        Get
+            Return Me.mShowsFocusRing
+        End Get
+        Set
+            If value = Me.mShowsFocusRing Then Return
+            Me.mShowsFocusRing = value
+            #If TargetMac Then
+                If Me.mOutline <> Nil Then Me.ApplyMacFocusRing()
+            #End If
+        End Set
+    End Property
+    Private Property mCompactInsets As Boolean = False
+
+    ''' When True the macOS outline drops the automatic (inset) table style's side
+    ''' padding and the horizontal cell spacing, so level-0 rows start near the edge.
+    Public Property CompactInsets As Boolean
+        Get
+            Return Me.mCompactInsets
+        End Get
+        Set
+            If value = Me.mCompactInsets Then Return
+            Me.mCompactInsets = value
+            #If TargetMac Then
+                If Me.mOutline <> Nil Then Me.ApplyMacFocusRing()
+            #End If
+        End Set
+    End Property
+    #If TargetMac Then
+        ''' Focus ring and inset styling (ShowsFocusRing, CompactInsets).
+        Private Sub ApplyMacFocusRing()
+            ' NSFocusRingTypeDefault = 0, NSFocusRingTypeNone = 1.
+            Dim ringType As Integer = 0
+            If Not Me.mShowsFocusRing Then ringType = 1
+            MacFocusRingType(Me.mOutline, ringType)
+            MacFocusRingType(Me.mWidget, ringType)
+            ' NSTableViewStyleAutomatic = 0 resolves to Inset; FullWidth = 1.
+            Dim spacing As TreeIconSize
+            spacing.Height = 2.0
+            If Me.mCompactInsets Then
+                MacTableStyle(Me.mOutline, 1)
+                spacing.Width = 0.0
+            Else
+                MacTableStyle(Me.mOutline, 0)
+                spacing.Width = 3.0
+            End If
+            MacIntercellSpacing(Me.mOutline, spacing)
+        End Sub
+    #End If
+    #If TargetLinux Then
+        Private Property mRootModel As Ptr = Nil
+        Private Property mTreeModel As Ptr = Nil
+        Private Property mSelection As Ptr = Nil
+        Private Property mChildModels As Array Of Ptr = []
+    #ElseIf TargetMac Then
+        Private Property mMacIcons As Array Of Ptr = []
+        Private Property mOutline As Ptr = Nil
+        Private Property mBridge As Ptr = Nil
+    #ElseIf TargetWindows Then
+        Private Property mImageList As Ptr = Nil
+    #End If
+
+    Public Property RootCount As Integer
+        Get
+            Return Array.Count(Me.mRoots)
+        End Get
+    End Property
+    Public Function RootAt(index As Integer) As TreeNode
+        If index < 0 Or index >= Me.RootCount Then Throw New OutOfBoundsException("Invalid root index")
+        Return Me.mRoots(index)
+    End Function
+    Public Function Contains(node As TreeNode) As Boolean
+        If node = Nil Then Return False
+        For Each root As TreeNode In Me.mRoots
+            If root.Contains(node) Then Return True
+        Next
+        Return False
+    End Function
+    Public Sub AddRoot(node As TreeNode)
+        If node = Nil Then Throw New InvalidArgumentException("Root cannot be Nil")
+        If node.ParentNode <> Nil Or node.OwnerTree <> Nil Then Throw New InvalidArgumentException("Detach the node before adding it")
+        node.AttachTree(Me)
+        Array.Append(Me.mRoots, node)
+        Me.Reload()
+    End Sub
+    Public Sub RemoveRoot(node As TreeNode)
+        For i As Integer = 0 To Me.RootCount - 1
+            If Me.mRoots(i) Is node Then
+                Array.RemoveAt(Me.mRoots, i)
+                node.AttachTree(Nil)
+                Me.Reload()
+                Return
+            End If
+        Next
+        Throw New InvalidArgumentException("Node is not an immediate root")
+    End Sub
+    Public Sub Clear()
+        For Each node As TreeNode In Me.mRoots
+            node.AttachTree(Nil)
+        Next
+        Array.Clear(Me.mRoots)
+        Me.Reload()
+    End Sub
+    Public Property SelectedNode As TreeNode
+        Get
+            If Me.mID >= 0 And Not Me.mUpdating Then Me.mSelected = Me.ReadNativeSelection()
+            Return Me.mSelected
+        End Get
+        Set
+            If value <> Nil And Not Me.Contains(value) Then Throw New InvalidArgumentException("Selected node belongs to another tree")
+            Me.mSelected = value
+            Dim parents As Array Of TreeNode = []
+            Dim parent As TreeNode
+            If value <> Nil Then parent = value.ParentNode
+            While parent <> Nil
+                Array.Append(parents, parent)
+                parent = parent.ParentNode
+            End While
+            For i As Integer = Array.LastIndex(parents) To 0 Step -1
+                Me.SetExpanded(parents(i), True)
+            Next
+            If Me.mID >= 0 Then
+                Me.mUpdating = True
+                Me.ApplyNativeSelection()
+                Me.mUpdating = False
+            End If
+        End Set
+    End Property
+    Public Sub SetExpanded(node As TreeNode, expanded As Boolean)
+        If Not Me.Contains(node) Then Throw New InvalidArgumentException("Node belongs to another tree")
+        node.Expanded = expanded
+        If Me.mID < 0 Then Return
+        Me.mUpdating = True
+        #If TargetLinux Then
+            Me.ApplyGTKExpansion()
+        #ElseIf TargetWindows Then
+            Dim item As Ptr = Me.ItemFor(node)
+            Dim action As Integer = 1
+            If expanded Then action = 2
+            WinSend(Me.mWidget, 4354, action, CType(item, Integer))
+        #ElseIf TargetMac Then
+            Dim item As Ptr = Me.ItemFor(node)
+            If expanded Then
+                MacExpand(Me.mOutline, item, False)
+            Else
+                MacCollapse(Me.mOutline, item, False)
+            End If
+        #End If
+        Me.mUpdating = False
+    End Sub
+    Public Function IsExpanded(node As TreeNode) As Boolean
+        If Not Me.Contains(node) Then Throw New InvalidArgumentException("Node belongs to another tree")
+        If Me.mID >= 0 Then
+            #If TargetLinux Then
+                Dim row As Ptr = Me.GTKRowFor(node)
+                If row <> Nil Then
+                    node.Expanded = GTKExpanded(row) <> 0
+                    GTKUnref(row)
+                End If
+            #ElseIf TargetWindows Then
+                node.Expanded = (WinSend(Me.mWidget, 4391, CType(Me.ItemFor(node), Integer), 32) And 32) <> 0
+            #ElseIf TargetMac Then
+                node.Expanded = MacExpanded(Me.mOutline, Me.ItemFor(node))
+            #End If
+        End If
+        Return node.Expanded
+    End Function
+    Public Sub Open()
+        If Me.mNativeHostDestroyed Then Throw New InvalidArgumentException("Create a new TreeView after native host destruction")
+        Me.Close()
+        Me.LastNativeError = ""
+        Me.mHost = Me.NativeWidget
+        If Me.mHost = Nil Then Throw New InvalidArgumentException("Attach TreeView before Open")
+        #If TargetWindows Then
+            If WinIsWindow(Me.mHost) = 0 Then Throw New InvalidArgumentException("Attach TreeView to a live window before Open")
+        #End If
+        For i As Integer = 0 To Array.LastIndex(TreeRegistry.Items)
+            If TreeRegistry.Items(i).Owner = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(TreeRegistry.Items)
+            Array.Append(TreeRegistry.Items, New TreeReference())
+        End If
+        TreeRegistry.Items(Me.mID).Owner = Me
+        Try
+            #If TargetWindows Then
+                If WinSubclass(Me.mHost, AddressOf TreeWinMessage, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind tree container")
+            #End If
+            Me.Reload()
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Public Sub Close()
+        If Me.mID < 0 Then Return
+        Me.CaptureState()
+        TreeRegistry.Items(Me.mID).Owner = Nil
+        Me.DestroyNative()
+        #If TargetWindows Then
+            WinUnsubclass(Me.mHost, AddressOf TreeWinMessage, Me.mID + 1)
+        #End If
+        Me.mHost = Nil
+        Me.mID = -1
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+        For Each root As TreeNode In Me.mRoots
+            root.AttachTree(Nil)
+        Next
+    End Sub
+    Public Sub Reload()
+        If Me.mID < 0 Then
+            If Not Me.Contains(Me.mSelected) Then Me.mSelected = Nil
+            Return
+        End If
+        Me.CaptureState()
+        If Not Me.Contains(Me.mSelected) Then Me.mSelected = Nil
+        Me.DestroyNative()
+        Array.Clear(Me.mNodes)
+        For Each root As TreeNode In Me.mRoots
+            Me.Flatten(root)
+        Next
+        Me.mUpdating = True
+        Try
+            Me.BuildNative()
+            Me.RefreshNative()
+            Me.ApplyNativeSelection()
+            Me.mUpdating = False
+        Catch e As Exception
+            Me.DestroyNative()
+            Me.mUpdating = False
+            Throw e
+        End Try
+    End Sub
+    Private Sub Flatten(node As TreeNode)
+        Array.Append(Me.mNodes, node)
+        For i As Integer = 0 To node.ChildCount - 1
+            Me.Flatten(node.ChildAt(i))
+        Next
+    End Sub
+    Private Function ItemFor(node As TreeNode) As Ptr
+        For i As Integer = 0 To Array.LastIndex(Me.mNodes)
+            If Me.mNodes(i) Is node Then Return Me.mItems(i)
+        Next
+        Return Nil
+    End Function
+    Private Function NodeFor(item As Ptr) As TreeNode
+        If item = Nil Then Return Nil
+        For i As Integer = 0 To Array.LastIndex(Me.mItems)
+            If Me.mItems(i) = item Then Return Me.mNodes(i)
+        Next
+        Return Nil
+    End Function
+    Private Sub CaptureState()
+        If Me.mWidget = Nil Then Return
+        Me.mSelected = Me.ReadNativeSelection()
+        For Each node As TreeNode In Me.mNodes
+            If Me.Contains(node) Then Me.IsExpanded(node)
+        Next
+    End Sub
+    Private Sub DestroyNative()
+        Me.mUpdating = True
+        #If TargetLinux Then
+            If Me.mWidget <> Nil Then
+                Dim parent As Ptr = GTKParent(Me.mWidget)
+                If parent <> Nil Then GTKFixedRemove(parent, Me.mWidget)
+                GTKUnref(Me.mWidget)
+            End If
+            If Me.mSelection <> Nil Then GTKUnref(Me.mSelection)
+            If Me.mTreeModel <> Nil Then GTKUnref(Me.mTreeModel)
+            If Me.mRootModel <> Nil Then GTKUnref(Me.mRootModel)
+            For Each model As Ptr In Me.mChildModels
+                GTKUnref(model)
+            Next
+            For Each item As Ptr In Me.mItems
+                GTKUnref(item)
+            Next
+            Me.mSelection = Nil
+            Me.mTreeModel = Nil
+            Me.mRootModel = Nil
+            Array.Clear(Me.mChildModels)
+        #ElseIf TargetWindows Then
+            If Me.mWidget <> Nil Then WinDestroy(Me.mWidget)
+            If Me.mImageList <> Nil Then WinImagesDestroy(Me.mImageList)
+            Me.mImageList = Nil
+        #ElseIf TargetMac Then
+            If Me.mOutline <> Nil Then
+                MacDataSource(Me.mOutline, Nil)
+                MacDelegate(Me.mOutline, Nil)
+            End If
+            If Me.mWidget <> Nil Then
+                MacRemove(Me.mWidget)
+                MacRelease(Me.mWidget)
+            End If
+            If Me.mOutline <> Nil Then MacRelease(Me.mOutline)
+            If Me.mBridge <> Nil Then MacRelease(Me.mBridge)
+            For Each item As Ptr In Me.mItems
+                MacRelease(item)
+            Next
+            For Each icon As Ptr In Me.mMacIcons
+                If icon <> Nil Then MacRelease(icon)
+            Next
+            Array.Clear(Me.mMacIcons)
+            Me.mOutline = Nil
+            Me.mBridge = Nil
+        #End If
+        Me.mWidget = Nil
+        Array.Clear(Me.mItems)
+        Me.mUpdating = False
+    End Sub
+    Public Sub RefreshNative()
+        If Me.mWidget = Nil Then Return
+        #If TargetLinux Then
+            GTKSize(Me.mWidget, Me.Width, Me.Height)
+        #ElseIf TargetWindows Then
+            Dim scale As Double = WinDPI(Me.mHost) / 96.0
+            Dim width As Integer = Me.Width * scale
+            Dim height As Integer = Me.Height * scale
+            WinMove(Me.mWidget, 0, 0, width, height, 1)
+        #ElseIf TargetMac Then
+            Dim frame As TreeRect
+            frame.X = 0
+            frame.Y = 0
+            frame.Width = Me.Width
+            frame.Height = Me.Height
+            MacFrame(Me.mWidget, frame)
+        #End If
+    End Sub
+    Private Function ReadNativeSelection() As TreeNode
+        If Me.mWidget = Nil Then Return Me.mSelected
+        #If TargetLinux Then
+            Dim row As Ptr = GTKSelectedItem(Me.mSelection)
+            If row <> Nil Then Return Me.GTKNodeForRow(row)
+        #ElseIf TargetWindows Then
+            Dim address As Integer = WinSend(Me.mWidget, 4362, 9, 0)
+            Return Me.NodeFor(CType(address, Ptr))
+        #ElseIf TargetMac Then
+            Dim row As Integer = MacSelectedRow(Me.mOutline)
+            If row >= 0 Then Return Me.NodeFor(MacItemAtRow(Me.mOutline, row))
+        #End If
+        Return Nil
+    End Function
+    Private Sub ApplyNativeSelection()
+        #If TargetLinux Then
+            Dim position As Integer = 4294967295
+            Dim count As Integer = GTKCount(Me.mTreeModel)
+            For i As Integer = 0 To count - 1
+                Dim row As Ptr = GTKGetRow(Me.mTreeModel, i)
+                If Me.GTKNodeForRow(row) Is Me.mSelected Then position = i
+                GTKUnref(row)
+            Next
+            GTKSelect(Me.mSelection, position)
+        #ElseIf TargetWindows Then
+            WinSend(Me.mWidget, 4363, 9, CType(Me.ItemFor(Me.mSelected), Integer))
+        #ElseIf TargetMac Then
+            If Me.mSelected = Nil Then
+                MacDeselect(Me.mOutline, Me.mOutline)
+            Else
+                Dim row As Integer = MacRowForItem(Me.mOutline, Me.ItemFor(Me.mSelected))
+                If row >= 0 Then MacSelect(Me.mOutline, MacIndexSet(MacClass("NSIndexSet"), row), False)
+            End If
+        #End If
+    End Sub
+    ' Select without notifying first: the host may rebuild the tree during selection.
+    Public Sub RequestContext(node As TreeNode, location As Point)
+        If node <> Nil And Not Me.Contains(node) Then Return
+        Me.SelectedNode = node
+        #If TargetWindows Then
+            Me.FocusKeyboard()
+        #End If
+        RaiseEvent ContextRequested(node, location)
+    End Sub
+
+    ''' Focus belongs to the native tree or one of its native row children.
+    Public Property HasKeyboardFocus As Boolean
+        Get
+            If Me.mWidget = Nil Then Return False
+            #If TargetLinux Then
+                Dim root As Ptr = GTKKeyboardRoot(Me.mWidget)
+                If root = Nil Then Return False
+                Dim focus As Ptr = GTKKeyboardFocus(root)
+                If focus = Nil Then Return False
+                Return focus = Me.mWidget Or GTKKeyboardAncestor(focus, Me.mWidget) <> 0
+            #ElseIf TargetWindows Then
+                Return WinKeyboardFocus() = Me.mWidget
+            #ElseIf TargetMac Then
+                Dim window As Ptr = MacKeyboardWindow(Me.mOutline)
+                If window = Nil Then Return False
+                Return MacKeyboardResponder(window) = Me.mOutline
+            #End If
+            Return False
+        End Get
+    End Property
+
+    ''' Shared entry point for native key events and focus-aware menu routing.
+    Public Function ActivateKeyboardCommand(command As String) As Boolean
+        Dim node As TreeNode = Me.SelectedNode
+        If node = Nil Then Return False
+        If command = "context-menu" Then
+            Me.RequestSelectedContext()
+            Return True
+        End If
+        If Not Me.NavigatorShortcuts Then Return False
+        If command <> "rename" And command <> "duplicate" Then Return False
+        RaiseEvent KeyboardCommand(node, command)
+        Return True
+    End Function
+
+    ''' Restore tree focus after a popup, without stealing focus from a clicked editor.
+    Public Sub FocusKeyboard()
+        #If TargetWindows Then
+            If Me.mWidget <> Nil Then WinKeyboardSetFocus(Me.mWidget)
+        #ElseIf TargetLinux Then
+            Me.RestoreKeyboardFocus()
+        #End If
+    End Sub
+
+    Public Sub RestoreKeyboardFocus()
+        #If TargetLinux Then
+            If Me.mWidget = Nil Then Return
+            Dim list As Ptr = GTKKeyboardScrollChild(Me.mWidget)
+            If list <> Nil Then GTKKeyboardGrabFocus(list)
+        #End If
+    End Sub
+
+    Public Function NavigationKey(key As String, primary As Boolean, shift As Boolean, alt As Boolean) As Boolean
+        If alt Then Return False
+        If key = "Menu" And Not primary And Not shift Then Return Me.ActivateKeyboardCommand("context-menu")
+        If key = "F10" And shift And Not primary Then Return Me.ActivateKeyboardCommand("context-menu")
+        If key = "F2" And Not primary And Not shift Then Return Me.ActivateKeyboardCommand("rename")
+        #If TargetMac Then
+            If key = "Return" And Not primary And Not shift Then Return Me.ActivateKeyboardCommand("rename")
+        #End If
+        If key = "D" And primary And Not shift Then Return Me.ActivateKeyboardCommand("duplicate")
+        Return False
+    End Function
+
+    Public Sub RequestSelectedContext()
+        Dim node As TreeNode = Me.SelectedNode
+        If node = Nil Then Return
+        Dim location As Point = { X: 12.0, Y: 12.0 }
+        #If TargetLinux Then
+            Dim row As Ptr = Me.GTKRowFor(node)
+            If row <> Nil Then
+                Dim widget As Ptr = GTKData(row, "buoy-context-widget")
+                If widget <> Nil Then
+                    Dim x As Double
+                    Dim y As Double
+                    If GTKContextPoint(widget, Me.mHost, 12.0, Math.Max(22, Me.mIconSize + 4), x, y) <> 0 Then
+                        location.X = x
+                        location.Y = y
+                    End If
+                End If
+                GTKUnref(row)
+            End If
+        #ElseIf TargetWindows Then
+            Dim itemRect As TreeKeyboardItemRect
+            itemRect.Item = Me.ItemFor(node)
+            If WinSend(Me.mWidget, 4356, 1, CType(CType(itemRect, Ptr), Integer)) <> 0 Then
+                Dim bounds As TreeKeyboardRect
+                WinCopy(CType(bounds, Ptr), CType(itemRect, Ptr), 16)
+                Dim scale As Double = WinDPI(Me.mHost) / 96.0
+                location.X = bounds.Left / scale
+                location.Y = bounds.Bottom / scale
+            End If
+        #ElseIf TargetMac Then
+            Dim row As Integer = MacRowForItem(Me.mOutline, Me.ItemFor(node))
+            If row >= 0 Then
+                Dim bounds As TreeRect = MacKeyboardRowRect(Me.mOutline, row)
+                Dim point As TreeContextPoint
+                point.X = bounds.X + 12
+                point.Y = bounds.Y + bounds.Height
+                Dim local As TreeContextPoint = MacContextConvert(Me.mHost, point, Me.mOutline)
+                location.X = local.X
+                location.Y = local.Y
+            End If
+        #End If
+        Me.RequestContext(node, location)
+    End Sub
+
+    Public Function OwnsNativeWidget(widget As Ptr) As Boolean
+        Return Me.mWidget = widget
+    End Function
+    Public Sub NativeSelectionChanged()
+        If Me.mUpdating Or Me.mID < 0 Then Return
+        Try
+            Me.mSelected = Me.ReadNativeSelection()
+            RaiseEvent SelectionChanged(Me.mSelected)
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    Private Sub BuildNative()
+        #If TargetLinux Then
+            For Each node As TreeNode In Me.mNodes
+                Array.Append(Me.mItems, GTKString(node.Caption))
+                Array.Append(Me.mChildModels, GTKStore(GTKStringType()))
+            Next
+            For i As Integer = 0 To Array.LastIndex(Me.mNodes)
+                Dim node As TreeNode = Me.mNodes(i)
+                For child As Integer = 0 To node.ChildCount - 1
+                    GTKAppend(Me.mChildModels(i), Me.ItemFor(node.ChildAt(child)))
+                Next
+            Next
+            Me.mRootModel = GTKStore(GTKStringType())
+            For Each root As TreeNode In Me.mRoots
+                GTKAppend(Me.mRootModel, Me.ItemFor(root))
+            Next
+            Me.mTreeModel = GTKTree(GTKRef(Me.mRootModel), 0, 0, AddressOf TreeGTKChildren, CType(Me.mID + 1, Ptr), Nil)
+            Me.mSelection = GTKSelection(GTKRef(Me.mTreeModel))
+            GTKAutoselect(Me.mSelection, 0)
+            GTKCanUnselect(Me.mSelection, 1)
+            GTKSelect(Me.mSelection, 4294967295)
+            GTKConnect(Me.mSelection, "notify::selected-item", AddressOf TreeGTKSelected, CType(Me.mID + 1, Ptr), Nil, 0)
+            Dim factory As Ptr = GTKFactory()
+            GTKConnect(factory, "setup", AddressOf TreeGTKSetup, CType(Me.mID + 1, Ptr), Nil, 0)
+            GTKConnect(factory, "bind", AddressOf TreeGTKBind, CType(Me.mID + 1, Ptr), Nil, 0)
+            GTKConnect(factory, "unbind", AddressOf TreeGTKUnbind, CType(Me.mID + 1, Ptr), Nil, 0)
+            Dim list As Ptr = GTKList(GTKRef(Me.mSelection), factory)
+            Dim keys As Ptr = GTKKeyboardNew()
+            GTKKeyboardPhase(keys, 1)
+            GTKKeyboardConnect(keys, "key-pressed", AddressOf TreeGTKKeyboard, CType(Me.mID + 1, Ptr), Nil, 0)
+            GTKContextController(list, keys)
+            Me.mWidget = GTKScroll()
+            GTKRefSink(Me.mWidget)
+            GTKScrollPolicy(Me.mWidget, 1, 1)
+            GTKScrollChild(Me.mWidget, list)
+            GTKFixedPut(Me.mHost, Me.mWidget, 0, 0)
+            Me.ApplyGTKExpansion()
+        #ElseIf TargetWindows Then
+            Dim controls As TreeCommonControls
+            controls.Size = 8
+            controls.Classes = 2 ' ICC_TREEVIEW_CLASSES
+            If WinInitControls(controls) = 0 Then Throw New RuntimeException("Could not initialize TreeView common control")
+            Dim cls As Bytes = TreeWide("SysTreeView32")
+            Me.mWidget = WinCreate(512, cls.DataPtr(), Nil, 1342242855, 0, 0, 1, 1, Me.mHost, Nil, Nil, Nil)
+            If Me.mWidget = Nil Then Throw New RuntimeException("Could not create Win32 TreeView")
+            If WinSubclass(Me.mWidget, AddressOf TreeWinMessage, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not monitor native TreeView lifetime")
+            WinSend(Me.mWidget, 48, WinStockFont(17), 1)
+            WinSend(Me.mWidget, 4359, Me.mIndentation, 0) ' TVM_SETINDENT
+            WinSend(Me.mWidget, 4379, Math.Max(22, Me.mIconSize + 4), 0) ' TVM_SETITEMHEIGHT
+            Me.mImageList = WinImages(Me.mIconSize, Me.mIconSize, 32, 0, 16)
+            If Me.mImageList <> Nil Then WinSend(Me.mWidget, 4361, 0, CType(Me.mImageList, Integer))
+            For Each node As TreeNode In Me.mNodes
+                Dim text As Bytes = TreeWide(node.Caption)
+                Dim insert As TreeInsert
+                insert.Parent = CType(-65536, Ptr) ' TVI_ROOT
+                If node.ParentNode <> Nil Then insert.Parent = Me.ItemFor(node.ParentNode)
+                insert.After = CType(-65534, Ptr) ' TVI_LAST
+                insert.Item.Mask = 65 ' TVIF_TEXT | TVIF_CHILDREN
+                If node.IconPath <> "" And Me.mImageList <> Nil Then
+                    Dim iconFileName As Bytes = TreeWide(node.IconPath)
+                    Dim icon As Ptr = WinLoadImage(Nil, iconFileName.DataPtr(), 1, Me.mIconSize, Me.mIconSize, 16)
+                    If icon <> Nil Then
+                        Dim imageIndex As Int32 = WinImagesAdd(Me.mImageList, -1, icon)
+                        WinIconDestroy(icon)
+                        If imageIndex >= 0 Then
+                            insert.Item.Mask = insert.Item.Mask Or 34
+                            insert.Item.Image = imageIndex
+                            insert.Item.SelectedImage = imageIndex
+                        End If
+                    End If
+                End If
+                insert.Item.Text = text.DataPtr()
+                insert.Item.Children = 0
+                If node.ChildCount > 0 Then insert.Item.Children = 1
+                Dim address As Integer = WinSend(Me.mWidget, 4402, 0, CType(CType(insert, Ptr), Integer))
+                If address = 0 Then Throw New RuntimeException("Could not insert native tree node")
+                Array.Append(Me.mItems, CType(address, Ptr))
+            Next
+            For Each node As TreeNode In Me.mNodes
+                If node.Expanded Then WinSend(Me.mWidget, 4354, 2, CType(Me.ItemFor(node), Integer))
+            Next
+        #ElseIf TargetMac Then
+            For Each node As TreeNode In Me.mNodes
+                Array.Append(Me.mItems, MacInit(MacAlloc(MacClass("NSObject"))))
+                Dim icon As Ptr = Nil
+                If node.IconPath <> "" Then icon = MacImageFile(MacAlloc(MacClass("NSImage")), MacString(MacClass("NSString"), node.IconPath))
+                If icon <> Nil Then
+                    Dim logicalSize As TreeIconSize
+                    logicalSize.Width = Me.mIconSize
+                    logicalSize.Height = Me.mIconSize
+                    MacImageSize(icon, logicalSize)
+                End If
+                Array.Append(Me.mMacIcons, icon)
+            Next
+            Me.mBridge = MacInit(MacAlloc(TreeMacBridgeClass()))
+            Me.mWidget = MacInit(MacAlloc(MacClass("NSScrollView")))
+            Me.mOutline = MacInit(MacAlloc(TreeContextOutlineClass()))
+            Dim column As Ptr = MacColumnInit(MacAlloc(MacClass("NSTableColumn")), MacString(MacClass("NSString"), "tree"))
+            MacColumnWidth(column, Math.Max(20, Me.Width - 20))
+            Dim cell As Ptr = MacCellText(MacAlloc(MacClass("NSBrowserCell")), MacString(MacClass("NSString"), ""))
+            MacCellLeaf(cell, True)
+            MacColumnCell(column, cell)
+            MacRelease(cell)
+            MacAddColumn(Me.mOutline, column)
+            MacOutlineColumn(Me.mOutline, column)
+            MacRelease(column)
+            Dim outlineFrame As TreeRect
+            outlineFrame.X = 0
+            outlineFrame.Y = 0
+            outlineFrame.Width = Me.Width
+            outlineFrame.Height = Me.Height
+            MacFrame(Me.mOutline, outlineFrame)
+            MacAutoresizing(Me.mOutline, 2)
+            MacHeader(Me.mOutline, Nil)
+            MacRowHeight(Me.mOutline, Math.Max(22, Me.mIconSize + 4))
+            MacIndentation(Me.mOutline, Me.mIndentation)
+            Me.ApplyMacFocusRing()
+            MacDataSource(Me.mOutline, Me.mBridge)
+            MacDelegate(Me.mOutline, Me.mBridge)
+            MacVerticalScroller(Me.mWidget, True)
+            MacAutohideScrollers(Me.mWidget, True)
+            MacDocumentView(Me.mWidget, Me.mOutline)
+            MacAutoresizing(Me.mWidget, 18)
+            MacAddSubview(Me.mHost, Me.mWidget)
+            MacReload(Me.mOutline)
+            For Each node As TreeNode In Me.mNodes
+                If node.Expanded Then MacExpand(Me.mOutline, Me.ItemFor(node), False)
+            Next
+        #End If
+    End Sub
+    #If TargetLinux Then
+        Public Function GTKChildren(item As Ptr) As Ptr
+            For i As Integer = 0 To Array.LastIndex(Me.mItems)
+                If Me.mItems(i) = item Then
+                    If Me.mNodes(i).ChildCount = 0 Then Return Nil
+                    Return GTKRef(Me.mChildModels(i))
+                End If
+            Next
+            Return Nil
+        End Function
+        Private Function GTKNodeForRow(row As Ptr) As TreeNode
+            If row = Nil Then Return Nil
+            Dim item As Ptr = GTKRowItem(row)
+            Dim node As TreeNode = Me.NodeFor(item)
+            If item <> Nil Then GTKUnref(item)
+            Return node
+        End Function
+        Private Function GTKRowFor(node As TreeNode) As Ptr
+            For i As Integer = 0 To GTKCount(Me.mTreeModel) - 1
+                Dim row As Ptr = GTKGetRow(Me.mTreeModel, i)
+                If Me.GTKNodeForRow(row) Is node Then Return row
+                GTKUnref(row)
+            Next
+            Return Nil
+        End Function
+        Private Sub ApplyGTKExpansion()
+            Dim position As Integer = 0
+            While position < GTKCount(Me.mTreeModel)
+                Dim row As Ptr = GTKGetRow(Me.mTreeModel, position)
+                Dim node As TreeNode = Me.GTKNodeForRow(row)
+                If node <> Nil Then GTKSetExpanded(row, CType(node.Expanded, Int32))
+                GTKUnref(row)
+                position += 1
+            End While
+        End Sub
+        Public Sub GTKContext(widget As Ptr, x As Double, y As Double)
+            Dim row As Ptr = GTKData(widget, "buoy-context-row")
+            Dim node As TreeNode = Me.GTKNodeForRow(row)
+            If node = Nil Then Return
+            Dim localX As Double
+            Dim localY As Double
+            If GTKContextPoint(widget, Me.mHost, x, y, localX, localY) = 0 Then Return
+            Dim location As Point = { X: localX, Y: localY }
+            Me.RequestContext(node, location)
+        End Sub
+        Public Sub GTKBindItem(item As Ptr)
+            Dim row As Ptr = GTKListItem(item)
+            Dim expander As Ptr = GTKListChild(item)
+            Dim node As TreeNode = Me.GTKNodeForRow(row)
+            If node = Nil Then Return
+            Dim box As Ptr = GTKExpanderChild(expander)
+            GTKLabel(GTKLastChild(box), node.Caption)
+            Dim image As Ptr = GTKFirstChild(box)
+            GTKExpanderIndentDepth(expander, 0)
+            GTKMarginStart(expander, GTKRowDepth(row) * Me.mIndentation)
+            GTKImagePixelSize(image, Me.mIconSize)
+            GTKSize(image, Me.mIconSize, Me.mIconSize)
+            If node.IconPath <> "" Then
+                GTKImageFile(image, node.IconPath)
+                GTKVisible(image, 1)
+            Else
+                GTKImageClear(image)
+                GTKVisible(image, 0)
+            End If
+            GTKSetData(expander, "buoy-context-row", row)
+            GTKSetData(row, "buoy-context-widget", expander)
+            GTKExpanderRow(expander, row)
+            If GTKData(row, "buoy-tree-watch") = Nil Then
+                GTKSetData(row, "buoy-tree-watch", CType(Me.mID + 1, Ptr))
+                GTKConnect(row, "notify::expanded", AddressOf TreeGTKExpanded, CType(Me.mID + 1, Ptr), Nil, 0)
+            End If
+        End Sub
+        Public Sub GTKExpansionChanged(row As Ptr)
+            If Me.mUpdating Then Return
+            Dim node As TreeNode = Me.GTKNodeForRow(row)
+            If node <> Nil Then node.Expanded = GTKExpanded(row) <> 0
+        End Sub
+    #ElseIf TargetWindows Then
+        Public Sub WindowsContextFromCursor()
+            Dim point As TreeNativePoint
+            If WinContextCursor(point) = 0 Then Return
+            If WinContextToClient(Me.mWidget, point) = 0 Then Return
+            Me.WindowsContextAt(point.X, point.Y)
+        End Sub
+        Public Sub WindowsContext(coordinates As Integer)
+            Me.WindowsContextAt(coordinates And 65535, (coordinates >> 16) And 65535)
+        End Sub
+        Public Sub WindowsContextAt(x As Integer, y As Integer)
+            Dim hit As TreeContextHit
+            hit.X = x
+            hit.Y = y
+            Dim item As Integer = WinSend(Me.mWidget, 4369, 0, CType(CType(hit, Ptr), Integer))
+            Dim node As TreeNode = Me.NodeFor(CType(item, Ptr))
+            If node = Nil Then Return
+            Dim scale As Double = WinDPI(Me.mHost) / 96.0
+            Dim location As Point = { X: hit.X / scale, Y: hit.Y / scale }
+            Me.RequestContext(node, location)
+        End Sub
+        Public Sub WindowsDestroyed(widget As Ptr)
+            ' The common control does not own its image list. External destruction
+            ' clears mID below, so Close can no longer reach DestroyNative.
+            If (widget = Me.mWidget Or widget = Me.mHost) And Not Me.mUpdating Then
+                If Me.mImageList <> Nil Then WinImagesDestroy(Me.mImageList)
+                Me.mImageList = Nil
+            End If
+            If widget = Me.mWidget Then
+                Me.mWidget = Nil
+                Array.Clear(Me.mItems)
+                If Not Me.mUpdating Then
+                    If Me.mID >= 0 Then
+                        TreeRegistry.Items(Me.mID).Owner = Nil
+                        WinUnsubclass(Me.mHost, AddressOf TreeWinMessage, Me.mID + 1)
+                    End If
+                    Me.mID = -1
+                    Me.mHost = Nil
+                    Me.mNativeHostDestroyed = True
+                End If
+            End If
+            If widget = Me.mHost Then
+                If Me.mID >= 0 Then TreeRegistry.Items(Me.mID).Owner = Nil
+                Me.mID = -1
+                Me.mWidget = Nil
+                Me.mHost = Nil
+                Me.mNativeHostDestroyed = True
+                Array.Clear(Me.mItems)
+            End If
+        End Sub
+        Public Sub WindowsExpansionChanged(item As Ptr)
+            If Me.mUpdating Then Return
+            Dim node As TreeNode = Me.NodeFor(item)
+            If node <> Nil Then node.Expanded = (WinSend(Me.mWidget, 4391, CType(item, Integer), 32) And 32) <> 0
+        End Sub
+    #ElseIf TargetMac Then
+        Public Function OwnsContextOutline(outline As Ptr) As Boolean
+            Return Me.mOutline = outline
+        End Function
+        Public Sub MacContext(nativeEvent As Ptr)
+            Dim point As TreeContextPoint = MacContextConvert(Me.mOutline, MacContextEventPoint(nativeEvent), Nil)
+            Dim row As Integer = MacContextRow(Me.mOutline, point)
+            If row < 0 Then Return
+            Dim node As TreeNode = Me.NodeFor(MacItemAtRow(Me.mOutline, row))
+            Dim local As TreeContextPoint = MacContextConvert(Me.mHost, point, Me.mOutline)
+            Dim location As Point = { X: local.X, Y: local.Y }
+            Me.RequestContext(node, location)
+        End Sub
+        Public Function OwnsMacBridge(bridge As Ptr) As Boolean
+            Return Me.mBridge = bridge
+        End Function
+        Public Function MacChildCount(item As Ptr) As Integer
+            If item = Nil Then Return Me.RootCount
+            Dim node As TreeNode = Me.NodeFor(item)
+            If node = Nil Then Return 0
+            Return node.ChildCount
+        End Function
+        Public Function MacChild(index As Integer, item As Ptr) As Ptr
+            If item = Nil Then Return Me.ItemFor(Me.RootAt(index))
+            Dim node As TreeNode = Me.NodeFor(item)
+            If node = Nil Then Return Nil
+            Return Me.ItemFor(node.ChildAt(index))
+        End Function
+        Public Function MacCaption(item As Ptr) As Ptr
+            Dim node As TreeNode = Me.NodeFor(item)
+            If node = Nil Then Return Nil
+            Return MacString(MacClass("NSString"), node.Caption)
+        End Function
+        Public Sub MacDisplayIcon(cell As Ptr, item As Ptr)
+            For i As Integer = 0 To Array.LastIndex(Me.mItems)
+                If Me.mItems(i) = item Then
+                    MacCellImage(cell, Me.mMacIcons(i))
+                    Return
+                End If
+            Next
+            MacCellImage(cell, Nil)
+        End Sub
+        Public Sub MacExpansionChanged(notification As Ptr)
+            If Me.mUpdating Then Return
+            Dim info As Ptr = MacUserInfo(notification)
+            Dim item As Ptr = MacObjectForKey(info, MacString(MacClass("NSString"), "NSObject"))
+            Dim node As TreeNode = Me.NodeFor(item)
+            If node <> Nil Then node.Expanded = MacExpanded(Me.mOutline, item)
+        End Sub
+    #End If
+End Class
+
+Private Function TreeOwner(data As Ptr) As TreeView
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(TreeRegistry.Items) Then Return Nil
+    Return TreeRegistry.Items(index).Owner
+End Function
+
+#If TargetLinux Then
+Delegate Sub TreeGTKSignal(object As Ptr, detail As Ptr, data As Ptr)
+Delegate Function TreeGTKCreate(item As Ptr, data As Ptr) As Ptr
+Private Optional Declare Function GTKRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (object As Ptr) As Ptr
+Private Optional Declare Function GTKRefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (object As Ptr) As Ptr
+Private Optional Declare Sub GTKUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (object As Ptr)
+Private Optional Declare Function GTKParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Sub GTKFixedRemove Lib "libgtk-4.so.1" Alias "gtk_fixed_remove" (host As Ptr, widget As Ptr)
+Private Optional Declare Sub GTKFixedPut Lib "libgtk-4.so.1" Alias "gtk_fixed_put" (host As Ptr, widget As Ptr, x As Double, y As Double)
+Private Optional Declare Sub GTKSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Function GTKStringType Lib "libgtk-4.so.1" Alias "gtk_string_object_get_type" () As UInt64
+Private Optional Declare Function GTKString Lib "libgtk-4.so.1" Alias "gtk_string_object_new" (caption As String) As Ptr
+Private Optional Declare Function GTKStore Lib "libgio-2.0.so.0" Alias "g_list_store_new" (itemType As UInt64) As Ptr
+Private Optional Declare Sub GTKAppend Lib "libgio-2.0.so.0" Alias "g_list_store_append" (store As Ptr, item As Ptr)
+Private Optional Declare Function GTKCount Lib "libgio-2.0.so.0" Alias "g_list_model_get_n_items" (model As Ptr) As UInt32
+Private Optional Declare Function GTKTree Lib "libgtk-4.so.1" Alias "gtk_tree_list_model_new" (root As Ptr, passthrough As Int32, autoexpand As Int32, create As TreeGTKCreate, data As Ptr, destroy As Ptr) As Ptr
+Private Optional Declare Function GTKSelection Lib "libgtk-4.so.1" Alias "gtk_single_selection_new" (model As Ptr) As Ptr
+Private Optional Declare Sub GTKAutoselect Lib "libgtk-4.so.1" Alias "gtk_single_selection_set_autoselect" (selection As Ptr, enabled As Int32)
+Private Optional Declare Sub GTKCanUnselect Lib "libgtk-4.so.1" Alias "gtk_single_selection_set_can_unselect" (selection As Ptr, enabled As Int32)
+Private Optional Declare Sub GTKSelect Lib "libgtk-4.so.1" Alias "gtk_single_selection_set_selected" (selection As Ptr, position As UInt32)
+Private Optional Declare Function GTKSelectedItem Lib "libgtk-4.so.1" Alias "gtk_single_selection_get_selected_item" (selection As Ptr) As Ptr
+Private Optional Declare Function GTKFactory Lib "libgtk-4.so.1" Alias "gtk_signal_list_item_factory_new" () As Ptr
+Private Optional Declare Function GTKList Lib "libgtk-4.so.1" Alias "gtk_list_view_new" (selection As Ptr, factory As Ptr) As Ptr
+Private Optional Declare Function GTKScroll Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_new" () As Ptr
+Private Optional Declare Sub GTKScrollChild Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_set_child" (scroll As Ptr, child As Ptr)
+Private Optional Declare Sub GTKScrollPolicy Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_set_policy" (scroll As Ptr, horizontal As Int32, vertical As Int32)
+Private Optional Declare Function GTKGetRow Lib "libgtk-4.so.1" Alias "gtk_tree_list_model_get_row" (model As Ptr, position As UInt32) As Ptr
+Private Optional Declare Function GTKRowItem Lib "libgtk-4.so.1" Alias "gtk_tree_list_row_get_item" (row As Ptr) As Ptr
+Private Optional Declare Sub GTKSetExpanded Lib "libgtk-4.so.1" Alias "gtk_tree_list_row_set_expanded" (row As Ptr, expanded As Int32)
+Private Optional Declare Function GTKExpanded Lib "libgtk-4.so.1" Alias "gtk_tree_list_row_get_expanded" (row As Ptr) As Int32
+Private Optional Declare Function GTKListItem Lib "libgtk-4.so.1" Alias "gtk_list_item_get_item" (item As Ptr) As Ptr
+Private Optional Declare Sub GTKListFocusable Lib "libgtk-4.so.1" Alias "gtk_list_item_set_focusable" (item As Ptr, focusable As Int32)
+Private Optional Declare Function GTKListChild Lib "libgtk-4.so.1" Alias "gtk_list_item_get_child" (item As Ptr) As Ptr
+Private Optional Declare Sub GTKListSetChild Lib "libgtk-4.so.1" Alias "gtk_list_item_set_child" (item As Ptr, child As Ptr)
+Private Optional Declare Function GTKExpander Lib "libgtk-4.so.1" Alias "gtk_tree_expander_new" () As Ptr
+Private Optional Declare Sub GTKExpanderIndentDepth Lib "libgtk-4.so.1" Alias "gtk_tree_expander_set_indent_for_depth" (expander As Ptr, enabled As Int32)
+Private Optional Declare Function GTKRowDepth Lib "libgtk-4.so.1" Alias "gtk_tree_list_row_get_depth" (row As Ptr) As UInt32
+Private Optional Declare Sub GTKMarginStart Lib "libgtk-4.so.1" Alias "gtk_widget_set_margin_start" (widget As Ptr, margin As Int32)
+Private Optional Declare Sub GTKImagePixelSize Lib "libgtk-4.so.1" Alias "gtk_image_set_pixel_size" (image As Ptr, pixels As Int32)
+Private Optional Declare Function GTKExpanderChild Lib "libgtk-4.so.1" Alias "gtk_tree_expander_get_child" (expander As Ptr) As Ptr
+Private Optional Declare Sub GTKExpanderSetChild Lib "libgtk-4.so.1" Alias "gtk_tree_expander_set_child" (expander As Ptr, child As Ptr)
+Private Optional Declare Sub GTKExpanderRow Lib "libgtk-4.so.1" Alias "gtk_tree_expander_set_list_row" (expander As Ptr, row As Ptr)
+Private Optional Declare Function GTKBox Lib "libgtk-4.so.1" Alias "gtk_box_new" (orientation As Int32, spacing As Int32) As Ptr
+Private Optional Declare Sub GTKBoxAppend Lib "libgtk-4.so.1" Alias "gtk_box_append" (box As Ptr, child As Ptr)
+Private Optional Declare Function GTKFirstChild Lib "libgtk-4.so.1" Alias "gtk_widget_get_first_child" (widget As Ptr) As Ptr
+Private Optional Declare Function GTKLastChild Lib "libgtk-4.so.1" Alias "gtk_widget_get_last_child" (widget As Ptr) As Ptr
+Private Optional Declare Function GTKImage Lib "libgtk-4.so.1" Alias "gtk_image_new" () As Ptr
+Private Optional Declare Sub GTKImageFile Lib "libgtk-4.so.1" Alias "gtk_image_set_from_file" (image As Ptr, fileName As String)
+Private Optional Declare Sub GTKImageClear Lib "libgtk-4.so.1" Alias "gtk_image_clear" (image As Ptr)
+Private Optional Declare Sub GTKVisible Lib "libgtk-4.so.1" Alias "gtk_widget_set_visible" (widget As Ptr, visible As Int32)
+Private Optional Declare Function GTKLabelNew Lib "libgtk-4.so.1" Alias "gtk_label_new" (caption As String) As Ptr
+Private Optional Declare Sub GTKLabel Lib "libgtk-4.so.1" Alias "gtk_label_set_text" (label As Ptr, caption As String)
+Private Optional Declare Sub GTKLabelAlignment Lib "libgtk-4.so.1" Alias "gtk_label_set_xalign" (label As Ptr, alignment As Single)
+Private Optional Declare Function GTKConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (object As Ptr, signal As String, callback As TreeGTKSignal, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Function GTKData Lib "libgobject-2.0.so.0" Alias "g_object_get_data" (object As Ptr, key As String) As Ptr
+Private Optional Declare Sub GTKSetData Lib "libgobject-2.0.so.0" Alias "g_object_set_data" (object As Ptr, key As String, data As Ptr)
+Private Function TreeGTKChildren(item As Ptr, data As Ptr) As Ptr
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return Nil
+    Try
+        Return owner.GTKChildren(item)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        Return Nil
+    End Try
+End Function
+Private Sub TreeGTKSelected(object As Ptr, detail As Ptr, data As Ptr)
+    Dim owner As TreeView = TreeOwner(data)
+    If owner <> Nil Then owner.NativeSelectionChanged()
+End Sub
+Private Delegate Function TreeGTKKeyboardSignal(controller As Ptr, key As UInt32, code As UInt32, state As UInt32, data As Ptr) As Int32
+Private Optional Declare Function GTKKeyboardScrollChild Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_child" (scroll As Ptr) As Ptr
+Private Optional Declare Function GTKKeyboardGrabFocus Lib "libgtk-4.so.1" Alias "gtk_widget_grab_focus" (widget As Ptr) As Int32
+Private Optional Declare Function GTKKeyboardNew Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_new" () As Ptr
+Private Optional Declare Sub GTKKeyboardPhase Lib "libgtk-4.so.1" Alias "gtk_event_controller_set_propagation_phase" (controller As Ptr, phase As Int32)
+Private Optional Declare Function GTKKeyboardConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (object As Ptr, signal As String, callback As TreeGTKKeyboardSignal, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Function GTKKeyboardRoot Lib "libgtk-4.so.1" Alias "gtk_widget_get_root" (widget As Ptr) As Ptr
+Private Optional Declare Function GTKKeyboardFocus Lib "libgtk-4.so.1" Alias "gtk_window_get_focus" (window As Ptr) As Ptr
+Private Optional Declare Function GTKKeyboardAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_is_ancestor" (widget As Ptr, ancestor As Ptr) As Int32
+Private Function TreeGTKKeyboard(controller As Ptr, key As UInt32, code As UInt32, state As UInt32, data As Ptr) As Int32
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return 0
+    Try
+        Dim name As String = ""
+        Select Case key
+            Case 65383
+                name = "Menu"
+            Case 65479
+                name = "F10"
+            Case 65471
+                name = "F2"
+            Case 68, 100
+                name = "D"
+        End Select
+        Dim primary As Boolean = (state And 4) <> 0
+        Dim shift As Boolean = (state And 1) <> 0
+        Dim alt As Boolean = (state And 8) <> 0 Or (state And 67108864) <> 0
+        If owner.NavigationKey(name, primary, shift, alt) Then Return 1
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+    Return 0
+End Function
+Private Delegate Sub TreeGTKContextSignal(gesture As Ptr, presses As Int32, x As Double, y As Double, data As Ptr)
+Private Optional Declare Function GTKConnectContext Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (object As Ptr, signal As String, callback As TreeGTKContextSignal, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Function GTKContextGesture Lib "libgtk-4.so.1" Alias "gtk_gesture_click_new" () As Ptr
+Private Optional Declare Sub GTKContextButton Lib "libgtk-4.so.1" Alias "gtk_gesture_single_set_button" (gesture As Ptr, button As UInt32)
+Private Optional Declare Sub GTKContextController Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Function GTKContextWidget Lib "libgtk-4.so.1" Alias "gtk_event_controller_get_widget" (controller As Ptr) As Ptr
+Private Optional Declare Function GTKContextPoint Lib "libgtk-4.so.1" Alias "gtk_widget_translate_coordinates" (source As Ptr, destination As Ptr, x As Double, y As Double, ByRef destX As Double, ByRef destY As Double) As Int32
+Private Sub TreeGTKContext(gesture As Ptr, presses As Int32, x As Double, y As Double, data As Ptr)
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return
+    Try
+        owner.GTKContext(GTKContextWidget(gesture), x, y)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+End Sub
+Private Sub TreeGTKSetup(object As Ptr, item As Ptr, data As Ptr)
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return
+    Try
+        GTKListFocusable(item, 0)
+        Dim expander As Ptr = GTKExpander()
+        Dim label As Ptr = GTKLabelNew("")
+        GTKLabelAlignment(label, 0.0)
+        Dim box As Ptr = GTKBox(0, 6)
+        Dim image As Ptr = GTKImage()
+        GTKSize(image, 20, 20)
+        GTKBoxAppend(box, image)
+        GTKBoxAppend(box, label)
+        GTKExpanderSetChild(expander, box)
+        GTKListSetChild(item, expander)
+        Dim gesture As Ptr = GTKContextGesture()
+        GTKContextButton(gesture, 3)
+        GTKConnectContext(gesture, "pressed", AddressOf TreeGTKContext, data, Nil, 0)
+        GTKContextController(expander, gesture)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+End Sub
+Private Sub TreeGTKBind(object As Ptr, item As Ptr, data As Ptr)
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return
+    Try
+        owner.GTKBindItem(item)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+End Sub
+Private Sub TreeGTKUnbind(object As Ptr, item As Ptr, data As Ptr)
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return
+    Try
+        Dim oldRow As Ptr = GTKData(GTKListChild(item), "buoy-context-row")
+        If oldRow <> Nil Then GTKSetData(oldRow, "buoy-context-widget", Nil)
+        GTKSetData(GTKListChild(item), "buoy-context-row", Nil)
+        GTKExpanderRow(GTKListChild(item), Nil)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+End Sub
+Private Sub TreeGTKExpanded(row As Ptr, detail As Ptr, data As Ptr)
+    Dim owner As TreeView = TreeOwner(data)
+    If owner = Nil Then Return
+    Try
+        owner.GTKExpansionChanged(row)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+End Sub
+#ElseIf TargetWindows Then
+Sequential Structure TreeNativePoint
+    X As Int32
+    Y As Int32
+End Structure
+Private Optional Declare Function WinContextCursor Lib "user32" Alias "GetCursorPos" (ByRef point As TreeNativePoint) As Int32
+Private Optional Declare Function WinContextToClient Lib "user32" Alias "ScreenToClient" (window As Ptr, ByRef point As TreeNativePoint) As Int32
+Sequential Structure TreeKeyboardItemRect
+    Item As Ptr
+    Right As Int32
+    Bottom As Int32
+End Structure
+Sequential Structure TreeKeyboardRect
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+End Structure
+Private Optional Declare Function WinKeyboardFocus Lib "user32" Alias "GetFocus" () As Ptr
+Private Optional Declare Function WinKeyboardSetFocus Lib "user32" Alias "SetFocus" (window As Ptr) As Ptr
+Private Optional Declare Function WinKeyboardState Lib "user32" Alias "GetKeyState" (key As Int32) As Int16
+Sequential Structure TreeContextHit
+    X As Int32
+    Y As Int32
+    Flags As UInt32
+    Item As Ptr
+End Structure
+Sequential Structure TreeCommonControls
+    Size As UInt32
+    Classes As UInt32
+End Structure
+Sequential Structure TreeWinItem
+    Mask As UInt32
+    Handle As Ptr
+    State As UInt32
+    StateMask As UInt32
+    Text As Ptr
+    TextCapacity As Int32
+    Image As Int32
+    SelectedImage As Int32
+    Children As Int32
+    Parameter As Int64
+End Structure
+Sequential Structure TreeInsert
+    Parent As Ptr
+    After As Ptr
+    Item As TreeWinItem
+End Structure
+Sequential Structure TreeNotifyHeader
+    Window As Ptr
+    ID As UInt64
+    Code As Int32
+    Padding As UInt32
+End Structure
+Sequential Structure TreeNotify
+    Window As Ptr
+    ID As UInt64
+    Code As Int32
+    HeaderPadding As UInt32
+    Action As UInt32
+    OldItem As TreeWinItem
+    NewItem As TreeWinItem
+    DragX As Int32
+    DragY As Int32
+End Structure
+Delegate Function TreeWinCallback(widget As Ptr, message As UInt32, word As UInt64, param As Ptr, id As UInt64, data As UInt64) As Int64
+Private Optional Declare Function WinInitControls Lib "comctl32" Alias "InitCommonControlsEx" (ByRef controls As TreeCommonControls) As Int32
+Private Optional Declare Function WinSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As TreeWinCallback, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function WinUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As TreeWinCallback, id As UInt64) As Int32
+Private Optional Declare Function WinDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function WinCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, parameter As Ptr) As Ptr
+Private Optional Declare Function WinIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function WinDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Optional Declare Function WinSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function WinMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, repaint As Int32) As Int32
+Private Optional Declare Function WinDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function WinStockFont Lib "gdi32" Alias "GetStockObject" (index As Int32) As UInt64
+Private Optional Declare Sub WinCopy Lib "kernel32" Alias "RtlMoveMemory" (destination As Ptr, source As Ptr, count As UInt64)
+Private Optional Declare Function WinImages Lib "comctl32" Alias "ImageList_Create" (width As Int32, height As Int32, imageOptions As UInt32, initial As Int32, grow As Int32) As Ptr
+Private Optional Declare Function WinImagesAdd Lib "comctl32" Alias "ImageList_ReplaceIcon" (images As Ptr, index As Int32, icon As Ptr) As Int32
+Private Optional Declare Function WinImagesDestroy Lib "comctl32" Alias "ImageList_Destroy" (images As Ptr) As Int32
+Private Optional Declare Function WinLoadImage Lib "user32" Alias "LoadImageW" (instance As Ptr, name As Ptr, kind As UInt32, width As Int32, height As Int32, loadOptions As UInt32) As Ptr
+Private Optional Declare Function WinIconDestroy Lib "user32" Alias "DestroyIcon" (icon As Ptr) As Int32
+Private Function TreeWide(value As String) As Bytes
+    Dim bytes As Bytes = value.AsUTF16LE()
+    bytes.Append(0)
+    bytes.Append(0)
+    Return bytes
+End Function
+Private Function TreeWinMessage(widget As Ptr, message As UInt32, word As UInt64, param As Ptr, id As UInt64, data As UInt64) As Int64
+    If message = 130 Then ' WM_NCDESTROY invalidates HWNDs before they can be recycled.
+        Dim callbackID As Integer = id
+        Dim owner As TreeView = TreeOwner(CType(callbackID, Ptr))
+        If owner <> Nil Then owner.WindowsDestroyed(widget)
+    End If
+    If message = 256 Or message = 260 Then ' WM_KEYDOWN / WM_SYSKEYDOWN
+        Dim keyID As Integer = id
+        Dim owner As TreeView = TreeOwner(CType(keyID, Ptr))
+        If owner <> Nil Then
+            If owner.OwnsNativeWidget(widget) Then
+                Try
+                    Dim name As String = ""
+                    Select Case word
+                        Case 93
+                            name = "Menu"
+                        Case 121
+                            name = "F10"
+                        Case 113
+                            name = "F2"
+                        Case 68
+                            name = "D"
+                    End Select
+                    If owner.NavigationKey(name, WinKeyboardState(17) < 0, WinKeyboardState(16) < 0, WinKeyboardState(18) < 0 Or WinKeyboardState(91) < 0 Or WinKeyboardState(92) < 0) Then Return 0
+                Catch e As Exception
+                    owner.LastNativeError = e.Message
+                End Try
+            End If
+        End If
+    End If
+    If message = 78 And param <> Nil Then ' WM_NOTIFY
+        Dim callbackID As Integer = id
+        Dim owner As TreeView = TreeOwner(CType(callbackID, Ptr))
+        If owner <> Nil Then
+            Try
+                Dim header As TreeNotifyHeader
+                WinCopy(CType(header, Ptr), param, 24)
+                If owner.OwnsNativeWidget(header.Window) Then
+                    If header.Code = -5 Then owner.WindowsContextFromCursor() ' NM_RCLICK
+                    If header.Code = -451 Then owner.NativeSelectionChanged() ' TVN_SELCHANGEDW
+                    If header.Code = -455 Then
+                        Dim notification As TreeNotify
+                        WinCopy(CType(notification, Ptr), param, 152)
+                        owner.WindowsExpansionChanged(notification.NewItem.Handle)
+                    End If
+                End If
+            Catch e As Exception
+                owner.LastNativeError = e.Message
+            End Try
+        End If
+    End If
+    Return WinDefault(widget, message, word, CType(param, Integer))
+End Function
+#ElseIf TargetMac Then
+Sequential Structure TreeRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Delegate Function TreeMacCount(receiver As Ptr, methodSelector As Ptr, outline As Ptr, item As Ptr) As Integer
+Delegate Function TreeMacChild(receiver As Ptr, methodSelector As Ptr, outline As Ptr, index As Integer, item As Ptr) As Ptr
+Delegate Function TreeMacExpandable(receiver As Ptr, methodSelector As Ptr, outline As Ptr, item As Ptr) As UInt8
+Delegate Function TreeMacValue(receiver As Ptr, methodSelector As Ptr, outline As Ptr, column As Ptr, item As Ptr) As Ptr
+Delegate Sub TreeMacNotification(receiver As Ptr, methodSelector As Ptr, notification As Ptr)
+Private Declare Function MacClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function MacAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Sub MacRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function MacAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, implementation As Ptr, encoding As String) As UInt8
+Private Declare Function MacSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function MacAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function MacInit Lib "AppKit" Selector "init" (object As Ptr) As Ptr
+Private Declare Sub MacRelease Lib "AppKit" Selector "release" (object As Ptr)
+Private Declare Function MacColumnInit Lib "AppKit" Selector "initWithIdentifier:" (column As Ptr, identifier As Ptr) As Ptr
+Private Declare Sub MacColumnWidth Lib "AppKit" Selector "setWidth:" (column As Ptr, width As Double)
+Private Declare Sub MacAddColumn Lib "AppKit" Selector "addTableColumn:" (outline As Ptr, column As Ptr)
+Private Declare Sub MacOutlineColumn Lib "AppKit" Selector "setOutlineTableColumn:" (outline As Ptr, column As Ptr)
+Private Declare Sub MacHeader Lib "AppKit" Selector "setHeaderView:" (outline As Ptr, header As Ptr)
+Private Declare Sub MacDataSource Lib "AppKit" Selector "setDataSource:" (outline As Ptr, source As Ptr)
+Private Declare Sub MacDelegate Lib "AppKit" Selector "setDelegate:" (outline As Ptr, source As Ptr)
+Private Declare Sub MacVerticalScroller Lib "AppKit" Selector "setHasVerticalScroller:" (scroll As Ptr, visible As Boolean)
+Private Declare Sub MacAutohideScrollers Lib "AppKit" Selector "setAutohidesScrollers:" (scroll As Ptr, autohide As Boolean)
+Private Declare Sub MacDocumentView Lib "AppKit" Selector "setDocumentView:" (scroll As Ptr, view As Ptr)
+Private Declare Sub MacAddSubview Lib "AppKit" Selector "addSubview:" (host As Ptr, view As Ptr)
+Private Declare Sub MacRemove Lib "AppKit" Selector "removeFromSuperview" (view As Ptr)
+Private Declare Sub MacAutoresizing Lib "AppKit" Selector "setAutoresizingMask:" (view As Ptr, mask As Integer)
+Private Declare Sub MacFrame Lib "AppKit" Selector "setFrame:" (view As Ptr, frame As TreeRect)
+Private Declare Sub MacReload Lib "AppKit" Selector "reloadData" (outline As Ptr)
+Private Declare Sub MacExpand Lib "AppKit" Selector "expandItem:expandChildren:" (outline As Ptr, item As Ptr, children As Boolean)
+Private Declare Sub MacCollapse Lib "AppKit" Selector "collapseItem:collapseChildren:" (outline As Ptr, item As Ptr, children As Boolean)
+Private Declare Function MacExpanded Lib "AppKit" Selector "isItemExpanded:" (outline As Ptr, item As Ptr) As Boolean
+Private Declare Function MacSelectedRow Lib "AppKit" Selector "selectedRow" (outline As Ptr) As Integer
+Private Declare Function MacItemAtRow Lib "AppKit" Selector "itemAtRow:" (outline As Ptr, row As Integer) As Ptr
+Private Declare Function MacRowForItem Lib "AppKit" Selector "rowForItem:" (outline As Ptr, item As Ptr) As Integer
+Private Declare Sub MacDeselect Lib "AppKit" Selector "deselectAll:" (outline As Ptr, sender As Ptr)
+Private Declare Sub MacSelect Lib "AppKit" Selector "selectRowIndexes:byExtendingSelection:" (outline As Ptr, indexes As Ptr, extend As Boolean)
+Private Declare Function MacIndexSet Lib "Foundation" Selector "indexSetWithIndex:" (cls As Ptr, index As Integer) As Ptr
+Private Declare Function MacString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function MacUserInfo Lib "Foundation" Selector "userInfo" (notification As Ptr) As Ptr
+Private Declare Function MacObjectForKey Lib "Foundation" Selector "objectForKey:" (dictionary As Ptr, key As Ptr) As Ptr
+Sequential Structure TreeIconSize
+    Width As Double
+    Height As Double
+End Structure
+Private Declare Sub MacImageSize Lib "AppKit" Selector "setSize:" (image As Ptr, size As TreeIconSize)
+Private Declare Sub MacRowHeight Lib "AppKit" Selector "setRowHeight:" (outline As Ptr, height As Double)
+Private Declare Sub MacFocusRingType Lib "AppKit" Selector "setFocusRingType:" (view As Ptr, ringType As Integer)
+Private Declare Sub MacTableStyle Lib "AppKit" Selector "setStyle:" (table As Ptr, style As Integer)
+Private Declare Sub MacIntercellSpacing Lib "AppKit" Selector "setIntercellSpacing:" (table As Ptr, spacing As TreeIconSize)
+Private Declare Sub MacIndentation Lib "AppKit" Selector "setIndentationPerLevel:" (outline As Ptr, indentation As Double)
+Private Declare Function MacImageFile Lib "AppKit" Selector "initWithContentsOfFile:" (image As Ptr, fileName As Ptr) As Ptr
+Private Declare Function MacCellText Lib "AppKit" Selector "initTextCell:" (cell As Ptr, text As Ptr) As Ptr
+Private Declare Sub MacColumnCell Lib "AppKit" Selector "setDataCell:" (column As Ptr, cell As Ptr)
+Private Declare Sub MacCellImage Lib "AppKit" Selector "setImage:" (cell As Ptr, image As Ptr)
+Private Declare Sub MacCellLeaf Lib "AppKit" Selector "setLeaf:" (cell As Ptr, leaf As Boolean)
+Private Delegate Sub TreeMacDisplay(receiver As Ptr, methodSelector As Ptr, outline As Ptr, cell As Ptr, column As Ptr, item As Ptr)
+Private Sub TreeMacDisplayCell(receiver As Ptr, methodSelector As Ptr, outline As Ptr, cell As Ptr, column As Ptr, item As Ptr)
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner <> Nil Then owner.MacDisplayIcon(cell, item)
+End Sub
+Sequential Structure TreeContextPoint
+    X As Double
+    Y As Double
+End Structure
+Private Declare Function MacContextEventPoint Lib "AppKit" Selector "locationInWindow" (nativeEvent As Ptr) As TreeContextPoint
+Private Declare Function MacContextConvert Lib "AppKit" Selector "convertPoint:fromView:" (view As Ptr, point As TreeContextPoint, source As Ptr) As TreeContextPoint
+Private Declare Function MacContextRow Lib "AppKit" Selector "rowAtPoint:" (outline As Ptr, point As TreeContextPoint) As Integer
+Private Delegate Function TreeContextCallback(receiver As Ptr, methodSelector As Ptr, nativeEvent As Ptr) As Ptr
+Sequential Structure TreeKeyboardSuper
+    Receiver As Ptr
+    ParentClass As Ptr
+End Structure
+Private Declare Sub MacKeyboardSuper Lib "objc" Alias "objc_msgSendSuper" (ByRef receiver As TreeKeyboardSuper, methodSelector As Ptr, nativeEvent As Ptr)
+Private Declare Function MacKeyboardCode Lib "AppKit" Selector "keyCode" (nativeEvent As Ptr) As UInt16
+Private Declare Function MacKeyboardModifiers Lib "AppKit" Selector "modifierFlags" (nativeEvent As Ptr) As UInt64
+Private Declare Function MacKeyboardWindow Lib "AppKit" Selector "window" (view As Ptr) As Ptr
+Private Declare Function MacKeyboardResponder Lib "AppKit" Selector "firstResponder" (window As Ptr) As Ptr
+Private Declare Function MacKeyboardRowRect Lib "AppKit" Selector "rectOfRow:" (outline As Ptr, row As Integer) As TreeRect
+Private Delegate Sub TreeKeyboardCallback(receiver As Ptr, methodSelector As Ptr, nativeEvent As Ptr)
+Private Sub TreeMacKeyboard(receiver As Ptr, methodSelector As Ptr, nativeEvent As Ptr)
+    For Each reference As TreeReference In TreeRegistry.Items
+        Dim owner As TreeView = reference.Owner
+        If owner <> Nil Then
+            If owner.OwnsContextOutline(receiver) Then
+                Try
+                    Dim name As String = ""
+                    Select Case MacKeyboardCode(nativeEvent)
+                        Case 120
+                            name = "F2"
+                        Case 109
+                            name = "F10"
+                        Case 2
+                            name = "D"
+                        Case 36, 76
+                            name = "Return"
+                    End Select
+                    Dim modifiers As UInt64 = MacKeyboardModifiers(nativeEvent)
+                    Dim primary As Boolean = (modifiers And 1048576) <> 0
+                    Dim shift As Boolean = (modifiers And 131072) <> 0
+                    Dim alt As Boolean = (modifiers And 524288) <> 0 Or (modifiers And 262144) <> 0
+                    If owner.NavigationKey(name, primary, shift, alt) Then Return
+                Catch e As Exception
+                    owner.LastNativeError = e.Message
+                End Try
+                Exit For
+            End If
+        End If
+    Next
+    Dim parent As TreeKeyboardSuper
+    parent.Receiver = receiver
+    parent.ParentClass = MacClass("NSOutlineView")
+    MacKeyboardSuper(parent, methodSelector, nativeEvent)
+End Sub
+Private Function TreeContextOutlineClass() As Ptr
+    Dim cls As Ptr = MacClass("BuoyContextOutlineView")
+    If cls <> Nil Then Return cls
+    cls = MacAllocateClass(MacClass("NSOutlineView"), "BuoyContextOutlineView", 0)
+    Dim callback As TreeContextCallback = AddressOf TreeMacContext
+    If MacAddMethod(cls, MacSelector("menuForEvent:"), CType(callback, Ptr), "@@:@") = 0 Then Throw New RuntimeException("Could not register tree context menu")
+    Dim keyCallback As TreeKeyboardCallback = AddressOf TreeMacKeyboard
+    If MacAddMethod(cls, MacSelector("keyDown:"), CType(keyCallback, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not register tree keyboard handler")
+    MacRegisterClass(cls)
+    Return cls
+End Function
+Private Function TreeMacContext(receiver As Ptr, methodSelector As Ptr, nativeEvent As Ptr) As Ptr
+    For Each reference As TreeReference In TreeRegistry.Items
+        Dim owner As TreeView = reference.Owner
+        If owner <> Nil Then
+            If owner.OwnsContextOutline(receiver) Then
+                Try
+                    owner.MacContext(nativeEvent)
+                Catch e As Exception
+                    owner.LastNativeError = e.Message
+                End Try
+                Return Nil
+            End If
+        End If
+    Next
+    Return Nil
+End Function
+Private Function TreeMacBridgeClass() As Ptr
+    Dim cls As Ptr = MacClass("BuoyNativeTreeDataSource")
+    If cls <> Nil Then Return cls
+    cls = MacAllocateClass(MacClass("NSObject"), "BuoyNativeTreeDataSource", 0)
+    If cls = Nil Then Throw New RuntimeException("Could not allocate outline data source")
+    Dim count As TreeMacCount = AddressOf TreeMacNumber
+    Dim child As TreeMacChild = AddressOf TreeMacGetChild
+    Dim expandable As TreeMacExpandable = AddressOf TreeMacCanExpand
+    Dim value As TreeMacValue = AddressOf TreeMacGetValue
+    Dim selected As TreeMacNotification = AddressOf TreeMacSelected
+    Dim expanded As TreeMacNotification = AddressOf TreeMacExpanded
+    If MacAddMethod(cls, MacSelector("outlineView:numberOfChildrenOfItem:"), CType(count, Ptr), "q@:@@") = 0 Then Throw New RuntimeException("Could not register outline count")
+    If MacAddMethod(cls, MacSelector("outlineView:child:ofItem:"), CType(child, Ptr), "@@:@q@") = 0 Then Throw New RuntimeException("Could not register outline child")
+    If MacAddMethod(cls, MacSelector("outlineView:isItemExpandable:"), CType(expandable, Ptr), "C@:@@") = 0 Then Throw New RuntimeException("Could not register outline expandability")
+    If MacAddMethod(cls, MacSelector("outlineView:objectValueForTableColumn:byItem:"), CType(value, Ptr), "@@:@@@") = 0 Then Throw New RuntimeException("Could not register outline caption")
+    If MacAddMethod(cls, MacSelector("outlineViewSelectionDidChange:"), CType(selected, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not register outline selection")
+    If MacAddMethod(cls, MacSelector("outlineViewItemDidExpand:"), CType(expanded, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not register outline expansion")
+    If MacAddMethod(cls, MacSelector("outlineViewItemDidCollapse:"), CType(expanded, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not register outline collapse")
+    Dim display As TreeMacDisplay = AddressOf TreeMacDisplayCell
+    If MacAddMethod(cls, MacSelector("outlineView:willDisplayCell:forTableColumn:item:"), CType(display, Ptr), "v@:@@@@") = 0 Then Throw New RuntimeException("Could not register outline icons")
+    MacRegisterClass(cls)
+    Return cls
+End Function
+Private Function TreeMacOwner(receiver As Ptr) As TreeView
+    For Each reference As TreeReference In TreeRegistry.Items
+        Dim owner As TreeView = reference.Owner
+        If owner <> Nil Then
+            If owner.OwnsMacBridge(receiver) Then Return owner
+        End If
+    Next
+    Return Nil
+End Function
+Private Function TreeMacNumber(receiver As Ptr, methodSelector As Ptr, outline As Ptr, item As Ptr) As Integer
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner = Nil Then Return 0
+    Try
+        Return owner.MacChildCount(item)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        Return 0
+    End Try
+End Function
+Private Function TreeMacGetChild(receiver As Ptr, methodSelector As Ptr, outline As Ptr, index As Integer, item As Ptr) As Ptr
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner = Nil Then Return Nil
+    Try
+        Return owner.MacChild(index, item)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        Return Nil
+    End Try
+End Function
+Private Function TreeMacCanExpand(receiver As Ptr, methodSelector As Ptr, outline As Ptr, item As Ptr) As UInt8
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner = Nil Then Return 0
+    Try
+        If owner.MacChildCount(item) > 0 Then Return 1
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+    Return 0
+End Function
+Private Function TreeMacGetValue(receiver As Ptr, methodSelector As Ptr, outline As Ptr, column As Ptr, item As Ptr) As Ptr
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner = Nil Then Return Nil
+    Try
+        Return owner.MacCaption(item)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+        Return Nil
+    End Try
+End Function
+Private Sub TreeMacSelected(receiver As Ptr, methodSelector As Ptr, notification As Ptr)
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner <> Nil Then owner.NativeSelectionChanged()
+End Sub
+Private Sub TreeMacExpanded(receiver As Ptr, methodSelector As Ptr, notification As Ptr)
+    Dim owner As TreeView = TreeMacOwner(receiver)
+    If owner = Nil Then Return
+    Try
+        owner.MacExpansionChanged(notification)
+    Catch e As Exception
+        owner.LastNativeError = e.Message
+    End Try
+End Sub
+#End If

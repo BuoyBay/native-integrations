@@ -1,0 +1,78 @@
+Import segmentedbutton
+
+Window SegmentLayout
+    Title = "Buoy Native SegmentedButton"
+    Frame = (100, 100, 620, 290)
+    Control Label description
+        Text = "Native single, multiple, and momentary segments"
+        Frame = (20, 15, 580, 25)
+    End Control
+    Control SegmentedButton singleChoice
+        Frame = (20, 55, 570, 40)
+    End Control
+    Control SegmentedButton multipleChoice
+        Frame = (20, 115, 570, 40)
+    End Control
+    Control SegmentedButton momentary
+        Frame = (20, 175, 570, 40)
+    End Control
+    Control Label hint
+        Text = "Tab to focus a native button; Space activates it."
+        Frame = (20, 240, 580, 25)
+    End Control
+End Window
+Class SegmentDemo Inherits SegmentLayout
+    Private Property mCount As Integer = 0
+    Handle Opening()
+        Me.singleChoice.AddSegment("Day")
+        Me.singleChoice.AddSegment("Week")
+        Me.singleChoice.AddSegment("Month")
+        Me.singleChoice.SelectedSegmentIndex = 0
+        Me.multipleChoice.SelectionStyle = SegmentSelectionStyle.Multiple
+        Me.multipleChoice.AddSegment("Bold")
+        Me.multipleChoice.AddSegment("Italic")
+        Me.multipleChoice.AddSegment("Underline")
+        Me.momentary.SelectionStyle = SegmentSelectionStyle.None
+        Me.momentary.AddSegment("Back")
+        Me.momentary.AddSegment("Forward")
+        Me.momentary.AddSegment("Unavailable")
+        Me.momentary.SetSegmentEnabled(2, False)
+        Me.singleChoice.Open()
+        Me.multipleChoice.Open()
+        Me.momentary.Open()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.singleChoice.RefreshNative()
+        Me.multipleChoice.RefreshNative()
+        Me.momentary.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.singleChoice.Close()
+        Me.multipleChoice.Close()
+        Me.momentary.Close()
+    End Handle
+    Private Sub Report(name As String, index As Integer, button As SegmentedButton)
+        Me.mCount += 1
+        Me.Title = name + ": " + Str(index) + " selected=" + Str(button.SelectedSegmentIndex) + " presses=" + Str(Me.mCount)
+    End Sub
+    With singleChoice
+        Handle Pressed(segmentIndex As Integer)
+            Me.Report("Single", segmentIndex, Me.singleChoice)
+        End Handle
+    End With
+    With multipleChoice
+        Handle Pressed(segmentIndex As Integer)
+            Me.Report("Multiple", segmentIndex, Me.multipleChoice)
+        End Handle
+    End With
+    With momentary
+        Handle Pressed(segmentIndex As Integer)
+            Me.Report("Momentary", segmentIndex, Me.momentary)
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New SegmentDemo()
+    win.Show()
+    Application.Run()
+End Sub

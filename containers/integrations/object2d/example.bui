@@ -1,0 +1,115 @@
+' Object2D example: builds a small scene, hit-tests it, and renders it
+' offscreen to a PNG. Usage: example [output.png]
+Import object2d
+
+Function BuildScene() As Group2D
+    Dim scene As New Group2D
+
+    Dim card As New RoundRectShape
+    card.X = 160.0
+    card.Y = 110.0
+    card.Width = 280.0
+    card.Height = 180.0
+    card.CornerWidth = 24.0
+    card.CornerHeight = 24.0
+    card.FillColor = Color.RGB(0.95, 0.96, 0.98)
+    card.BorderColor = Color.RGB(0.55, 0.6, 0.7)
+    card.BorderOpacity = 100.0
+    card.BorderWidth = 2.0
+    scene.AddObject(card)
+
+    Dim box As New RectShape
+    box.X = 80.0
+    box.Y = 90.0
+    box.Width = 60.0
+    box.Height = 60.0
+    box.Rotation = Math.Pi / 4.0
+    box.FillColor = Color.RGB(0.27, 0.51, 0.71)
+    box.FillOpacity = 80.0
+    scene.AddObject(box)
+
+    Dim pie As New ArcShape
+    pie.X = 170.0
+    pie.Y = 90.0
+    pie.Width = 80.0
+    pie.Height = 80.0
+    pie.StartAngle = -Math.Pi / 2.0
+    pie.ArcAngle = Math.Pi * 1.5
+    pie.FillColor = Color.Orange
+    pie.BorderColor = Color.Black
+    pie.BorderOpacity = 100.0
+    scene.AddObject(pie)
+
+    Dim triangle As New FigureShape
+    triangle.X = 250.0
+    triangle.Y = 90.0
+    triangle.AddLine(0.0, -30.0, 30.0, 25.0)
+    triangle.AddQuad(30.0, 25.0, -30.0, 25.0, 0.0, 45.0)
+    triangle.FillColor = Color.RGB(0.3, 0.7, 0.4)
+    triangle.BorderOpacity = 100.0
+    scene.AddObject(triangle)
+
+    Dim wave As New CurveShape
+    wave.Order = 2
+    wave.X = 40.0
+    wave.Y = 165.0
+    wave.X2 = 280.0
+    wave.Y2 = 165.0
+    wave.ControlX(0) = 120.0
+    wave.ControlY(0) = 125.0
+    wave.ControlX(1) = 200.0
+    wave.ControlY(1) = 205.0
+    wave.BorderColor = Color.Red
+    wave.BorderWidth = 3.0
+    scene.AddObject(wave)
+
+    Dim caption As New TextShape("Object2D via IGraphics")
+    caption.X = 160.0
+    caption.Y = 185.0
+    caption.VerticalAlignment = TextShape.Alignment.Top
+    caption.FontSize = 16.0
+    caption.Bold = True
+    caption.FillColor = Color.RGB(0.15, 0.15, 0.2)
+    scene.AddObject(caption)
+
+    Return scene
+End Function
+
+Sub Main(args As Array Of String)
+    Dim outPath As String = "object2d-example.png"
+    For Each arg As String In args
+        If String.EndsWith(arg, ".png") Then
+            outPath = arg
+        End If
+    Next
+
+    Dim scene As Group2D = BuildScene()
+    Print "Objects in scene: " + Str(scene.Count)
+
+    Dim hit As Object2D = scene.HitTest(190.0, 90.0)
+    If hit IsA ArcShape Then
+        Print "(190, 90) hits the arc"
+    End If
+    If scene.HitTest(150.0, 70.0) IsA ArcShape Then
+        Print "Unexpected: (150, 70) is in the arc's open quarter"
+    Else
+        Print "(150, 70) falls through the arc's open quarter to the card"
+    End If
+
+    Dim pic As New Picture(320, 230)
+    Dim g As Graphics = pic.Graphics
+    g.FillRect(0.0, 0.0, 320.0, 230.0, Color.White)
+    ' Draw the whole scene shifted 0, 5 points. DrawObject(g, scene, 0.0, 5.0)
+    ' is the equivalent free-function spelling.
+    g.DrawObject(scene, 0.0, 5.0)
+
+    Dim b As Rect = scene.Bounds()
+    Print "Scene bounds: " + Str(b.Left) + ", " + Str(b.Top) + " " + Str(b.Width) + " x " + Str(b.Height)
+
+    Dim saved As Result Of Boolean, IOError = pic.Save(New FileSystemItem(outPath), Picture.ImageFormat.PNG)
+    If saved.IsErr Then
+        Print "Save failed: " + saved.Error.Message
+    Else
+        Print "Wrote " + outPath
+    End If
+End Sub

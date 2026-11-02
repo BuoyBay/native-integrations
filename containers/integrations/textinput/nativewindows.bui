@@ -1,0 +1,328 @@
+Import inputbridge
+
+#If TargetWindows Then
+Sequential Structure CandidateForm
+    Index As UInt32
+    Style As UInt32
+    X As Int32
+    Y As Int32
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+End Structure
+Sequential Structure CompositionForm
+    Style As UInt32
+    X As Int32
+    Y As Int32
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+End Structure
+Delegate Function SubclassCallback(window As Ptr, message As UInt32, word As UInt64, param As Int64, identifier As UInt64, data As UInt64) As Int64
+Private Optional Declare Function SetSubclass Lib "comctl32" Alias "SetWindowSubclass" (window As Ptr, callback As SubclassCallback, identifier As UInt64, data As UInt64) As Int32
+Private Optional Declare Function RemoveSubclass Lib "comctl32" Alias "RemoveWindowSubclass" (window As Ptr, callback As SubclassCallback, identifier As UInt64) As Int32
+Private Optional Declare Function NextSubclass Lib "comctl32" Alias "DefSubclassProc" (window As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function CreateContext Lib "imm32" Alias "ImmCreateContext" () As Ptr
+Private Optional Declare Function AssociateContext Lib "imm32" Alias "ImmAssociateContext" (window As Ptr, context As Ptr) As Ptr
+Private Optional Declare Function DestroyContext Lib "imm32" Alias "ImmDestroyContext" (context As Ptr) As Int32
+Private Optional Declare Function CompositionString Lib "imm32" Alias "ImmGetCompositionStringW" (context As Ptr, kind As UInt32, buffer As Ptr, capacity As UInt32) As Int32
+Private Optional Declare Function NotifyIME Lib "imm32" Alias "ImmNotifyIME" (context As Ptr, action As UInt32, index As UInt32, value As UInt32) As Int32
+Private Optional Declare Function SetCandidate Lib "imm32" Alias "ImmSetCandidateWindow" (context As Ptr, ByRef form As CandidateForm) As Int32
+Private Optional Declare Function SetComposition Lib "imm32" Alias "ImmSetCompositionWindow" (context As Ptr, ByRef form As CompositionForm) As Int32
+Private Optional Declare Function WindowDPI Lib "user32" Alias "GetDpiForWindow" (window As Ptr) As UInt32
+Private Optional Declare Function KeyState Lib "user32" Alias "GetKeyState" (key As Int32) As Int16
+
+Class WindowsInputs
+    Public Shared Property Items As Array Of WindowsInput = []
+End Class
+
+Public Class WindowsInput
+    Public Property Widget As Ptr = Nil
+    Public Property Context As Ptr = Nil
+    Public Property Callbacks As InputCallbacks
+    Private Property mPrevious As Ptr = Nil
+    Private Property mID As Integer = -1
+    Private Property mHighSurrogate As Integer = 0
+    Private Property mComposing As Boolean = False
+    Public Property LastError As String = ""
+
+    Public Sub Open(widget As Ptr, callbacks As InputCallbacks)
+        If Me.Context <> Nil Then Exit Sub
+        If widget = Nil Then Throw New InvalidArgumentException("Windows input requires a native HWND")
+        Me.Context = CreateContext()
+        If Me.Context = Nil Then Throw New RuntimeException("ImmCreateContext failed")
+        Me.Widget = widget
+        Me.Callbacks = callbacks
+        Me.mID = -1
+        For i As Integer = 0 To Array.LastIndex(WindowsInputs.Items)
+            If WindowsInputs.Items(i) = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID = -1 Then
+            Me.mID = Array.Count(WindowsInputs.Items)
+            Array.Append(WindowsInputs.Items, Me)
+        Else
+            WindowsInputs.Items(Me.mID) = Me
+        End If
+        If SetSubclass(widget, AddressOf WindowsProcedure, Me.mID + 1, Me.mID + 1) = 0 Then
+            WindowsInputs.Items(Me.mID) = Nil
+            DestroyContext(Me.Context)
+            Me.Context = Nil
+            Me.Widget = Nil
+            Throw New RuntimeException("SetWindowSubclass failed; attach on the GUI thread")
+        End If
+        Me.mPrevious = AssociateContext(widget, Me.Context)
+    End Sub
+
+    Public Sub Cancel()
+        If Me.Context = Nil Then Exit Sub
+        If Me.mComposing Then NotifyIME(Me.Context, 21, 4, 0) ' NI_COMPOSITIONSTR / CPS_CANCEL
+        Me.mComposing = False
+        Me.mHighSurrogate = 0
+        Me.Callbacks.DeliverCancel()
+    End Sub
+
+    Public Sub Close()
+        If Me.Context = Nil Then Exit Sub
+        Try
+            Me.Cancel()
+        Finally
+            RemoveSubclass(Me.Widget, AddressOf WindowsProcedure, Me.mID + 1)
+            AssociateContext(Me.Widget, Me.mPrevious)
+            DestroyContext(Me.Context)
+            Me.Context = Nil
+            Me.Widget = Nil
+            Me.mPrevious = Nil
+            WindowsInputs.Items(Me.mID) = Nil
+            Me.mID = -1
+            Me.Callbacks.DeliverDetached()
+        End Try
+    End Sub
+
+    Public Sub UpdateLocation()
+        If Me.Context = Nil Then Exit Sub
+        Dim state As InputSnapshot = Me.Callbacks.GetSnapshot()
+        Dim dpi As Integer = WindowDPI(Me.Widget)
+        Dim candidate As CandidateForm
+        candidate.Index = 0
+        candidate.Style = 128 ' CFS_EXCLUDE, local client coordinates
+        candidate.X = PhysicalInputCoordinate(state.X, dpi)
+        candidate.Y = PhysicalInputCoordinate(state.Y + state.Height, dpi)
+        candidate.Left = PhysicalInputCoordinate(state.X, dpi)
+        candidate.Top = PhysicalInputCoordinate(state.Y, dpi)
+        candidate.Right = PhysicalInputCoordinate(state.X + Math.Max(1, state.Width), dpi)
+        candidate.Bottom = PhysicalInputCoordinate(state.Y + Math.Max(1, state.Height), dpi)
+        SetCandidate(Me.Context, candidate)
+        Dim composition As CompositionForm
+        composition.Style = 2 ' CFS_POINT
+        composition.X = PhysicalInputCoordinate(state.X, dpi)
+        composition.Y = PhysicalInputCoordinate(state.Y, dpi)
+        SetComposition(Me.Context, composition)
+    End Sub
+
+    Private Function ReadComposition(kind As UInt32) As String
+        Dim count As Int32 = CompositionString(Me.Context, kind, Nil, 0)
+        If count < 0 Then Throw New RuntimeException("ImmGetCompositionStringW returned no composition data")
+        If count = 0 Then Return ""
+        If count > 1048576 Or count Mod 2 <> 0 Then Throw New RuntimeException("Invalid IMM UTF-16 length")
+        Dim buffer As New Bytes()
+        For i As Integer = 1 To count
+            buffer.Append(0)
+        Next
+        Dim copied As Int32 = CompositionString(Me.Context, kind, buffer.DataPtr(), count)
+        If copied < 0 Or copied > count Or copied Mod 2 <> 0 Then Throw New RuntimeException("ImmGetCompositionStringW failed")
+        Dim bytes As New Bytes()
+        bytes.Append(buffer.DataPtr(), copied)
+        Return String.FromUTF16LE(bytes)
+    End Function
+
+    Private Sub Character(unit As Integer)
+        If unit >= 55296 And unit <= 56319 Then
+            Me.mHighSurrogate = unit
+            Exit Sub
+        End If
+        If unit >= 56320 And unit <= 57343 Then
+            If Me.mHighSurrogate <> 0 Then
+                Dim scalar As Integer = 65536 + (Me.mHighSurrogate - 55296) * 1024 + unit - 56320
+                Me.mHighSurrogate = 0
+                Me.Callbacks.DeliverCommit(String.Chr(scalar), -1, 0)
+            End If
+            Exit Sub
+        End If
+        Me.mHighSurrogate = 0
+        ' Ctrl/AltGr shortcuts do not insert control characters. AltGr text arrives as WM_CHAR.
+        If unit = 13 Then
+            Me.Callbacks.DeliverCommit("\n", -1, 0)
+        ElseIf unit >= 32 And unit <> 127 Then
+            Me.Callbacks.DeliverCommit(String.Chr(unit), -1, 0)
+        End If
+    End Sub
+
+    Public Function ProcessMessage(message As UInt32, word As UInt64, param As Int64) As Int64
+        Select Case message
+        Case 256 ' WM_KEYDOWN: use virtual keys; Ctrl+A produces character 1, not "a".
+            Dim control As Boolean = KeyState(17) < 0 And KeyState(18) >= 0 ' Ctrl, not AltGr
+            Dim extend As Boolean = KeyState(16) < 0
+            Dim virtualKey As Integer = word
+            If virtualKey = 27 Then
+                Me.Cancel()
+                Return 0
+            End If
+            Dim command As String = WindowsKeyCommand(virtualKey, control, extend)
+            If command <> "" Then
+                Me.Cancel()
+                If Me.Callbacks.DeliverCommand(command, extend) Then Return 0
+            End If
+            ' TranslateMessage already prepared WM_CHAR/WM_DEADCHAR before dispatch.
+            ' Buoy's default key-down handler calls ToUnicode again and consumes the
+            ' layout's pending dead key, so printable keys stop here. Ctrl shortcuts and
+            ' non-character keys (Tab focus traversal, F-keys, unhandled navigation)
+            ' continue to the Canvas KeyDown event.
+            If Not control And Not WindowsNonCharacterKey(virtualKey) Then Return 0
+        Case 7 ' WM_SETFOCUS
+            Me.Callbacks.DeliverFocus(True)
+            Me.UpdateLocation()
+        Case 8 ' WM_KILLFOCUS
+            Me.Cancel()
+            Me.Callbacks.DeliverFocus(False)
+        Case 258 ' WM_CHAR (UTF-16, including dead keys and AltGr)
+            Me.Character(word)
+            Return 0
+        Case 265 ' WM_UNICHAR
+            If word = 65535 Then Return 1 ' UNICODE_NOCHAR capability query
+            If word >= 32 And word <= 1114111 And Not (word >= 55296 And word <= 57343) Then
+                Dim scalar As Integer = word
+                Me.Callbacks.DeliverCommit(String.Chr(scalar), -1, 0)
+            End If
+            Return 0
+        Case 269 ' WM_IME_STARTCOMPOSITION
+            Me.mComposing = True
+            Me.UpdateLocation()
+            Return 0
+        Case 270 ' WM_IME_ENDCOMPOSITION
+            Me.mComposing = False
+            Me.Callbacks.DeliverCancel()
+            Return 0
+        Case 271 ' WM_IME_COMPOSITION
+            If (param And 2048) <> 0 Then ' GCS_RESULTSTR
+                Me.Callbacks.DeliverCommit(Me.ReadComposition(2048), -1, 0)
+                Me.mComposing = False
+            End If
+            If (param And 136) <> 0 Then ' GCS_COMPSTR | GCS_CURSORPOS
+                Dim text As String = Me.ReadComposition(8)
+                Dim cursor As Integer = CompositionString(Me.Context, 128, Nil, 0)
+                Me.mComposing = String.Len(text) > 0
+                Me.Callbacks.DeliverPreedit(text, -1, 0, CodepointOffset(text, Math.Max(0, cursor)))
+            ElseIf param = 0 Then
+                Me.mComposing = False
+                Me.Callbacks.DeliverCancel()
+            End If
+            Me.UpdateLocation()
+            Return 0 ' Do not forward: DefWindowProc would generate duplicate committed chars.
+        Case 641 ' WM_IME_SETCONTEXT
+            Return NextSubclass(Me.Widget, message, word, param And Not 2147483648)
+        Case 646 ' WM_IME_CHAR: already handled through GCS_RESULTSTR
+            Return 0
+        Case 130 ' WM_NCDESTROY: detach while HWND is still valid
+            Dim widget As Ptr = Me.Widget
+            Me.Close()
+            Return NextSubclass(widget, message, word, param)
+        End Select
+        Return NextSubclass(Me.Widget, message, word, param)
+    End Function
+End Class
+
+Function WindowsProcedure(window As Ptr, message As UInt32, word As UInt64, param As Int64, identifier As UInt64, data As UInt64) As Int64
+    Dim input As WindowsInput = WindowsInputs.Items(data - 1)
+    If input = Nil Then Return NextSubclass(window, message, word, param)
+    Try
+        Return input.ProcessMessage(message, word, param)
+    Catch e As Exception
+        input.LastError = e.Message
+        ' Never unwind Buoy exceptions into USER32; do not insert failed native text twice.
+        If message = 258 Or message = 265 Or message = 271 Or message = 646 Then Return 0
+        Return NextSubclass(window, message, word, param)
+    End Try
+End Function
+#End If
+
+''' Windows edit-control key bindings: the TextInputCanvas command for a WM_KEYDOWN
+''' virtual key, with Ctrl (not AltGr) held or not. Shift extends selections; it also
+''' selects the legacy clipboard keys Shift+Delete (cut) and Shift+Insert (paste).
+''' "" = no binding. The adapter handles Escape itself (composition cancel).
+Public Function WindowsKeyCommand(virtualKey As Integer, control As Boolean, shift As Boolean) As String
+    If control Then
+        Select Case virtualKey
+        Case 65 ' A
+            Return "selectAll"
+        Case 67 ' C
+            Return "copy"
+        Case 88 ' X
+            Return "cut"
+        Case 86 ' V
+            Return "paste"
+        Case 90 ' Z
+            If shift Then Return "redo"
+            Return "undo"
+        Case 89 ' Y
+            Return "redo"
+        Case 45 ' Insert
+            If Not shift Then Return "copy"
+        Case 37
+            Return "moveWordLeft"
+        Case 39
+            Return "moveWordRight"
+        Case 38
+            Return "scrollLineUp"
+        Case 40
+            Return "scrollLineDown"
+        Case 36
+            Return "moveDocumentStart"
+        Case 35
+            Return "moveDocumentEnd"
+        Case 8
+            Return "deleteWordBackward"
+        Case 46
+            Return "deleteWordForward"
+        End Select
+        Return ""
+    End If
+    Select Case virtualKey
+    Case 37
+        Return "moveLeft"
+    Case 39
+        Return "moveRight"
+    Case 38
+        Return "moveUp"
+    Case 40
+        Return "moveDown"
+    Case 36
+        Return "moveHome"
+    Case 35
+        Return "moveEnd"
+    Case 33
+        Return "pageUp"
+    Case 34
+        Return "pageDown"
+    Case 8
+        Return "deleteBackward"
+    Case 46
+        If shift Then Return "cut"
+        Return "deleteForward"
+    Case 45
+        If shift Then Return "paste"
+    End Select
+    Return ""
+End Function
+
+''' True for virtual keys that never produce WM_CHAR text: Tab, navigation, Insert,
+''' Delete, Pause, the Applications key and F1-F24.
+Public Function WindowsNonCharacterKey(virtualKey As Integer) As Boolean
+    If virtualKey = 9 Or virtualKey = 19 Or virtualKey = 45 Or virtualKey = 46 Or virtualKey = 93 Then Return True
+    If virtualKey >= 33 And virtualKey <= 40 Then Return True
+    Return virtualKey >= 112 And virtualKey <= 135
+End Function

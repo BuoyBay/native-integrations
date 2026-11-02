@@ -1,0 +1,142 @@
+' Present USB Plug and Play metadata; no device handles are opened.
+Public Class USBDevice
+    Public Property InstanceId As String
+    Public Property Name As Optional Of String
+    Public Property Manufacturer As Optional Of String
+    Public Property DeviceNode As Integer
+End Class
+
+#If TargetWindows Then
+' SP_DEVINFO_DATA is 32 bytes on x64/ARM64 (DWORD, GUID, DWORD, ULONG_PTR).
+Sequential Structure NativeUSBDeviceInfo
+    Size As UInt32
+    GuidA As UInt32
+    GuidB As UInt32
+    GuidC As UInt32
+    GuidD As UInt32
+    DeviceNode As UInt32
+    Reserved As UInt64
+End Structure
+Private Optional Declare Function USBNativeSet Lib "setupapi" Alias "SetupDiGetClassDevsW" (classGuid As Ptr, enumeratorName As Ptr, parentWindow As Ptr, options As UInt32) As Ptr
+Private Optional Declare Function USBNativeNext Lib "setupapi" Alias "SetupDiEnumDeviceInfo" (infoSet As Ptr, index As UInt32, ByRef data As NativeUSBDeviceInfo) As Int32
+Private Optional Declare Function USBNativeId Lib "setupapi" Alias "SetupDiGetDeviceInstanceIdW" (infoSet As Ptr, ByRef data As NativeUSBDeviceInfo, buffer As Ptr, capacity As UInt32, ByRef required As UInt32) As Int32
+Private Optional Declare Function USBNativeProperty Lib "setupapi" Alias "SetupDiGetDeviceRegistryPropertyW" (infoSet As Ptr, ByRef data As NativeUSBDeviceInfo, propertyId As UInt32, ByRef valueType As UInt32, buffer As Ptr, capacity As UInt32, ByRef required As UInt32) As Int32
+Private Optional Declare Function USBNativeDestroy Lib "setupapi" Alias "SetupDiDestroyDeviceInfoList" (infoSet As Ptr) As Int32
+Private Optional Declare Function USBNativeError Lib "kernel32" Alias "GetLastError" () As UInt32
+
+Private Sub USBFail(operation As String)
+    Dim code As Integer = USBNativeError()
+    Throw New RuntimeException(operation + " failed (Win32 error " + Str(code) + ")", code)
+End Sub
+
+Private Function USBBuffer() As Bytes
+    Dim allocated As New Bytes(65536)
+    For i As Integer = 1 To 65536
+        allocated.Append(0)
+    Next
+    Return allocated
+End Function
+
+Private Function USBDecodeWide(value As Bytes, byteCount As Integer) As String
+    If byteCount < 2 Or byteCount > value.Count Or byteCount Mod 2 <> 0 Then
+        Throw New RuntimeException("SetupAPI returned invalid UTF-16 buffer length")
+    End If
+    Dim units As Integer = byteCount \ 2
+    For i As Integer = 0 To units - 1
+        If value.Item(i * 2) = 0 And value.Item(i * 2 + 1) = 0 Then
+            Dim exact As New Bytes(i * 2)
+            exact.Append(value.DataPtr(), i * 2)
+            Return String.FromUTF16LE(exact)
+        End If
+    Next
+    Throw New RuntimeException("SetupAPI returned unterminated UTF-16 text")
+End Function
+
+Private Function USBReadId(infoSet As Ptr, data As NativeUSBDeviceInfo) As String
+    Dim value As Bytes = USBBuffer()
+    Dim required As UInt32 = 0
+    If USBNativeId(infoSet, data, value.DataPtr(), 32768, required) = 0 Then
+        USBFail("SetupDiGetDeviceInstanceIdW")
+    End If
+    Return USBDecodeWide(value, required * 2)
+End Function
+
+Private Function USBReadText(infoSet As Ptr, data As NativeUSBDeviceInfo, propertyId As UInt32) As Optional Of String
+    Dim value As Bytes = USBBuffer()
+    Dim required As UInt32 = 0
+    Dim valueType As UInt32 = 0
+    If USBNativeProperty(infoSet, data, propertyId, valueType, value.DataPtr(), 65536, required) = 0 Then
+        Dim code As Integer = USBNativeError()
+        If code = 13 Then
+            Return None
+        End If
+        Throw New RuntimeException("SetupDiGetDeviceRegistryPropertyW failed (Win32 error " + Str(code) + ")", code)
+    End If
+    If valueType <> 1 Then
+        Throw New RuntimeException("SetupAPI text property was not REG_SZ")
+    End If
+    Return Some(USBDecodeWide(value, required))
+End Function
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Library availability only; an installed backend can have no present hardware.
+Public Function IsAvailable() As Boolean
+#If TargetWindows Then
+    Return System.IsLibraryAvailable("setupapi") And System.IsLibraryAvailable("kernel32")
+#Else
+    Return False
+#End If
+End Function
+
+''' One owned record per present USB device node; discovery can race hotplug.
+Public Function PresentDevices() As Array Of USBDevice
+#If TargetWindows Then
+    Dim enumeratorName As Bytes = "USB".AsUTF16LE()
+    enumeratorName.Append(0)
+    enumeratorName.Append(0)
+    ' DIGCF_PRESENT | DIGCF_ALLCLASSES; USB enumerator rather than setup class.
+    USBNativeError()
+    Dim infoSet As Ptr = USBNativeSet(Nil, enumeratorName.DataPtr(), Nil, 6)
+    If CType(infoSet, Integer) = -1 Then
+        USBFail("SetupDiGetClassDevsW")
+    End If
+    Dim results As Array Of USBDevice = []
+    Try
+        Dim index As UInt32 = 0
+        While True
+            Dim data As NativeUSBDeviceInfo
+            data.Size = 32
+            If USBNativeNext(infoSet, index, data) = 0 Then
+                Dim code As Integer = USBNativeError()
+                If code = 259 Then
+                    Exit While
+                End If
+                Throw New RuntimeException("SetupDiEnumDeviceInfo failed (Win32 error " + Str(code) + ")", code)
+            End If
+            Dim entry As New USBDevice
+            entry.InstanceId = USBReadId(infoSet, data)
+            entry.Name = USBReadText(infoSet, data, 12)
+            If Not entry.Name.HasValue Then
+                entry.Name = USBReadText(infoSet, data, 0)
+            End If
+            entry.Manufacturer = USBReadText(infoSet, data, 11)
+            entry.DeviceNode = data.DeviceNode
+            Array.Append(results, entry)
+            index += 1
+        End While
+        Return results
+    Finally
+        USBNativeDestroy(infoSet)
+    End Try
+#Else
+    Throw New UnsupportedOperationException("WinUSB requires Windows")
+#End If
+End Function

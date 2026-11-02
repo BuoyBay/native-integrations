@@ -1,0 +1,2047 @@
+' Xojo-inspired Object2D vector shapes, drawn through IGraphics.
+'
+' Every shape draws into any IGraphics backend: a Canvas.Paint Graphics, a
+' Picture.Graphics offscreen context, or a PDFGraphics page from the optional
+' pdf package. See README.md for the coordinate model and platform notes.
+
+''' Deepest Group2D nesting that drawing, hit testing and bounds will follow.
+Const Object2DMaxDepth As Integer = 256
+
+''' Default number of polygon sides used for hit testing and bounds of curves.
+Const Object2DFlattenSegments As Integer = 64
+
+''' Bezier handle length for a quarter ellipse.
+Const Object2DKappa As Double = 0.5522847498307936
+
+''' Font-size units. Pixel conversion uses TextShape.PixelsPerPoint because
+''' IGraphics does not expose target DPI. Point remains the default.
+Public Enum FontUnits As Integer
+    Default = 0
+    Pixel = 1
+    Point = 2
+    Inches = 3
+    Millimeter = 4
+End Enum
+
+''' 2-D affine transform: x' = A*x + C*y + E, y' = B*x + D*y + F.
+Public Class Object2DTransform
+    Public Property A As Double = 1.0
+    Public Property B As Double = 0.0
+    Public Property C As Double = 0.0
+    Public Property D As Double = 1.0
+    Public Property E As Double = 0.0
+    Public Property F As Double = 0.0
+
+    Public Sub Constructor()
+    End Sub
+
+    Public Sub Constructor(a0 As Double, b0 As Double, c0 As Double, d0 As Double, e0 As Double, f0 As Double)
+        A = a0
+        B = b0
+        C = c0
+        D = d0
+        E = e0
+        F = f0
+    End Sub
+
+    ''' Translate to (x, y), rotate clockwise by `rotation` radians, then scale uniformly.
+    Public Shared Function Placement(x As Double, y As Double, rotation As Double, scale As Double) As Object2DTransform
+        Dim cs As Double = Math.Cos(rotation) * scale
+        Dim sn As Double = Math.Sin(rotation) * scale
+        Return New Object2DTransform(cs, sn, -sn, cs, x, y)
+    End Function
+
+    ''' The transform applying `inner` first, then Me.
+    Public Function Concat(inner As Object2DTransform) As Object2DTransform
+        Return New Object2DTransform( _
+            A * inner.A + C * inner.B, _
+            B * inner.A + D * inner.B, _
+            A * inner.C + C * inner.D, _
+            B * inner.C + D * inner.D, _
+            A * inner.E + C * inner.F + E, _
+            B * inner.E + D * inner.F + F)
+    End Function
+
+    Public Function MapX(x As Double, y As Double) As Double
+        Return A * x + C * y + E
+    End Function
+
+    Public Function MapY(x As Double, y As Double) As Double
+        Return B * x + D * y + F
+    End Function
+
+    Public Function Determinant() As Double
+        Return A * D - B * C
+    End Function
+
+    ''' The inverse transform, or Nil when the transform is singular.
+    Public Function Inverted() As Object2DTransform
+        Dim det As Double = Determinant()
+        If det = 0.0 Or Not Object2DIsFinite(det) Then
+            Return Nil
+        End If
+        Dim ia As Double = D / det
+        Dim ib As Double = -B / det
+        Dim ic As Double = -C / det
+        Dim id As Double = A / det
+        Return New Object2DTransform(ia, ib, ic, id, -(ia * E + ic * F), -(ib * E + id * F))
+    End Function
+End Class
+
+''' Evaluate a line, quadratic, or cubic scalar Bezier by de Casteljau.
+Internal Function Object2DBezierValue(v As Array Of Double, t As Double) As Double
+    Dim values As Array Of Double = Array.Clone(v)
+    For level As Integer = Array.Count(values) - 1 To 1 Step -1
+        For i As Integer = 0 To level - 1
+            values(i) = values(i) * (1.0 - t) + values(i + 1) * t
+        Next
+    Next
+    Return values(0)
+End Function
+
+''' Parameters where the scalar Bezier derivative vanishes.
+Internal Function Object2DBezierExtrema(v As Array Of Double) As Array Of Double
+    Dim roots As Array Of Double = []
+    ' Root parameters are invariant under uniform coordinate scaling. Avoid
+    ' overflow/underflow in derivative coefficients and the discriminant even
+    ' for finite geometry much larger or smaller than normal screen units.
+    Dim magnitude As Double = 0.0
+    For Each coordinate As Double In v
+        magnitude = Math.Max(magnitude, Math.Abs(coordinate))
+    Next
+    If magnitude = 0.0 Then
+        Return roots
+    End If
+    Dim normalized As Array Of Double = []
+    For Each coordinate As Double In v
+        Array.Append(normalized, coordinate / magnitude)
+    Next
+    v = normalized
+    If Array.Count(v) = 3 Then
+        Dim den As Double = v(0) - 2.0 * v(1) + v(2)
+        If den <> 0.0 Then
+            Array.Append(roots, (v(0) - v(1)) / den)
+        End If
+    ElseIf Array.Count(v) = 4 Then
+        Dim a As Double = -v(0) + 3.0 * v(1) - 3.0 * v(2) + v(3)
+        Dim b As Double = 2.0 * (v(0) - 2.0 * v(1) + v(2))
+        Dim c As Double = v(1) - v(0)
+        If a = 0.0 Then
+            If b <> 0.0 Then
+                Array.Append(roots, -c / b)
+            End If
+        Else
+            Dim disc As Double = b * b - 4.0 * a * c
+            If disc >= 0.0 Then
+                ' Stable quadratic roots avoid cancellation for small roots.
+                Dim radical As Double = Math.Sqrt(disc)
+                If b < 0.0 Then
+                    radical = -radical
+                End If
+                Dim q As Double = -0.5 * (b + radical)
+                If q = 0.0 Then
+                    Array.Append(roots, -b / (2.0 * a))
+                Else
+                    Array.Append(roots, q / a)
+                    Array.Append(roots, c / q)
+                End If
+            End If
+        End If
+    End If
+    Return roots
+End Function
+
+''' Tight Bezier bounds after the full affine transform. Extrema must be
+''' solved in output coordinates, not from a transformed local bounding box.
+Internal Sub Object2DCollectBezier(box As Object2DBoxBuilder, m As Object2DTransform, xs As Array Of Double, ys As Array Of Double)
+    Dim vx As Array Of Double = []
+    Dim vy As Array Of Double = []
+    For i As Integer = 0 To Array.Count(xs) - 1
+        Array.Append(vx, m.MapX(xs(i), ys(i)))
+        Array.Append(vy, m.MapY(xs(i), ys(i)))
+    Next
+    Dim identity As New Object2DTransform
+    box.Add(identity, vx(0), vy(0))
+    Dim last As Integer = Array.Count(vx) - 1
+    box.Add(identity, vx(last), vy(last))
+    Dim candidates As Array Of Double = Object2DBezierExtrema(vx)
+    For Each t As Double In Object2DBezierExtrema(vy)
+        Array.Append(candidates, t)
+    Next
+    For Each t As Double In candidates
+        If t > 0.0 And t < 1.0 Then
+            box.Add(identity, Object2DBezierValue(vx, t), Object2DBezierValue(vy, t))
+        End If
+    Next
+End Sub
+
+Internal Function Object2DAngleInSweep(angle As Double, start As Double, sweep As Double) As Boolean
+    If Math.Abs(sweep) >= 2.0 * Math.Pi Then
+        Return True
+    End If
+    Dim rel As Double = angle - start
+    If sweep < 0.0 Then
+        rel = -rel
+    End If
+    Dim turn As Double = 2.0 * Math.Pi
+    rel -= turn * Math.Floor(rel / turn)
+    Return rel <= Math.Abs(sweep) + 0.000000000001
+End Function
+
+''' Exact extrema of a transformed elliptical arc, including its endpoints.
+Internal Sub Object2DCollectEllipseArc(box As Object2DBoxBuilder, m As Object2DTransform, cx As Double, cy As Double, rx As Double, ry As Double, start As Double, sweep As Double)
+    Dim tx As Double = Math.Atan2(m.C * ry, m.A * rx)
+    Dim ty As Double = Math.Atan2(m.D * ry, m.B * rx)
+    Dim angles As Array Of Double = [start, start + sweep, tx, tx + Math.Pi, ty, ty + Math.Pi]
+    For i As Integer = 0 To Array.Count(angles) - 1
+        Dim angle As Double = angles(i)
+        If i < 2 Or Object2DAngleInSweep(angle, start, sweep) Then
+            box.Add(m, cx + rx * Math.Cos(angle), cy + ry * Math.Sin(angle))
+        End If
+    Next
+End Sub
+
+''' Polyline or polygon vertices in some local coordinate space.
+Public Class Object2DPolyline
+    Public Property Xs As Array Of Double = []
+    Public Property Ys As Array Of Double = []
+
+    Public Sub Add(x As Double, y As Double)
+        Array.Append(Xs, x)
+        Array.Append(Ys, y)
+    End Sub
+
+    Public Function Count() As Integer
+        Return Array.Count(Xs)
+    End Function
+End Class
+
+''' Accumulates transformed points into an axis-aligned box.
+Public Class Object2DBoxBuilder
+    Public Property HasPoints As Boolean = False
+    Public Property MinX As Double = 0.0
+    Public Property MinY As Double = 0.0
+    Public Property MaxX As Double = 0.0
+    Public Property MaxY As Double = 0.0
+
+    Public Sub Add(m As Object2DTransform, x As Double, y As Double)
+        Dim px As Double = m.MapX(x, y)
+        Dim py As Double = m.MapY(x, y)
+        If Not HasPoints Then
+            MinX = px
+            MaxX = px
+            MinY = py
+            MaxY = py
+            HasPoints = True
+        Else
+            MinX = Math.Min(MinX, px)
+            MaxX = Math.Max(MaxX, px)
+            MinY = Math.Min(MinY, py)
+            MaxY = Math.Max(MaxY, py)
+        End If
+    End Sub
+
+    Public Sub AddAll(m As Object2DTransform, pts As Object2DPolyline)
+        For i As Integer = 0 To pts.Count() - 1
+            Add(m, pts.Xs(i), pts.Ys(i))
+        Next
+    End Sub
+End Class
+
+Internal Function Object2DIsFinite(v As Double) As Boolean
+    ' NaN fails both comparisons; infinities fail one.
+    Return v > -Double.Infinity And v < Double.Infinity
+End Function
+
+Internal Function Object2DClampPercent(v As Double) As Double
+    If Not (v >= 0.0) Then
+        Return 0.0
+    End If
+    If v > 100.0 Then
+        Return 100.0
+    End If
+    Return v
+End Function
+
+''' The color with its alpha multiplied by opacity/100, or Nil when invisible.
+Internal Function Object2DPaint(c As Color, opacity As Double) As Color
+    If c Is Nil Then
+        Return Nil
+    End If
+    Dim alpha As Double = c.A * Object2DClampPercent(opacity) / 100.0
+    If alpha <= 0.0 Then
+        Return Nil
+    End If
+    Return Color.RGBA(c.R, c.G, c.B, alpha)
+End Function
+
+Internal Function Object2DCheckDepth(depth As Integer) As Boolean
+    If depth > Object2DMaxDepth Then
+        Throw New UnsupportedOperationException("Object2D nesting exceeds Object2DMaxDepth")
+    End If
+    Return True
+End Function
+
+''' True when `g` is a native Windows Graphics. Buoy 0.72.0 draws its text
+''' (GDI DrawTextW) and pictures (GDI AlphaBlend) without the GDI+ world
+''' transform and clip, so those primitives must be placed in device space.
+Internal Function Object2DNeedsDeviceSpace(g As IGraphics) As Boolean
+#If TargetWindows Then
+    Return TryCast(g, Graphics) IsNot Nil
+#Else
+    Return False
+#End If
+End Function
+
+''' Windows 0.72.0 ignores world transforms on DrawPicture. Transform pixels
+''' explicitly, then blit in device space. Nearest-neighbor sampling preserves
+''' straight alpha and supports rotation and negative scale without native FFI.
+Internal Sub Object2DDrawDevicePicture(g As IGraphics, img As Picture, m As Object2DTransform, left As Double, top As Double, width As Double, height As Double)
+    If width <= 0.0 Or height <= 0.0 Then
+        Return
+    End If
+    Dim inv As Object2DTransform = m.Inverted()
+    If inv Is Nil Then
+        Return
+    End If
+    Dim box As New Object2DBoxBuilder
+    box.Add(m, left, top)
+    box.Add(m, left + width, top)
+    box.Add(m, left + width, top + height)
+    box.Add(m, left, top + height)
+    Dim x0 As Double = Math.Floor(box.MinX)
+    Dim y0 As Double = Math.Floor(box.MinY)
+    Dim dw As Double = Math.Ceiling(box.MaxX) - x0
+    Dim dh As Double = Math.Ceiling(box.MaxY) - y0
+    ' Bound intermediate allocations and processing before converting to integers.
+    If Not Object2DIsFinite(dw) Or Not Object2DIsFinite(dh) Or dw > 32767.0 Or dh > 32767.0 Or dw * dh > 16777216.0 Then
+        Throw New InvalidArgumentException("Object2D Windows raster transform exceeds 16 million pixels or 32767 pixels per side")
+    End If
+    Dim outW As Integer = dw
+    Dim outH As Integer = dh
+    If outW <= 0 Or outH <= 0 Then
+        Return
+    End If
+    Dim length As Integer = img.Width * img.Height * 4
+    Dim staging As New Bytes(length)
+    If img.GetBacking(staging.DataPtr(), length, 0) <> length Then
+        Throw New InvalidArgumentException("Object2D could not read image pixels")
+    End If
+    Dim src As New Bytes(length)
+    src.Append(staging.DataPtr(), length)
+    Dim dst As New Bytes(outW * outH * 4)
+    For y As Integer = 0 To outH - 1
+        For x As Integer = 0 To outW - 1
+            Dim px As Double = x0 + x + 0.5
+            Dim py As Double = y0 + y + 0.5
+            Dim u As Double = (inv.MapX(px, py) - left) / width
+            Dim v As Double = (inv.MapY(px, py) - top) / height
+            If u >= 0.0 And u < 1.0 And v >= 0.0 And v < 1.0 Then
+                Dim sx As Integer = Math.Floor(u * img.Width)
+                Dim sy As Integer = Math.Floor(v * img.Height)
+                Dim i As Integer = (sy * img.Width + sx) * 4
+                dst.Append(src.Item(i))
+                dst.Append(src.Item(i + 1))
+                dst.Append(src.Item(i + 2))
+                dst.Append(src.Item(i + 3))
+            Else
+                dst.Append(0)
+                dst.Append(0)
+                dst.Append(0)
+                dst.Append(0)
+            End If
+        Next
+    Next
+    Dim transformed As Picture = Picture.FromBuffer(dst.DataPtr(), dst.Count, 0, outW, outH)
+    g.DrawPicture(transformed, x0, y0, dw, dh)
+End Sub
+
+Internal Function Object2DPointInPolygon(pts As Object2DPolyline, x As Double, y As Double) As Boolean
+    ' Even-odd ray casting.
+    Dim n As Integer = pts.Count()
+    If n < 3 Then
+        Return False
+    End If
+    Dim inside As Boolean = False
+    Dim j As Integer = n - 1
+    For i As Integer = 0 To n - 1
+        Dim xi As Double = pts.Xs(i)
+        Dim yi As Double = pts.Ys(i)
+        Dim xj As Double = pts.Xs(j)
+        Dim yj As Double = pts.Ys(j)
+        If (yi > y) <> (yj > y) Then
+            Dim crossX As Double = xi + (y - yi) * (xj - xi) / (yj - yi)
+            If x < crossX Then
+                inside = Not inside
+            End If
+        End If
+        j = i
+    Next
+    Return inside
+End Function
+
+Internal Function Object2DSegmentDistance(px As Double, py As Double, ax As Double, ay As Double, bx As Double, by As Double) As Double
+    Dim dx As Double = bx - ax
+    Dim dy As Double = by - ay
+    Dim lenSq As Double = dx * dx + dy * dy
+    Dim t As Double = 0.0
+    If lenSq > 0.0 Then
+        t = ((px - ax) * dx + (py - ay) * dy) / lenSq
+        t = Math.Max(0.0, Math.Min(1.0, t))
+    End If
+    Dim qx As Double = ax + t * dx - px
+    Dim qy As Double = ay + t * dy - py
+    Return Math.Sqrt(qx * qx + qy * qy)
+End Function
+
+Internal Function Object2DNearPolyline(pts As Object2DPolyline, x As Double, y As Double, tolerance As Double) As Boolean
+    Dim n As Integer = pts.Count()
+    If n = 1 Then
+        Return Object2DSegmentDistance(x, y, pts.Xs(0), pts.Ys(0), pts.Xs(0), pts.Ys(0)) <= tolerance
+    End If
+    For i As Integer = 1 To n - 1
+        If Object2DSegmentDistance(x, y, pts.Xs(i - 1), pts.Ys(i - 1), pts.Xs(i), pts.Ys(i)) <= tolerance Then
+            Return True
+        End If
+    Next
+    Return False
+End Function
+
+''' Appends the elliptical arc from parametric angle t0 to t1 (excluding its start) to a path as cubic Beziers.
+Internal Sub Object2DPathArc(g As IGraphics, rx As Double, ry As Double, t0 As Double, t1 As Double)
+    Dim sweep As Double = t1 - t0
+    Dim pieces As Integer = Math.Ceiling(Math.Abs(sweep) / (Math.Pi / 2.0) - 0.000000001)
+    If pieces < 1 Then
+        pieces = 1
+    End If
+    Dim delta As Double = sweep / pieces
+    Dim k As Double = 4.0 / 3.0 * Math.Tan(delta / 4.0)
+    Dim a As Double = t0
+    For i As Integer = 1 To pieces
+        Dim b As Double = a + delta
+        Dim x0 As Double = rx * Math.Cos(a)
+        Dim y0 As Double = ry * Math.Sin(a)
+        Dim x3 As Double = rx * Math.Cos(b)
+        Dim y3 As Double = ry * Math.Sin(b)
+        g.CurveTo(x0 - k * rx * Math.Sin(a), y0 + k * ry * Math.Cos(a), _
+            x3 + k * rx * Math.Sin(b), y3 - k * ry * Math.Cos(b), x3, y3)
+        a = b
+    Next
+End Sub
+
+''' Appends sampled points of an elliptical arc; includes the start when `includeStart`.
+Internal Sub Object2DSampleArc(pts As Object2DPolyline, cx As Double, cy As Double, rx As Double, ry As Double, t0 As Double, t1 As Double, segments As Integer, includeStart As Boolean)
+    Dim n As Integer = Math.Max(1, segments)
+    Dim first As Integer = 1
+    If includeStart Then
+        first = 0
+    End If
+    For i As Integer = first To n
+        Dim t As Double = t0 + (t1 - t0) * i / n
+        pts.Add(cx + rx * Math.Cos(t), cy + ry * Math.Sin(t))
+    Next
+End Sub
+
+''' Draws polygon/polyline vertices as the current path.
+Internal Sub Object2DPathPolyline(g As IGraphics, pts As Object2DPolyline, closed As Boolean)
+    If pts.Count() = 0 Then
+        Return
+    End If
+    g.BeginPath()
+    g.MoveTo(pts.Xs(0), pts.Ys(0))
+    For i As Integer = 1 To pts.Count() - 1
+        g.LineTo(pts.Xs(i), pts.Ys(i))
+    Next
+    If closed Then
+        g.ClosePath()
+    End If
+End Sub
+
+''' Base class of every drawable vector object.
+'''
+''' X/Y are the anchor in the parent coordinate space (the Graphics, or the
+''' enclosing Group2D). Rotation is clockwise radians and Scale a uniform
+''' factor, both applied around the anchor. Opacities are percentages 0..100.
+Public Class Object2D
+    Public Property X As Double = 0.0
+    Public Property Y As Double = 0.0
+    Public Property Rotation As Double = 0.0
+    Public Property Scale As Double = 1.0
+    Public Property FillColor As Color = Color.Black
+    Public Property BorderColor As Color = Color.Black
+
+    Private Property mFillOpacity As Double = 100.0
+    Private Property mBorderOpacity As Double = 100.0
+    Private Property mBorderWidth As Double = 1.0
+
+    ''' Interior opacity, clamped to 0 (transparent) .. 100 (opaque).
+    Public Property FillOpacity As Double
+        Get
+            Return mFillOpacity
+        End Get
+        Set
+            mFillOpacity = Object2DClampPercent(value)
+        End Set
+    End Property
+
+    ''' Border opacity, clamped to 0 (invisible) .. 100 (opaque).
+    Public Property BorderOpacity As Double
+        Get
+            Return mBorderOpacity
+        End Get
+        Set
+            mBorderOpacity = Object2DClampPercent(value)
+        End Set
+    End Property
+
+    ''' Border width in points (before Scale); negative and NaN values become 0.
+    Public Property BorderWidth As Double
+        Get
+            Return mBorderWidth
+        End Get
+        Set
+            If value >= 0.0 And Object2DIsFinite(value) Then
+                mBorderWidth = value
+            Else
+                mBorderWidth = 0.0
+            End If
+        End Set
+    End Property
+
+    ''' Draws this object; equivalent to DrawObject(g, Me, dx, dy).
+    Public Sub Draw(g As IGraphics, dx As Double = 0.0, dy As Double = 0.0)
+        If g Is Nil Then
+            Throw New NilObjectException("Object2D.Draw requires a graphics context")
+        End If
+        g.Save()
+        Try
+            g.Translate(dx, dy)
+            RenderPlaced(g, 0, New Object2DTransform(1.0, 0.0, 0.0, 1.0, dx, dy))
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+
+    ''' Placement of this object's local space in its parent space.
+    Public Function LocalTransform() As Object2DTransform
+        Return Object2DTransform.Placement(X, Y, Rotation, Scale)
+    End Function
+
+    ''' True when (x, y), in the parent coordinate space, lies on the shape.
+    ''' DrawObject offsets are not included, matching Xojo's Contains.
+    Public Function Contains(x As Double, y As Double) As Boolean
+        Return ContainsAt(x, y, 0)
+    End Function
+
+    ''' Axis-aligned geometric bounds in the parent coordinate space, after
+    ''' Rotation and Scale. Borders are not included. Empty objects return a
+    ''' zero-size Rect at (X, Y).
+    Public Function Bounds() As Rect
+        Dim box As New Object2DBoxBuilder()
+        CollectBounds(LocalTransform(), box, 0)
+        If Not box.HasPoints Then
+            Return New Rect(X, Y, 0.0, 0.0)
+        End If
+        Return New Rect(box.MinX, box.MinY, box.MaxX - box.MinX, box.MaxY - box.MinY)
+    End Function
+
+    Internal Function IsPlaceable() As Boolean
+        Return Scale <> 0.0 And Object2DIsFinite(Scale) And Object2DIsFinite(Rotation) _
+            And Object2DIsFinite(X) And Object2DIsFinite(Y)
+    End Function
+
+    ''' `parent` maps the parent space to the space DrawObject was called in.
+    Internal Sub RenderPlaced(g As IGraphics, depth As Integer, parent As Object2DTransform)
+        Object2DCheckDepth(depth)
+        If Not IsPlaceable() Then
+            Return
+        End If
+        g.Save()
+        Try
+            g.Translate(X, Y)
+            If Rotation <> 0.0 Then
+                g.Rotate(Rotation)
+            End If
+            If Scale <> 1.0 Then
+                g.Scale(Scale, Scale)
+            End If
+            DrawLocal(g, depth, parent.Concat(LocalTransform()))
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+
+    Internal Function ContainsAt(x As Double, y As Double, depth As Integer) As Boolean
+        Object2DCheckDepth(depth)
+        If Not IsPlaceable() Then
+            Return False
+        End If
+        Dim inv As Object2DTransform = LocalTransform().Inverted()
+        If inv Is Nil Then
+            Return False
+        End If
+        Return LocalContains(inv.MapX(x, y), inv.MapY(x, y), depth)
+    End Function
+
+    Internal Sub CollectBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        Object2DCheckDepth(depth)
+        If Not IsPlaceable() Then
+            Return
+        End If
+        CollectLocalBounds(m, box, depth)
+    End Sub
+
+    Internal Function FillPaint() As Color
+        Return Object2DPaint(FillColor, FillOpacity)
+    End Function
+
+    Internal Function BorderPaint() As Color
+        If BorderWidth <= 0.0 Then
+            Return Nil
+        End If
+        Return Object2DPaint(BorderColor, BorderOpacity)
+    End Function
+
+    ' Subclass hooks. Coordinates are local: origin at the anchor, unrotated, unscaled.
+
+    ''' Draws local geometry. `device` maps local coordinates to the space
+    ''' DrawObject was called in. The base Object2D draws nothing.
+    Protected Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+    End Sub
+
+    ''' Hit test in local coordinates.
+    Protected Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        Dim pts As Object2DPolyline = Outline()
+        If pts Is Nil Then
+            Return False
+        End If
+        Return Object2DPointInPolygon(pts, lx, ly)
+    End Function
+
+    ''' Adds transformed local geometry to a bounds accumulator.
+    Protected Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        Dim pts As Object2DPolyline = Outline()
+        If pts IsNot Nil Then
+            box.AddAll(m, pts)
+        End If
+    End Sub
+
+    ''' Local outline polygon used by the default hit test and bounds, or Nil.
+    Protected Function Outline() As Object2DPolyline
+        Return Nil
+    End Function
+End Class
+
+''' Draws a shape (or Group2D) into any IGraphics, offset by (dx, dy).
+''' Library equivalent of Xojo's Graphics.DrawObject(object, deltaX, deltaY).
+''' As an extension it can be called as DrawObject(g, shape) or g.DrawObject(shape).
+Public Extension Sub DrawObject(g As IGraphics, shape As Object2D, dx As Double = 0.0, dy As Double = 0.0)
+    If shape Is Nil Then
+        Throw New NilObjectException("DrawObject requires an Object2D")
+    End If
+    shape.Draw(g, dx, dy)
+End Sub
+
+''' Rectangle centered on (X, Y). Defaults to 100 x 100 with no border.
+Public Class RectShape Inherits Object2D
+    Public Property Width As Double = 100.0
+    Public Property Height As Double = 100.0
+
+    Public Sub Constructor()
+        BorderOpacity = 0.0
+    End Sub
+
+    Internal Function HalfWidth() As Double
+        Return Math.Abs(Width) / 2.0
+    End Function
+
+    Internal Function HalfHeight() As Double
+        Return Math.Abs(Height) / 2.0
+    End Function
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        Dim w As Double = Math.Abs(Width)
+        Dim h As Double = Math.Abs(Height)
+        If w = 0.0 And h = 0.0 Then
+            Return
+        End If
+        If w = 0.0 Or h = 0.0 Then
+            ' Some native rectangle APIs drop zero-area strokes. Represent
+            ' a one-sided rectangle explicitly as a line on every backend.
+            Dim edge As Color = BorderPaint()
+            If edge IsNot Nil Then
+                g.DrawLine(-w / 2.0, -h / 2.0, w / 2.0, h / 2.0, BorderWidth, edge)
+            End If
+            Return
+        End If
+        Dim fill As Color = FillPaint()
+        If fill IsNot Nil Then
+            g.FillRect(-w / 2.0, -h / 2.0, w, h, fill)
+        End If
+        Dim border As Color = BorderPaint()
+        If border IsNot Nil Then
+            g.StrokeRect(-w / 2.0, -h / 2.0, w, h, BorderWidth, border)
+        End If
+    End Sub
+
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        Return Math.Abs(lx) <= HalfWidth() And Math.Abs(ly) <= HalfHeight()
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        Dim hw As Double = HalfWidth()
+        Dim hh As Double = HalfHeight()
+        Dim pts As New Object2DPolyline()
+        pts.Add(-hw, -hh)
+        pts.Add(hw, -hh)
+        pts.Add(hw, hh)
+        pts.Add(-hw, hh)
+        Return pts
+    End Function
+End Class
+
+''' Rectangle with elliptical corners. CornerWidth/CornerHeight are the
+''' corner oval's full width/height (Xojo semantics), clamped to the size.
+Public Class RoundRectShape Inherits RectShape
+    Public Property CornerWidth As Double = 10.0
+    Public Property CornerHeight As Double = 10.0
+    ''' 0 draws Bezier corners; N > 0 uses max(1, N \ 4) segments per corner, plus straight edges.
+    Public Property Segments As Integer = 0
+
+    Internal Function CornerRx() As Double
+        Return Math.Min(Math.Max(0.0, CornerWidth) / 2.0, HalfWidth())
+    End Function
+
+    Internal Function CornerRy() As Double
+        Return Math.Min(Math.Max(0.0, CornerHeight) / 2.0, HalfHeight())
+    End Function
+
+    Internal Sub BuildPath(g As IGraphics)
+        If Segments > 0 Then
+            Object2DPathPolyline(g, CornerOutline(Math.Max(1, Segments \ 4)), True)
+            Return
+        End If
+        Dim hw As Double = HalfWidth()
+        Dim hh As Double = HalfHeight()
+        Dim rx As Double = CornerRx()
+        Dim ry As Double = CornerRy()
+        Dim kx As Double = rx * Object2DKappa
+        Dim ky As Double = ry * Object2DKappa
+        g.BeginPath()
+        g.MoveTo(-hw + rx, -hh)
+        g.LineTo(hw - rx, -hh)
+        g.CurveTo(hw - rx + kx, -hh, hw, -hh + ry - ky, hw, -hh + ry)
+        g.LineTo(hw, hh - ry)
+        g.CurveTo(hw, hh - ry + ky, hw - rx + kx, hh, hw - rx, hh)
+        g.LineTo(-hw + rx, hh)
+        g.CurveTo(-hw + rx - kx, hh, -hw, hh - ry + ky, -hw, hh - ry)
+        g.LineTo(-hw, -hh + ry)
+        g.CurveTo(-hw, -hh + ry - ky, -hw + rx - kx, -hh, -hw + rx, -hh)
+        g.ClosePath()
+    End Sub
+
+    Internal Function CornerOutline(perCorner As Integer) As Object2DPolyline
+        Dim hw As Double = HalfWidth()
+        Dim hh As Double = HalfHeight()
+        Dim rx As Double = CornerRx()
+        Dim ry As Double = CornerRy()
+        Dim half As Double = Math.Pi / 2.0
+        Dim pts As New Object2DPolyline()
+        Object2DSampleArc(pts, hw - rx, -hh + ry, rx, ry, -half, 0.0, perCorner, True)
+        Object2DSampleArc(pts, hw - rx, hh - ry, rx, ry, 0.0, half, perCorner, True)
+        Object2DSampleArc(pts, -hw + rx, hh - ry, rx, ry, half, Math.Pi, perCorner, True)
+        Object2DSampleArc(pts, -hw + rx, -hh + ry, rx, ry, Math.Pi, Math.Pi + half, perCorner, True)
+        Return pts
+    End Function
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        Dim hw As Double = HalfWidth()
+        Dim hh As Double = HalfHeight()
+        If hw = 0.0 And hh = 0.0 Then
+            Return
+        End If
+        Dim fill As Color = FillPaint()
+        Dim border As Color = BorderPaint()
+        If Segments <= 0 And CornerRx() = CornerRy() Then
+            ' Circular corners: use the native primitive, which needs no path support.
+            If fill IsNot Nil Then
+                g.FillRoundedRect(-hw, -hh, hw * 2.0, hh * 2.0, CornerRx(), fill)
+            End If
+            If border IsNot Nil Then
+                g.StrokeRoundedRect(-hw, -hh, hw * 2.0, hh * 2.0, CornerRx(), BorderWidth, border)
+            End If
+            Return
+        End If
+        If fill IsNot Nil Then
+            BuildPath(g)
+            g.FillPath(fill)
+        End If
+        If border IsNot Nil Then
+            BuildPath(g)
+            g.StrokePath(BorderWidth, border)
+        End If
+    End Sub
+
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        Dim hw As Double = HalfWidth()
+        Dim hh As Double = HalfHeight()
+        Dim ax As Double = Math.Abs(lx)
+        Dim ay As Double = Math.Abs(ly)
+        If ax > hw Or ay > hh Then
+            Return False
+        End If
+        If Segments > 0 Then
+            Return Object2DPointInPolygon(Outline(), lx, ly)
+        End If
+        Dim rx As Double = CornerRx()
+        Dim ry As Double = CornerRy()
+        If rx <= 0.0 Or ry <= 0.0 Or ax <= hw - rx Or ay <= hh - ry Then
+            Return True
+        End If
+        Dim u As Double = (ax - (hw - rx)) / rx
+        Dim v As Double = (ay - (hh - ry)) / ry
+        Return u * u + v * v <= 1.0
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        Dim perCorner As Integer = Object2DFlattenSegments \ 4
+        If Segments > 0 Then
+            perCorner = Math.Max(1, Segments \ 4)
+        End If
+        Return CornerOutline(perCorner)
+    End Function
+
+    Protected Overrides Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        If Segments > 0 Then
+            box.AddAll(m, Outline())
+            Return
+        End If
+        Dim hw As Double = HalfWidth()
+        Dim hh As Double = HalfHeight()
+        Dim rx As Double = CornerRx()
+        Dim ry As Double = CornerRy()
+        Dim kx As Double = rx * Object2DKappa
+        Dim ky As Double = ry * Object2DKappa
+        Object2DCollectBezier(box, m, [hw - rx, hw - rx + kx, hw, hw], [-hh, -hh, -hh + ry - ky, -hh + ry])
+        Object2DCollectBezier(box, m, [hw, hw, hw - rx + kx, hw - rx], [hh - ry, hh - ry + ky, hh, hh])
+        Object2DCollectBezier(box, m, [-hw + rx, -hw + rx - kx, -hw, -hw], [hh, hh, hh - ry + ky, hh - ry])
+        Object2DCollectBezier(box, m, [-hw, -hw, -hw + rx - kx, -hw + rx], [-hh + ry, -hh + ry - ky, -hh, -hh])
+    End Sub
+End Class
+
+''' Ellipse inscribed in Width x Height, centered on (X, Y).
+Public Class OvalShape Inherits RectShape
+    ''' 0 uses the native oval primitive; N >= 3 draws an N-sided polygon.
+    Public Property Segments As Integer = 0
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        Dim w As Double = Math.Abs(Width)
+        Dim h As Double = Math.Abs(Height)
+        If w = 0.0 And h = 0.0 Then
+            Return
+        End If
+        Dim fill As Color = FillPaint()
+        Dim border As Color = BorderPaint()
+        If Segments <= 0 Then
+            If fill IsNot Nil Then
+                g.FillOval(-w / 2.0, -h / 2.0, w, h, fill)
+            End If
+            If border IsNot Nil Then
+                g.StrokeOval(-w / 2.0, -h / 2.0, w, h, BorderWidth, border)
+            End If
+            Return
+        End If
+        Dim pts As Object2DPolyline = Outline()
+        If fill IsNot Nil Then
+            Object2DPathPolyline(g, pts, True)
+            g.FillPath(fill)
+        End If
+        If border IsNot Nil Then
+            Object2DPathPolyline(g, pts, True)
+            g.StrokePath(BorderWidth, border)
+        End If
+    End Sub
+
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        Dim rx As Double = HalfWidth()
+        Dim ry As Double = HalfHeight()
+        If rx = 0.0 Or ry = 0.0 Then
+            Return False
+        End If
+        If Segments > 0 Then
+            Return Object2DPointInPolygon(Outline(), lx, ly)
+        End If
+        Dim u As Double = lx / rx
+        Dim v As Double = ly / ry
+        Return u * u + v * v <= 1.0
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        Dim n As Integer = Object2DFlattenSegments
+        If Segments > 0 Then
+            n = Math.Max(3, Segments)
+        End If
+        Dim pts As New Object2DPolyline()
+        Object2DSampleArc(pts, 0.0, 0.0, HalfWidth(), HalfHeight(), 0.0, 2.0 * Math.Pi, n, False)
+        Return pts
+    End Function
+
+    Protected Overrides Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        If Segments > 0 Then
+            box.AddAll(m, Outline())
+        Else
+            Object2DCollectEllipseArc(box, m, 0.0, 0.0, HalfWidth(), HalfHeight(), 0.0, 2.0 * Math.Pi)
+        End If
+    End Sub
+End Class
+
+''' Elliptical arc or pie wedge centered on (X, Y) with radii Width/2 and
+''' Height/2. StartAngle 0 is due east; positive angles run clockwise (screen
+''' y points down). Angles are parametric ellipse angles in radians. A fill
+''' draws a wedge to the center; the border outlines that wedge.
+Public Class ArcShape Inherits OvalShape
+    Public Property StartAngle As Double = 0.0
+    Public Property ArcAngle As Double = 0.0
+
+    Public Sub Constructor()
+        Super.Constructor()
+        BorderOpacity = 0.0
+    End Sub
+
+    Internal Function IsFullTurn() As Boolean
+        Return Math.Abs(ArcAngle) >= 2.0 * Math.Pi
+    End Function
+
+    Internal Function EffectiveSweep() As Double
+        If IsFullTurn() Then
+            If ArcAngle < 0.0 Then
+                Return -2.0 * Math.Pi
+            End If
+            Return 2.0 * Math.Pi
+        End If
+        Return ArcAngle
+    End Function
+
+    Internal Sub BuildPath(g As IGraphics)
+        If Segments > 0 Then
+            Object2DPathPolyline(g, Outline(), True)
+            Return
+        End If
+        Dim rx As Double = HalfWidth()
+        Dim ry As Double = HalfHeight()
+        Dim t0 As Double = StartAngle
+        Dim t1 As Double = StartAngle + EffectiveSweep()
+        g.BeginPath()
+        If IsFullTurn() Then
+            g.MoveTo(rx * Math.Cos(t0), ry * Math.Sin(t0))
+        Else
+            g.MoveTo(0.0, 0.0)
+            g.LineTo(rx * Math.Cos(t0), ry * Math.Sin(t0))
+        End If
+        Object2DPathArc(g, rx, ry, t0, t1)
+        g.ClosePath()
+    End Sub
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        If ArcAngle = 0.0 Or Not Object2DIsFinite(ArcAngle) Or Not Object2DIsFinite(StartAngle) Then
+            Return
+        End If
+        If HalfWidth() = 0.0 And HalfHeight() = 0.0 Then
+            Return
+        End If
+        Dim fill As Color = FillPaint()
+        If fill IsNot Nil Then
+            BuildPath(g)
+            g.FillPath(fill)
+        End If
+        Dim border As Color = BorderPaint()
+        If border IsNot Nil Then
+            BuildPath(g)
+            g.StrokePath(BorderWidth, border)
+        End If
+    End Sub
+
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        If ArcAngle = 0.0 Or Not Object2DIsFinite(ArcAngle) Or Not Object2DIsFinite(StartAngle) Then
+            Return False
+        End If
+        Dim rx As Double = HalfWidth()
+        Dim ry As Double = HalfHeight()
+        If rx = 0.0 Or ry = 0.0 Then
+            Return False
+        End If
+        If Segments > 0 Then
+            Return Object2DPointInPolygon(Outline(), lx, ly)
+        End If
+        Dim u As Double = lx / rx
+        Dim v As Double = ly / ry
+        If u * u + v * v > 1.0 Then
+            Return False
+        End If
+        If IsFullTurn() Or (u = 0.0 And v = 0.0) Then
+            Return True
+        End If
+        ' Offset of the point's parametric angle from the start, in the sweep direction.
+        Dim twoPi As Double = 2.0 * Math.Pi
+        Dim rel As Double = Math.Atan2(v, u) - StartAngle
+        If ArcAngle < 0.0 Then
+            rel = -rel
+        End If
+        rel = rel - twoPi * Math.Floor(rel / twoPi)
+        Return rel <= Math.Abs(ArcAngle) + 0.000000001
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        Dim pts As New Object2DPolyline()
+        If ArcAngle = 0.0 Or Not Object2DIsFinite(ArcAngle) Or Not Object2DIsFinite(StartAngle) Then
+            Return pts
+        End If
+        Dim sweep As Double = EffectiveSweep()
+        Dim n As Integer = Segments
+        If n <= 0 Then
+            Dim estimate As Integer = Math.Ceiling(Object2DFlattenSegments * Math.Abs(sweep) / (2.0 * Math.Pi))
+            n = Math.Max(4, estimate)
+        End If
+        If Not IsFullTurn() Then
+            pts.Add(0.0, 0.0)
+        End If
+        Object2DSampleArc(pts, 0.0, 0.0, HalfWidth(), HalfHeight(), StartAngle, StartAngle + sweep, n, True)
+        Return pts
+    End Function
+
+    Protected Overrides Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        If ArcAngle = 0.0 Or Not Object2DIsFinite(ArcAngle) Or Not Object2DIsFinite(StartAngle) Then
+            Return
+        End If
+        If Segments > 0 Then
+            box.AddAll(m, Outline())
+            Return
+        End If
+        If Not IsFullTurn() Then
+            box.Add(m, 0.0, 0.0)
+        End If
+        Object2DCollectEllipseArc(box, m, 0.0, 0.0, HalfWidth(), HalfHeight(), StartAngle, EffectiveSweep())
+    End Sub
+End Class
+
+''' Straight line (Order 0), quadratic (Order 1) or cubic (Order 2) Bezier
+''' from (X, Y) to (X2, Y2). Endpoints and control points share the parent
+''' coordinate space; Rotation and Scale pivot on (X, Y). Only the border is
+''' drawn (BorderOpacity defaults to 100); FillColor is ignored.
+Public Class CurveShape Inherits Object2D
+    Public Property X2 As Double = 100.0
+    Public Property Y2 As Double = 100.0
+    ''' 0 uses native Bezier segments; N > 0 draws N straight segments.
+    Public Property Segments As Integer = 0
+
+    Private Property mOrder As Integer = 0
+    Private Property mControlX As Array Of Double = [0.0, 0.0]
+    Private Property mControlY As Array Of Double = [0.0, 0.0]
+
+    ''' Number of control points used: 0 = line, 1 = quadratic, 2 = cubic.
+    Public Property Order As Integer
+        Get
+            Return mOrder
+        End Get
+        Set
+            If value < 0 Or value > 2 Then
+                Throw New OutOfBoundsException("CurveShape.Order must be 0, 1 or 2")
+            End If
+            mOrder = value
+        End Set
+    End Property
+
+    Public Function ControlX(index As Integer) As Double
+        CheckControlIndex(index)
+        Return mControlX(index)
+    End Function
+
+    Public Sub ControlX(index As Integer, Assigns value As Double)
+        CheckControlIndex(index)
+        mControlX(index) = value
+    End Sub
+
+    Public Function ControlY(index As Integer) As Double
+        CheckControlIndex(index)
+        Return mControlY(index)
+    End Function
+
+    Public Sub ControlY(index As Integer, Assigns value As Double)
+        CheckControlIndex(index)
+        mControlY(index) = value
+    End Sub
+
+    Private Sub CheckControlIndex(index As Integer)
+        If index < 0 Or index > 1 Then
+            Throw New OutOfBoundsException("CurveShape control point index must be 0 or 1")
+        End If
+    End Sub
+
+    ' Geometry relative to an origin (ox, oy): (X, Y) for a standalone curve,
+    ' or the figure anchor (0, 0) when the curve is part of a FigureShape.
+
+    ''' Begins a subpath when `startPath`, otherwise continues it, and appends this curve.
+    Internal Sub AppendToPath(g As IGraphics, ox As Double, oy As Double, startPath As Boolean)
+        Dim sx As Double = X - ox
+        Dim sy As Double = Y - oy
+        If startPath Then
+            g.MoveTo(sx, sy)
+        Else
+            g.LineTo(sx, sy)
+        End If
+        If Segments > 0 Then
+            Dim pts As Object2DPolyline = Sample(ox, oy, Segments)
+            For i As Integer = 1 To pts.Count() - 1
+                g.LineTo(pts.Xs(i), pts.Ys(i))
+            Next
+            Return
+        End If
+        Dim ex As Double = X2 - ox
+        Dim ey As Double = Y2 - oy
+        Select Case mOrder
+            Case 1
+                Dim qx As Double = mControlX(0) - ox
+                Dim qy As Double = mControlY(0) - oy
+                g.CurveTo(sx + 2.0 / 3.0 * (qx - sx), sy + 2.0 / 3.0 * (qy - sy), _
+                    ex + 2.0 / 3.0 * (qx - ex), ey + 2.0 / 3.0 * (qy - ey), ex, ey)
+            Case 2
+                g.CurveTo(mControlX(0) - ox, mControlY(0) - oy, mControlX(1) - ox, mControlY(1) - oy, ex, ey)
+            Case Else
+                g.LineTo(ex, ey)
+        End Select
+    End Sub
+
+    ''' Points along the curve, start included, relative to (ox, oy).
+    Internal Function Sample(ox As Double, oy As Double, segmentCount As Integer) As Object2DPolyline
+        Dim pts As New Object2DPolyline()
+        Dim sx As Double = X - ox
+        Dim sy As Double = Y - oy
+        Dim ex As Double = X2 - ox
+        Dim ey As Double = Y2 - oy
+        If mOrder = 0 Then
+            pts.Add(sx, sy)
+            pts.Add(ex, ey)
+            Return pts
+        End If
+        Dim n As Integer = Math.Max(1, segmentCount)
+        Dim steps As Double = n
+        For i As Integer = 0 To n
+            Dim t As Double = i / steps
+            Dim mt As Double = 1.0 - t
+            If mOrder = 1 Then
+                Dim qx As Double = mControlX(0) - ox
+                Dim qy As Double = mControlY(0) - oy
+                pts.Add(mt * mt * sx + 2.0 * mt * t * qx + t * t * ex, mt * mt * sy + 2.0 * mt * t * qy + t * t * ey)
+            Else
+                Dim c0x As Double = mControlX(0) - ox
+                Dim c0y As Double = mControlY(0) - oy
+                Dim c1x As Double = mControlX(1) - ox
+                Dim c1y As Double = mControlY(1) - oy
+                pts.Add(mt * mt * mt * sx + 3.0 * mt * mt * t * c0x + 3.0 * mt * t * t * c1x + t * t * t * ex, _
+                    mt * mt * mt * sy + 3.0 * mt * mt * t * c0y + 3.0 * mt * t * t * c1y + t * t * t * ey)
+            End If
+        Next
+        Return pts
+    End Function
+
+    Internal Function SampleForGeometry(ox As Double, oy As Double) As Object2DPolyline
+        If Segments > 0 Then
+            Return Sample(ox, oy, Segments)
+        End If
+        Return Sample(ox, oy, Object2DFlattenSegments)
+    End Function
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        Dim border As Color = BorderPaint()
+        If border Is Nil Then
+            Return
+        End If
+        g.BeginPath()
+        AppendToPath(g, X, Y, True)
+        g.StrokePath(BorderWidth, border)
+    End Sub
+
+    ''' Hit tolerance is half the BorderWidth, but at least 1 local unit.
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        Return Object2DNearPolyline(SampleForGeometry(X, Y), lx, ly, Math.Max(1.0, BorderWidth / 2.0))
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        Return SampleForGeometry(X, Y)
+    End Function
+
+    Internal Sub CollectGeometryBounds(m As Object2DTransform, box As Object2DBoxBuilder, ox As Double, oy As Double)
+        If Segments > 0 Then
+            box.AddAll(m, Sample(ox, oy, Segments))
+            Return
+        End If
+        Dim xs As Array Of Double = []
+        Dim ys As Array Of Double = []
+        Array.Append(xs, X - ox)
+        Array.Append(ys, Y - oy)
+        For i As Integer = 0 To mOrder - 1
+            Array.Append(xs, mControlX(i) - ox)
+            Array.Append(ys, mControlY(i) - oy)
+        Next
+        Array.Append(xs, X2 - ox)
+        Array.Append(ys, Y2 - oy)
+        Object2DCollectBezier(box, m, xs, ys)
+    End Sub
+
+    Protected Overrides Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        CollectGeometryBounds(m, box, X, Y)
+    End Sub
+
+    Public Sub Constructor()
+    End Sub
+
+    ''' Straight line from (x1, y1) to (x2, y2).
+    Public Sub Constructor(startX As Double, startY As Double, endX As Double, endY As Double)
+        X = startX
+        Y = startY
+        X2 = endX
+        Y2 = endY
+    End Sub
+End Class
+
+''' Closed figure made of CurveShapes joined end to start. Curve coordinates
+''' are relative to the figure's (X, Y) anchor; Rotation and Scale pivot there.
+''' The last curve is joined back to the first. Only the figure's style and
+''' transform are used: each member curve's colors, Rotation and Scale are
+''' ignored (its Order, control points and Segments are honored).
+Public Class FigureShape Inherits Object2D
+    Private Property mCurves As Array Of CurveShape = []
+
+    Public Sub Constructor()
+        BorderOpacity = 0.0
+    End Sub
+
+    Public Property Count As Integer
+        Get
+            Return Array.Count(mCurves)
+        End Get
+    End Property
+
+    Public Sub AddLine(x As Double, y As Double, x2 As Double, y2 As Double)
+        AddCurve(New CurveShape(x, y, x2, y2))
+    End Sub
+
+    Public Sub AddQuad(x As Double, y As Double, x2 As Double, y2 As Double, cx As Double, cy As Double)
+        Dim c As New CurveShape(x, y, x2, y2)
+        c.Order = 1
+        c.ControlX(0) = cx
+        c.ControlY(0) = cy
+        AddCurve(c)
+    End Sub
+
+    Public Sub AddCubic(x As Double, y As Double, x2 As Double, y2 As Double, cx As Double, cy As Double, cx2 As Double, cy2 As Double)
+        Dim c As New CurveShape(x, y, x2, y2)
+        c.Order = 2
+        c.ControlX(0) = cx
+        c.ControlY(0) = cy
+        c.ControlX(1) = cx2
+        c.ControlY(1) = cy2
+        AddCurve(c)
+    End Sub
+
+    Public Sub AddCurve(curve As CurveShape)
+        RequireCurve(curve)
+        Array.Append(mCurves, curve)
+    End Sub
+
+    Public Sub AddCurveAt(index As Integer, curve As CurveShape)
+        RequireCurve(curve)
+        If index < 0 Or index > Array.Count(mCurves) Then
+            Throw New OutOfBoundsException("FigureShape.AddCurveAt index is out of range")
+        End If
+        Array.Insert(mCurves, index, curve)
+    End Sub
+
+    Public Function CurveAt(index As Integer) As CurveShape
+        CheckIndex(index)
+        Return mCurves(index)
+    End Function
+
+    Public Sub CurveAt(index As Integer, Assigns curve As CurveShape)
+        RequireCurve(curve)
+        CheckIndex(index)
+        mCurves(index) = curve
+    End Sub
+
+    ''' Xojo's ValueAt spelling of CurveAt.
+    Public Function ValueAt(index As Integer) As CurveShape
+        Return CurveAt(index)
+    End Function
+
+    Public Sub ValueAt(index As Integer, Assigns curve As CurveShape)
+        Me.CurveAt(index) = curve
+    End Sub
+
+    ''' Removes the first occurrence of `curve`; no effect when it is absent.
+    Public Sub RemoveCurve(curve As CurveShape)
+        For i As Integer = 0 To Array.Count(mCurves) - 1
+            If mCurves(i) Is curve Then
+                Array.RemoveAt(mCurves, i)
+                Return
+            End If
+        Next
+    End Sub
+
+    Public Sub RemoveCurveAt(index As Integer)
+        CheckIndex(index)
+        Array.RemoveAt(mCurves, index)
+    End Sub
+
+    Public Sub RemoveAllCurves()
+        Array.Clear(mCurves)
+    End Sub
+
+    Private Sub RequireCurve(curve As CurveShape)
+        If curve Is Nil Then
+            Throw New NilObjectException("FigureShape curves cannot be Nil")
+        End If
+    End Sub
+
+    Private Sub CheckIndex(index As Integer)
+        If index < 0 Or index >= Array.Count(mCurves) Then
+            Throw New OutOfBoundsException("FigureShape curve index is out of range")
+        End If
+    End Sub
+
+    Internal Function HasGeometry() As Boolean
+        Return Array.Count(mCurves) > 0
+    End Function
+
+    Internal Sub BuildPath(g As IGraphics)
+        g.BeginPath()
+        For i As Integer = 0 To Array.Count(mCurves) - 1
+            Dim c As CurveShape = mCurves(i)
+            Dim startPath As Boolean = (i = 0)
+            If Not startPath Then
+                Dim prev As CurveShape = mCurves(i - 1)
+                ' Skip the joining LineTo when the curve starts where the previous ended.
+                If prev.X2 = c.X And prev.Y2 = c.Y Then
+                    c.AppendToPath(g, 0.0, 0.0, False)
+                    Continue For
+                End If
+            End If
+            c.AppendToPath(g, 0.0, 0.0, startPath)
+        Next
+        g.ClosePath()
+    End Sub
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        If Not HasGeometry() Then
+            Return
+        End If
+        Dim fill As Color = FillPaint()
+        If fill IsNot Nil Then
+            BuildPath(g)
+            g.FillPath(fill)
+        End If
+        Dim border As Color = BorderPaint()
+        If border IsNot Nil Then
+            BuildPath(g)
+            g.StrokePath(BorderWidth, border)
+        End If
+    End Sub
+
+    ''' Even-odd test on the flattened outline, or near a degenerate figure's edges.
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        Dim pts As Object2DPolyline = Outline()
+        If Object2DPointInPolygon(pts, lx, ly) Then
+            Return True
+        End If
+        If pts.Count() > 0 And BorderPaint() IsNot Nil Then
+            pts.Add(pts.Xs(0), pts.Ys(0))
+            Return Object2DNearPolyline(pts, lx, ly, Math.Max(1.0, BorderWidth / 2.0))
+        End If
+        Return False
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        Dim pts As New Object2DPolyline()
+        For Each c As CurveShape In mCurves
+            Dim part As Object2DPolyline = c.SampleForGeometry(0.0, 0.0)
+            For i As Integer = 0 To part.Count() - 1
+                pts.Add(part.Xs(i), part.Ys(i))
+            Next
+        Next
+        Return pts
+    End Function
+
+    Protected Overrides Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        For Each c As CurveShape In mCurves
+            c.CollectGeometryBounds(m, box, 0.0, 0.0)
+        Next
+    End Sub
+End Class
+
+''' Copies a pixel region of `img` into a new Picture; pixels outside `img` are transparent.
+Internal Function Object2DCropPicture(img As Picture, left As Integer, top As Integer, cropW As Integer, cropH As Integer) As Picture
+    If cropW <= 0 Or cropH <= 0 Or cropW > 32767 Or cropH > 32767 Or cropW * cropH > 16777216 Then
+        Throw New InvalidArgumentException("Object2D source crop exceeds 16 million pixels or 32767 pixels per side")
+    End If
+    Dim imgW As Integer = img.Width
+    Dim imgH As Integer = img.Height
+    Dim size As Integer = imgW * imgH * 4
+    Dim staging As New Bytes(size)
+    If img.GetBacking(staging.DataPtr(), size, 0) <> size Then
+        Return Nil
+    End If
+    ' GetBacking fills capacity without changing Count; Append makes it addressable.
+    Dim pixels As New Bytes(size)
+    pixels.Append(staging.DataPtr(), size)
+    Dim crop As New Bytes(cropW * cropH * 4)
+    For y As Integer = top To top + cropH - 1
+        For x As Integer = left To left + cropW - 1
+            If x >= 0 And x < imgW And y >= 0 And y < imgH Then
+                Dim i As Integer = (y * imgW + x) * 4
+                crop.Append(pixels.Item(i))
+                crop.Append(pixels.Item(i + 1))
+                crop.Append(pixels.Item(i + 2))
+                crop.Append(pixels.Item(i + 3))
+            Else
+                crop.Append(0)
+                crop.Append(0)
+                crop.Append(0)
+                crop.Append(0)
+            End If
+        Next
+    Next
+    Return Picture.FromBuffer(crop.DataPtr(), crop.Count, 0, cropW, cropH)
+End Function
+
+''' Picture centered on (X, Y), scaled to Width x Height. The source region
+''' (SourceLeft, SourceTop, SourceWidth, SourceHeight) defaults to the whole
+''' image. Inherited fill and border properties are not drawn.
+Public Class PixmapShape Inherits RectShape
+    Public Property SourceLeft As Double = 0.0
+    Public Property SourceTop As Double = 0.0
+    Public Property SourceWidth As Integer = 0
+    Public Property SourceHeight As Integer = 0
+
+    Private Property mImage As Picture
+
+    ''' Assigning an image resets Width/Height and the source region to its pixel size.
+    Public Property Image As Picture
+        Get
+            Return mImage
+        End Get
+        Set
+            mImage = value
+            SourceLeft = 0.0
+            SourceTop = 0.0
+            If value Is Nil Then
+                SourceWidth = 0
+                SourceHeight = 0
+                Width = 0.0
+                Height = 0.0
+            Else
+                SourceWidth = value.Width
+                SourceHeight = value.Height
+                Width = value.Width
+                Height = value.Height
+            End If
+        End Set
+    End Property
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Image = Nil
+    End Sub
+
+    Public Sub Constructor(img As Picture)
+        Super.Constructor()
+        Image = img
+    End Sub
+
+    ''' The picture actually drawn: Image itself, or a fresh crop. Image is
+    ''' mutable, so a crop must reflect edits through Image.Graphics as well.
+    Public Function SourcePicture() As Picture
+        Dim img As Picture = mImage
+        If img Is Nil Or SourceWidth <= 0 Or SourceHeight <= 0 Then
+            Return Nil
+        End If
+        If SourceLeft = 0.0 And SourceTop = 0.0 And SourceWidth = img.Width And SourceHeight = img.Height Then
+            Return img
+        End If
+        If Not Object2DIsFinite(SourceLeft) Or Not Object2DIsFinite(SourceTop) Or Math.Abs(SourceLeft) > 2147483647.0 Or Math.Abs(SourceTop) > 2147483647.0 Then
+            Throw New InvalidArgumentException("Object2D source offsets must be finite 32-bit pixel coordinates")
+        End If
+        ' No sub-rectangle blit exists, and Windows DrawPicture ignores clips
+        ' and negative offsets, so copy the region's pixels into a new Picture.
+        Return Object2DCropPicture(img, Math.Floor(SourceLeft), Math.Floor(SourceTop), SourceWidth, SourceHeight)
+    End Function
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        If mImage Is Nil Then
+            Return
+        End If
+        If mImage.Width <= 0 Or mImage.Height <= 0 Then
+            Return
+        End If
+        Dim w As Double = Math.Abs(Width)
+        Dim h As Double = Math.Abs(Height)
+        If w = 0.0 Or h = 0.0 Then
+            Return
+        End If
+        Dim src As Picture = SourcePicture()
+        If src Is Nil Then
+            Return
+        End If
+        If Object2DNeedsDeviceSpace(g) Then
+            Object2DDrawDevicePicture(g, src, device, -w / 2.0, -h / 2.0, w, h)
+            Return
+        End If
+        ' Clip so smoothing filters cannot bleed past the destination when scaling.
+        g.Save()
+        Try
+            g.ClipToRect(-w / 2.0, -h / 2.0, w, h)
+            g.DrawPicture(src, -w / 2.0, -h / 2.0, w, h)
+        Finally
+            g.Restore()
+        End Try
+    End Sub
+End Class
+
+''' Single-style text anchored at (X, Y). Defaults: centered horizontally on
+''' X with the first line's baseline on Y. Line breaks (CR, LF or CRLF) start
+''' new lines; see README.md for the multiline layout rules.
+Public Class TextShape Inherits Object2D
+    Public Enum Alignment As Integer
+        Left = 0
+        Top = 1
+        Center = 2
+        Baseline = 3
+        Right = 4
+        Bottom = 5
+    End Enum
+
+    ''' Family used for the "System"/"SmallSystem" metafonts and an empty FontName.
+    Public Shared Property SystemFontName As String = Object2DDefaultSystemFont()
+    ''' Point size used when FontSize is 0 or negative.
+    Public Shared Property DefaultFontSize As Double = 12.0
+    ''' Ascent as a fraction of MeasureStringHeight, used for Top/Center/Bottom alignment.
+    Public Shared Property AscentRatio As Double = 0.8
+    ''' Line advance as a multiple of MeasureStringHeight.
+    Public Shared Property LineSpacing As Double = 1.0
+
+    Public Property Text As String = ""
+    Public Property FontName As String = "System"
+    Public Property FontSize As Double = 0.0
+    Private Property mFontUnit As FontUnits = FontUnits.Point
+    Private Property mPixelsPerPoint As Double = 1.0
+
+    Public Property FontUnit As FontUnits
+        Get
+            Return mFontUnit
+        End Get
+        Set
+            Dim code As Integer = CType(value, Integer)
+            If code < 0 Or code > 4 Then
+                Throw New InvalidArgumentException("Unknown TextShape.FontUnit")
+            End If
+            mFontUnit = value
+        End Set
+    End Property
+
+    ''' Target pixels per graphics point for Pixel units. IGraphics has no
+    ''' DPI query; set this explicitly for a physical-pixel-sized font.
+    Public Property PixelsPerPoint As Double
+        Get
+            Return mPixelsPerPoint
+        End Get
+        Set
+            If Not Object2DIsFinite(value) Or value <= 0.0 Then
+                Throw New InvalidArgumentException("TextShape.PixelsPerPoint must be finite and positive")
+            End If
+            mPixelsPerPoint = value
+        End Set
+    End Property
+    Public Property Bold As Boolean = False
+    Public Property Italic As Boolean = False
+    Public Property Underline As Boolean = False
+    Public Property HorizontalAlignment As TextShape.Alignment = TextShape.Alignment.Center
+    Public Property VerticalAlignment As TextShape.Alignment = TextShape.Alignment.Baseline
+
+    ' Local layout box from the most recent Draw/Measure; Nil until measured.
+    Private Property mBox As Rect
+    Private Property mBoxKey As String = ""
+
+    Public Sub Constructor()
+    End Sub
+
+    Public Sub Constructor(value As String)
+        Text = value
+    End Sub
+
+    ''' The font family actually passed to DrawString.
+    Public Function ResolvedFontName() As String
+        If FontName = "" Or String.Compare(FontName, "System") = 0 Or String.Compare(FontName, "SmallSystem") = 0 Then
+            Return TextShape.SystemFontName
+        End If
+        Return FontName
+    End Function
+
+    Public Function ResolvedFontSize() As Double
+        Dim size As Double = TextShape.DefaultFontSize
+        If FontSize > 0.0 And Object2DIsFinite(FontSize) Then
+            size = FontSize
+            Select Case mFontUnit
+                Case FontUnits.Pixel
+                    size /= mPixelsPerPoint
+                Case FontUnits.Inches
+                    size *= 72.0
+                Case FontUnits.Millimeter
+                    size *= 72.0 / 25.4
+                Case FontUnits.Default
+#If TargetWindows Then
+                    size /= mPixelsPerPoint
+#End If
+            End Select
+        End If
+        If Not Object2DIsFinite(size) Or size <= 0.0 Then
+            Throw New InvalidArgumentException("TextShape font size must resolve to finite positive points")
+        End If
+        Return size
+    End Function
+
+    ''' Text split at CR, LF and CRLF.
+    Public Function Lines() As Array Of String
+        Dim normalized As String = String.Replace(String.Replace(Text, "\r\n", "\n"), "\r", "\n")
+        Return String.Split(normalized, "\n")
+    End Function
+
+    ''' Measures with `g` (applying Bold/Italic on a native Graphics) and caches
+    ''' the layout box used by Contains and Bounds. Draw also refreshes it.
+    Public Sub Measure(g As IGraphics)
+        If g Is Nil Then
+            Throw New NilObjectException("TextShape.Measure requires a graphics context")
+        End If
+        Dim ng As Graphics = TryCast(g, Graphics)
+        Dim oldBold As Boolean = False
+        Dim oldItalic As Boolean = False
+        If ng IsNot Nil Then
+            oldBold = ng.Bold
+            oldItalic = ng.Italic
+        End If
+        Try
+            If ng IsNot Nil Then
+                ng.Bold = Bold
+                ng.Italic = Italic
+            End If
+            Layout(g, False)
+        Finally
+            If ng IsNot Nil Then
+                ng.Bold = oldBold
+                ng.Italic = oldItalic
+            End If
+        End Try
+    End Sub
+
+    ''' True when a cached measurement matches the current text and font.
+    Public Function IsMeasured() As Boolean
+        Return mBox IsNot Nil And String.Compare(mBoxKey, LayoutKey(), True) = 0
+    End Function
+
+    Private Function LayoutKey() As String
+        Return Text + "\n" + ResolvedFontName() + "\n" + Str(ResolvedFontSize()) + "\n" + Str(Bold) + Str(Italic) _
+            + "\n" + Str(CType(HorizontalAlignment, Integer)) + "," + Str(CType(VerticalAlignment, Integer)) _
+            + "\n" + Str(TextShape.AscentRatio) + "," + Str(TextShape.LineSpacing)
+    End Function
+
+    Private Function HorizontalFactor() As Double
+        Select Case HorizontalAlignment
+            Case TextShape.Alignment.Left
+                Return 0.0
+            Case TextShape.Alignment.Right
+                Return 1.0
+            Case Else
+                Return 0.5
+        End Select
+    End Function
+
+    ''' First baseline offset from Y for a block of `count` lines.
+    Private Function FirstBaseline(count As Integer, lineHeight As Double) As Double
+        Dim ascent As Double = lineHeight * TextShape.AscentRatio
+        Dim advance As Double = lineHeight * TextShape.LineSpacing
+        Dim blockHeight As Double = advance * (count - 1) + lineHeight
+        Select Case VerticalAlignment
+            Case TextShape.Alignment.Top
+                Return ascent
+            Case TextShape.Alignment.Center
+                Return ascent - blockHeight / 2.0
+            Case TextShape.Alignment.Bottom
+                Return ascent - blockHeight
+            Case Else
+                Return 0.0
+        End Select
+    End Function
+
+    ''' Lays out (and optionally draws) every line in local coordinates.
+    Private Sub Layout(g As IGraphics, paint As Boolean)
+        Dim parts As Array Of String = Lines()
+        Dim font As String = ResolvedFontName()
+        Dim size As Double = ResolvedFontSize()
+        Dim lineHeight As Double = g.MeasureStringHeight("Xg", font, size)
+        If Not (lineHeight > 0.0) Then
+            lineHeight = size * 1.2
+        End If
+        Dim advance As Double = lineHeight * TextShape.LineSpacing
+        Dim baseline As Double = FirstBaseline(Array.Count(parts), lineHeight)
+        Dim factor As Double = HorizontalFactor()
+        Dim fill As Color = Nil
+        If paint Then
+            fill = FillPaint()
+        End If
+        Dim emulateUnderline As Boolean = paint And Underline And TryCast(g, Graphics) Is Nil
+        Dim maxWidth As Double = 0.0
+        Dim minLeft As Double = 0.0
+        For i As Integer = 0 To Array.Count(parts) - 1
+            Dim line As String = parts(i)
+            Dim w As Double = 0.0
+            If line <> "" Then
+                w = g.MeasureStringWidth(line, font, size)
+            End If
+            Dim left As Double = -w * factor
+            If i = 0 Then
+                minLeft = left
+                maxWidth = w
+            Else
+                Dim right As Double = Math.Max(minLeft + maxWidth, left + w)
+                minLeft = Math.Min(minLeft, left)
+                maxWidth = right - minLeft
+            End If
+            If fill IsNot Nil And line <> "" Then
+                g.DrawString(line, left, baseline + advance * i, font, size, fill)
+                If emulateUnderline Then
+                    Dim uy As Double = baseline + advance * i + Math.Max(1.0, size * 0.1)
+                    g.DrawLine(left, uy, left + w, uy, Math.Max(0.5, size / 16.0), fill)
+                End If
+            End If
+        Next
+        Dim top As Double = baseline - lineHeight * TextShape.AscentRatio
+        Dim height As Double = advance * (Array.Count(parts) - 1) + lineHeight
+        mBox = New Rect(minLeft, top, maxWidth, height)
+        mBoxKey = LayoutKey()
+    End Sub
+
+    ''' Local layout box: the cached measurement, or an estimate (0.55 em per
+    ''' character) when the text has not been measured with its current font.
+    Public Function LayoutBox() As Rect
+        If IsMeasured() Then
+            Return mBox.Clone()
+        End If
+        Dim parts As Array Of String = Lines()
+        Dim size As Double = ResolvedFontSize()
+        Dim lineHeight As Double = size * 1.2
+        Dim advance As Double = lineHeight * TextShape.LineSpacing
+        Dim factor As Double = HorizontalFactor()
+        Dim widest As Double = 0.0
+        For Each line As String In parts
+            widest = Math.Max(widest, String.Len(line) * size * 0.55)
+        Next
+        Dim baseline As Double = FirstBaseline(Array.Count(parts), lineHeight)
+        Return New Rect(-widest * factor, baseline - lineHeight * TextShape.AscentRatio, widest, advance * (Array.Count(parts) - 1) + lineHeight)
+    End Function
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        Dim ng As Graphics = TryCast(g, Graphics)
+        Dim oldBold As Boolean = False
+        Dim oldItalic As Boolean = False
+        Dim oldUnderline As Boolean = False
+        If ng IsNot Nil Then
+            ' Save/Restore is not documented to cover font style, so restore it here.
+            oldBold = ng.Bold
+            oldItalic = ng.Italic
+            oldUnderline = ng.Underline
+        End If
+        Try
+            If ng IsNot Nil Then
+                ng.Bold = Bold
+                ng.Italic = Italic
+                ng.Underline = Underline
+            End If
+            If Object2DNeedsDeviceSpace(g) Then
+                Layout(g, False)
+                DrawDeviceText(g, device)
+            Else
+                Layout(g, True)
+            End If
+        Finally
+            If ng IsNot Nil Then
+                ng.Bold = oldBold
+                ng.Italic = oldItalic
+                ng.Underline = oldUnderline
+            End If
+        End Try
+    End Sub
+
+    ' Rasterize text upright into a transparent picture, then apply the same
+    ' affine pixel transform as PixmapShape. This also rotates styled glyphs
+    ' and underlines on the Windows runtime that ignores text transforms.
+    Private Sub DrawDeviceText(g As IGraphics, device As Object2DTransform)
+        Dim fill As Color = FillPaint()
+        If fill Is Nil Or Text = "" Then
+            Return
+        End If
+        Dim size As Double = ResolvedFontSize()
+        Dim pad As Double = Math.Ceiling(size / 2.0) + 2.0
+        Dim w As Double = Math.Max(1.0, Math.Ceiling(mBox.Width + pad * 2.0))
+        Dim h As Double = Math.Max(1.0, Math.Ceiling(mBox.Height + pad * 2.0))
+        If Not Object2DIsFinite(w) Or Not Object2DIsFinite(h) Or w > 32767.0 Or h > 32767.0 Or w * h > 16777216.0 Then
+            Throw New InvalidArgumentException("Object2D Windows text raster exceeds 16 million pixels or 32767 pixels per side")
+        End If
+        Dim raster As New Picture(w, h)
+        Dim rg As Graphics = raster.Graphics
+        rg.Bold = Bold
+        rg.Italic = Italic
+        rg.Underline = Underline
+        Dim font As String = ResolvedFontName()
+        Dim lineHeight As Double = g.MeasureStringHeight("Xg", font, size)
+        If Not (lineHeight > 0.0) Then
+            lineHeight = size * 1.2
+        End If
+        Dim parts As Array Of String = Lines()
+        Dim baseline As Double = FirstBaseline(Array.Count(parts), lineHeight)
+        For i As Integer = 0 To Array.Count(parts) - 1
+            Dim line As String = parts(i)
+            If line <> "" Then
+                Dim lineWidth As Double = g.MeasureStringWidth(line, font, size)
+                rg.DrawString(line, -lineWidth * HorizontalFactor() - mBox.Left + pad, _
+                    baseline + i * lineHeight * TextShape.LineSpacing - mBox.Top + pad, font, size, fill)
+            End If
+        Next
+        Object2DDrawDevicePicture(g, raster, device, mBox.Left - pad, mBox.Top - pad, w, h)
+    End Sub
+
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        If Text = "" Then
+            Return False
+        End If
+        Dim box As Rect = LayoutBox()
+        Return lx >= box.Left And lx <= box.Right And ly >= box.Top And ly <= box.Bottom
+    End Function
+
+    Protected Overrides Function Outline() As Object2DPolyline
+        If Text = "" Then
+            Return Nil
+        End If
+        Dim box As Rect = LayoutBox()
+        Dim pts As New Object2DPolyline()
+        pts.Add(box.Left, box.Top)
+        pts.Add(box.Right, box.Top)
+        pts.Add(box.Right, box.Bottom)
+        pts.Add(box.Left, box.Bottom)
+        Return pts
+    End Function
+End Class
+
+Internal Function Object2DDefaultSystemFont() As String
+#If TargetMac Then
+    Return "Helvetica"
+#ElseIf TargetWindows Then
+    Return "Segoe UI"
+#Else
+    Return "Sans"
+#End If
+End Function
+
+''' Legacy Xojo name for TextShape.
+Public Class StringShape Inherits TextShape
+    Public Sub Constructor()
+        Super.Constructor()
+    End Sub
+
+    Public Sub Constructor(value As String)
+        Super.Constructor(value)
+    End Sub
+End Class
+
+Internal Class Object2DGroupVisit
+    Private Property mSeen As Array Of Group2D = []
+
+    Public Function FirstVisit(group As Group2D) As Boolean
+        For Each prior As Group2D In mSeen
+            If prior Is group Then
+                Return False
+            End If
+        Next
+        Array.Append(mSeen, group)
+        Return True
+    End Function
+End Class
+
+''' Ordered container of Object2D items, drawn first to last. Children use the
+''' group's local space: the group's (X, Y) is that space's origin and its
+''' Rotation and Scale pivot there. With default X/Y/Rotation/Scale the
+''' children draw at their own coordinates. The group's own fill and border
+''' properties are not applied to children. Nil items and cycles (a group
+''' containing itself directly or through nested groups) are rejected.
+Public Class Group2D Inherits Object2D
+    Private Property mItems As Array Of Object2D = []
+
+    Public Property Count As Integer
+        Get
+            Return Array.Count(mItems)
+        End Get
+    End Property
+
+    Public Sub AddObject(item As Object2D)
+        RequireInsertable(item)
+        Array.Append(mItems, item)
+    End Sub
+
+    ''' Short alias of AddObject.
+    Public Sub Add(item As Object2D)
+        AddObject(item)
+    End Sub
+
+    ''' Inserts before `index`; index = Count appends.
+    Public Sub AddObjectAt(index As Integer, item As Object2D)
+        RequireInsertable(item)
+        If index < 0 Or index > Array.Count(mItems) Then
+            Throw New OutOfBoundsException("Group2D.AddObjectAt index is out of range")
+        End If
+        Array.Insert(mItems, index, item)
+    End Sub
+
+    ''' Alias of AddObjectAt.
+    Public Sub Insert(index As Integer, item As Object2D)
+        AddObjectAt(index, item)
+    End Sub
+
+    Public Function Item(index As Integer) As Object2D
+        CheckIndex(index)
+        Return mItems(index)
+    End Function
+
+    ''' Replaces the item at `index` (with the same Nil and cycle checks).
+    Public Sub Item(index As Integer, Assigns value As Object2D)
+        CheckIndex(index)
+        RequireInsertable(value)
+        mItems(index) = value
+    End Sub
+
+    ''' Zero-based index of the first identical item, or -1.
+    Public Function IndexOf(item As Object2D) As Integer
+        For i As Integer = 0 To Array.Count(mItems) - 1
+            If mItems(i) Is item Then
+                Return i
+            End If
+        Next
+        Return -1
+    End Function
+
+    ''' Removes the first identical item; no effect when it is absent.
+    Public Sub RemoveObject(item As Object2D)
+        Dim index As Integer = IndexOf(item)
+        If index >= 0 Then
+            Array.RemoveAt(mItems, index)
+        End If
+    End Sub
+
+    ''' Alias of RemoveObject.
+    Public Sub Remove(item As Object2D)
+        RemoveObject(item)
+    End Sub
+
+    Public Sub RemoveObjectAt(index As Integer)
+        CheckIndex(index)
+        Array.RemoveAt(mItems, index)
+    End Sub
+
+    Public Sub RemoveAll()
+        Array.Clear(mItems)
+    End Sub
+
+    ''' The topmost (last drawn) direct child containing (x, y) in the group's
+    ''' parent coordinate space, or Nil.
+    Public Function HitTest(x As Double, y As Double) As Object2D
+        If Not IsPlaceable() Then
+            Return Nil
+        End If
+        Dim inv As Object2DTransform = LocalTransform().Inverted()
+        If inv Is Nil Then
+            Return Nil
+        End If
+        Dim lx As Double = inv.MapX(x, y)
+        Dim ly As Double = inv.MapY(x, y)
+        For i As Integer = Array.Count(mItems) - 1 To 0 Step -1
+            If mItems(i).ContainsAt(lx, ly, 1) Then
+                Return mItems(i)
+            End If
+        Next
+        Return Nil
+    End Function
+
+    ''' True when `target` is this group or is nested anywhere inside it.
+    Public Function Encloses(target As Object2D) As Boolean
+        Return EnclosesAt(target, 0, New Object2DGroupVisit)
+    End Function
+
+    Internal Function EnclosesAt(target As Object2D, depth As Integer, visited As Object2DGroupVisit) As Boolean
+        Object2DCheckDepth(depth)
+        Dim self As Object2D = Me
+        If target Is self Then
+            Return True
+        End If
+        If Not visited.FirstVisit(Me) Then
+            Return False
+        End If
+        For Each child As Object2D In mItems
+            If child Is target Then
+                Return True
+            End If
+            Dim nested As Group2D = TryCast(child, Group2D)
+            If nested IsNot Nil Then
+                If nested.EnclosesAt(target, depth + 1, visited) Then
+                    Return True
+                End If
+            End If
+        Next
+        Return False
+    End Function
+
+    Private Sub RequireInsertable(item As Object2D)
+        If item Is Nil Then
+            Throw New NilObjectException("Group2D items cannot be Nil")
+        End If
+        Dim nested As Group2D = TryCast(item, Group2D)
+        If nested IsNot Nil Then
+            If nested.Encloses(Me) Then
+                Throw New InvalidArgumentException("Adding this Group2D would create a cycle")
+            End If
+        End If
+    End Sub
+
+    Private Sub CheckIndex(index As Integer)
+        If index < 0 Or index >= Array.Count(mItems) Then
+            Throw New OutOfBoundsException("Group2D index is out of range")
+        End If
+    End Sub
+
+    Protected Overrides Sub DrawLocal(g As IGraphics, depth As Integer, device As Object2DTransform)
+        ' Iterate a snapshot so the draw order is stable for this pass.
+        Dim snapshot As Array Of Object2D = Array.Clone(mItems)
+        For Each child As Object2D In snapshot
+            child.RenderPlaced(g, depth + 1, device)
+        Next
+    End Sub
+
+    Protected Overrides Function LocalContains(lx As Double, ly As Double, depth As Integer) As Boolean
+        For Each child As Object2D In mItems
+            If child.ContainsAt(lx, ly, depth + 1) Then
+                Return True
+            End If
+        Next
+        Return False
+    End Function
+
+    Protected Overrides Sub CollectLocalBounds(m As Object2DTransform, box As Object2DBoxBuilder, depth As Integer)
+        For Each child As Object2D In mItems
+            child.CollectBounds(m.Concat(child.LocalTransform()), box, depth + 1)
+        Next
+    End Sub
+End Class

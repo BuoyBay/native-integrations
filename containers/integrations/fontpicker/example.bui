@@ -1,0 +1,80 @@
+Import fontpicker
+Class DemoPicker Inherits FontPicker
+    Public Property Owner As Weak FontWindow
+    Handle Selected(font As FontSelection)
+        Dim win As FontWindow = Me.Owner
+        If win <> Nil Then win.UpdateSelection(font, "selected")
+    End Handle
+    Handle SelectionChanged(font As FontSelection)
+        Dim win As FontWindow = Me.Owner
+        If win <> Nil Then win.UpdateSelection(font, "changed")
+    End Handle
+    Handle Cancelled()
+        Dim win As FontWindow = Me.Owner
+        If win <> Nil Then win.CancelledCount += 1
+        If win <> Nil Then win.Title = "FontPicker: cancelled=" + Str(win.CancelledCount)
+    End Handle
+End Class
+Window FontLayout
+    Title = "Buoy Native FontPicker"
+    Frame = (100, 100, 640, 260)
+    Control Label explanation
+        Text = "Native font selection: dialog on GTK/Windows, live panel on macOS."
+        Frame = (20, 20, 600, 30)
+    End Control
+    Control Button choose
+        Caption = "Choose Font"
+        Frame = (20, 65, 160, 35)
+    End Control
+    Control Button dismiss
+        Caption = "Close picker"
+        Frame = (200, 65, 160, 35)
+    End Control
+    Control Label preview
+        Text = "The quick brown fox jumps over the lazy dog."
+        Frame = (20, 125, 600, 65)
+    End Control
+    Control Label status
+        Text = "Ready"
+        Frame = (20, 210, 600, 25)
+    End Control
+End Window
+Class FontWindow Inherits FontLayout
+    Public Property Picker As DemoPicker = New DemoPicker()
+    Public Property CancelledCount As Integer = 0
+    Handle Opening()
+        Me.Picker.Owner = Me
+        Me.Picker.Title = "Buoy Choose Font"
+        If Not FontPicker.IsSupported() Then
+            Me.choose.Enabled = False
+            Me.status.Text = "Requires GTK 4.10 or later."
+        End If
+    End Handle
+    Handle Closed()
+        Me.Picker.Close()
+    End Handle
+    Public Sub UpdateSelection(font As FontSelection, action As String)
+        Me.preview.FontName = font.Family
+        Me.preview.FontSize = font.Size
+        Me.preview.Bold = font.Bold
+        Me.preview.Italic = font.Italic
+        Me.status.Text = font.Family + " " + Str(font.Size) + " pt"
+        Me.Title = "FontPicker: " + action + " " + font.Family
+    End Sub
+    With choose
+        Handle Action()
+            If Not Me.Picker.IsOpen Then Me.Picker.Show(Me)
+        End Handle
+    End With
+    With dismiss
+        Handle Action()
+            Me.Picker.Close()
+            Me.status.Text = "Picker closed programmatically"
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New FontWindow()
+    win.Show()
+    Application.Run()
+End Sub

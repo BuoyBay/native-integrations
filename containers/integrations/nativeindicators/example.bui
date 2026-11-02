@@ -1,0 +1,73 @@
+Import nativeindicators
+
+Window IndicatorLayout
+    Title = "Buoy Native Indicators"
+    Frame = (100, 100, 560, 280)
+    Control Label titleLabel
+        Text = "Native separators and activity indicators"
+        Frame = (20, 15, 520, 25)
+    End Control
+    Control NativeSeparator horizontalLine
+        Frame = (20, 55, 520, 2)
+    End Control
+    Control NativeSeparator verticalLine
+        Orientation = SeparatorOrientation.Vertical
+        Frame = (280, 75, 2, 125)
+    End Control
+    Control ActivityIndicator busy
+        Frame = (80, 90, 120, 32)
+    End Control
+    Control Label stateLabel
+        Text = "Running"
+        Frame = (40, 135, 200, 25)
+    End Control
+    Control Button startButton
+        Caption = "Start"
+        Frame = (310, 90, 95, 32)
+    End Control
+    Control Button stopButton
+        Caption = "Stop"
+        Frame = (420, 90, 95, 32)
+    End Control
+    Control Label platformNote
+        Text = "macOS / GTK: spinner. Windows: native marquee progress bar."
+        Frame = (20, 230, 520, 25)
+    End Control
+End Window
+Class IndicatorDemo Inherits IndicatorLayout
+    Handle Opening()
+        Me.horizontalLine.Open()
+        Me.verticalLine.Open()
+        Me.busy.Start()
+        Me.busy.Open()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.horizontalLine.RefreshNative()
+        Me.verticalLine.RefreshNative()
+        Me.busy.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.busy.Close()
+        Me.horizontalLine.Close()
+        Me.verticalLine.Close()
+    End Handle
+    With startButton
+        Handle Action()
+            Me.busy.Start()
+            Me.stateLabel.Text = "Running"
+            Me.Title = "Indicators: running"
+        End Handle
+    End With
+    With stopButton
+        Handle Action()
+            Me.busy.Stop()
+            Me.stateLabel.Text = "Stopped"
+            Me.Title = "Indicators: stopped"
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New IndicatorDemo()
+    win.Show()
+    Application.Run()
+End Sub

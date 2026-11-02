@@ -1,0 +1,228 @@
+' Unicode HKCU string settings for 64-bit Windows; native handles never escape.
+#If TargetWindows Then
+Private Optional Declare Function NativeCreate Lib "advapi32" Alias "RegCreateKeyExW" (root As Ptr, keyPath As Ptr, reserved As UInt32, className As Ptr, options As UInt32, access As UInt32, security As Ptr, ByRef key As Ptr, ByRef disposition As UInt32) As Int32
+Private Optional Declare Function NativeOpen Lib "advapi32" Alias "RegOpenKeyExW" (root As Ptr, keyPath As Ptr, options As UInt32, access As UInt32, ByRef key As Ptr) As Int32
+Private Optional Declare Function NativeClose Lib "advapi32" Alias "RegCloseKey" (key As Ptr) As Int32
+Private Optional Declare Function NativeGet Lib "advapi32" Alias "RegGetValueW" (key As Ptr, subkey As Ptr, name As Ptr, queryFlags As UInt32, ByRef valueType As UInt32, data As Ptr, ByRef size As UInt32) As Int32
+Private Optional Declare Function NativeSet Lib "advapi32" Alias "RegSetValueExW" (key As Ptr, name As Ptr, reserved As UInt32, valueType As UInt32, data As Ptr, size As UInt32) As Int32
+Private Optional Declare Function NativeDeleteValue Lib "advapi32" Alias "RegDeleteValueW" (key As Ptr, name As Ptr) As Int32
+Private Optional Declare Function NativeDeleteKey Lib "advapi32" Alias "RegDeleteKeyExW" (root As Ptr, keyPath As Ptr, view As UInt32, reserved As UInt32) As Int32
+
+Private Function CurrentUser() As Ptr
+    ' HKEY_CURRENT_USER is a sign-extended predefined 32-bit pseudo-handle.
+    Return CType(-2147483647, Ptr)
+End Function
+
+Private Sub Fail(operation As String, code As Integer)
+    Throw New RuntimeException(operation + " failed (Win32 error " + Str(code) + ")", code)
+End Sub
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Private Sub RequireWindows()
+#If Not TargetWindows Then
+    Throw New UnsupportedOperationException("WinRegistry requires Windows")
+#End If
+End Sub
+
+Private Function Wide(value As String) As Bytes
+    Dim utf8 As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To utf8.Count - 1
+        If utf8.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Registry text cannot contain NUL")
+        End If
+    Next
+    Dim encoded As Bytes = value.AsUTF16LE()
+    If encoded.Count > 1048574 Then
+        Throw New InvalidArgumentException("Registry text exceeds this module's 1 MiB limit")
+    End If
+    encoded.Append(0)
+    encoded.Append(0)
+    Return encoded
+End Function
+
+Private Sub ValidatePath(keyPath As String, mutation As Boolean)
+    Dim parts As Array Of String = String.Split(keyPath, "\\")
+    If keyPath = "" Then
+        Throw New InvalidArgumentException("Registry key keyPath must be nonempty and relative to HKCU")
+    End If
+    For Each part As String In parts
+        If part = "" Then
+            Throw New InvalidArgumentException("Registry keyPath cannot contain empty components")
+        End If
+    Next
+    If mutation Then
+        If Array.Count(parts) < 3 Or String.LCase(parts(0)) <> "software" Then
+            Throw New InvalidArgumentException("Registry writes require Software\\<application>\\<subkey> or deeper")
+        End If
+    End If
+End Sub
+
+''' Creates an HKCU Software application subkey; True means this call created it.
+Public Function CreateKey(keyPath As String) As Boolean
+    RequireWindows()
+    ValidatePath(keyPath, True)
+#If TargetWindows Then
+    Dim encoded As Bytes = Wide(keyPath)
+    Dim key As Ptr = Nil
+    Dim disposition As UInt32 = 0
+    ' KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY; nonvolatile key.
+    Dim code As Integer = NativeCreate(CurrentUser(), encoded.DataPtr(), 0, Nil, 0, 259, Nil, key, disposition)
+    If code <> 0 Then
+        Fail("RegCreateKeyExW", code)
+    End If
+    Try
+        Return disposition = 1
+    Finally
+        NativeClose(key)
+    End Try
+#Else
+    Return False
+#End If
+End Function
+
+''' None means missing key/value. Only REG_SZ is accepted; expansion is disabled.
+Public Function ReadString(keyPath As String, name As String) As Optional Of String
+    RequireWindows()
+    ValidatePath(keyPath, False)
+#If TargetWindows Then
+    Dim encoded As Bytes = Wide(keyPath)
+    Dim valueName As Bytes = Wide(name)
+    Dim key As Ptr = Nil
+    Dim code As Integer = NativeOpen(CurrentUser(), encoded.DataPtr(), 0, 257, key)
+    If code = 2 Or code = 3 Then
+        Return None
+    ElseIf code <> 0 Then
+        Fail("RegOpenKeyExW", code)
+    End If
+    Try
+        Dim valueType As UInt32 = 0
+        Dim size As UInt32 = 0
+        ' RRF_RT_REG_SZ | RRF_NOEXPAND, preserving exact stored string type.
+        code = NativeGet(key, Nil, valueName.DataPtr(), 268435458, valueType, Nil, size)
+        If code = 2 Or code = 3 Then
+            Return None
+        ElseIf code <> 0 Then
+            Fail("RegGetValueW(size)", code)
+        End If
+        For attempt As Integer = 1 To 4
+            If size > 1048576 Then
+                Throw New RuntimeException("Registry string exceeds this module's 1 MiB limit")
+            End If
+            ' Extra capacity lets RegGetValue repair a missing native terminator.
+            Dim capacity As Integer = size + 2
+            Dim buffer As New Bytes(capacity)
+            For i As Integer = 1 To capacity
+                buffer.Append(0)
+            Next
+            size = capacity
+            code = NativeGet(key, Nil, valueName.DataPtr(), 268435458, valueType, buffer.DataPtr(), size)
+            If code = 234 Then
+                Continue For
+            ElseIf code = 2 Or code = 3 Then
+                Return None
+            ElseIf code <> 0 Then
+                Fail("RegGetValueW(data)", code)
+            End If
+            If size < 2 Or size Mod 2 <> 0 Or size > capacity Or size > 1048576 Then
+                Throw New RuntimeException("Registry returned an invalid UTF-16 string size")
+            End If
+            If buffer.Item(size - 2) <> 0 Or buffer.Item(size - 1) <> 0 Then
+                Throw New RuntimeException("Registry returned an unterminated string")
+            End If
+            For i As Integer = 0 To size - 4 Step 2
+                If buffer.Item(i) = 0 And buffer.Item(i + 1) = 0 Then
+                    Throw New RuntimeException("Registry string contains an embedded NUL")
+                End If
+            Next
+            Dim exact As New Bytes(size - 2)
+            exact.Append(buffer.DataPtr(), size - 2)
+            Return Some(String.FromUTF16LE(exact))
+        Next
+        Throw New RuntimeException("Registry value changed size repeatedly while reading")
+    Finally
+        NativeClose(key)
+    End Try
+#Else
+    Return None
+#End If
+End Function
+
+''' Writes REG_SZ to an existing key; an empty name selects the default value.
+Public Sub WriteString(keyPath As String, name As String, value As String)
+    RequireWindows()
+    ValidatePath(keyPath, True)
+#If TargetWindows Then
+    Dim encoded As Bytes = Wide(keyPath)
+    Dim valueName As Bytes = Wide(name)
+    Dim data As Bytes = Wide(value)
+    Dim key As Ptr = Nil
+    Dim code As Integer = NativeOpen(CurrentUser(), encoded.DataPtr(), 0, 258, key)
+    If code <> 0 Then
+        Fail("RegOpenKeyExW", code)
+    End If
+    Try
+        code = NativeSet(key, valueName.DataPtr(), 0, 1, data.DataPtr(), data.Count)
+        If code <> 0 Then
+            Fail("RegSetValueExW", code)
+        End If
+    Finally
+        NativeClose(key)
+    End Try
+#End If
+End Sub
+
+''' Deletes one named/default value; returns False if the key or value is missing.
+Public Function DeleteValue(keyPath As String, name As String) As Boolean
+    RequireWindows()
+    ValidatePath(keyPath, True)
+#If TargetWindows Then
+    Dim encoded As Bytes = Wide(keyPath)
+    Dim valueName As Bytes = Wide(name)
+    Dim key As Ptr = Nil
+    Dim code As Integer = NativeOpen(CurrentUser(), encoded.DataPtr(), 0, 258, key)
+    If code = 2 Or code = 3 Then
+        Return False
+    ElseIf code <> 0 Then
+        Fail("RegOpenKeyExW", code)
+    End If
+    Try
+        code = NativeDeleteValue(key, valueName.DataPtr())
+        If code = 2 Then
+            Return False
+        ElseIf code <> 0 Then
+            Fail("RegDeleteValueW", code)
+        End If
+        Return True
+    Finally
+        NativeClose(key)
+    End Try
+#Else
+    Return False
+#End If
+End Function
+
+''' Nonrecursive deletion: removes a leaf key and its values, never child keys.
+Public Function DeleteLeafKey(keyPath As String) As Boolean
+    RequireWindows()
+    ValidatePath(keyPath, True)
+#If TargetWindows Then
+    Dim encoded As Bytes = Wide(keyPath)
+    Dim code As Integer = NativeDeleteKey(CurrentUser(), encoded.DataPtr(), 256, 0)
+    If code = 2 Or code = 3 Then
+        Return False
+    ElseIf code <> 0 Then
+        Fail("RegDeleteKeyExW", code)
+    End If
+    Return True
+#Else
+    Return False
+#End If
+End Function

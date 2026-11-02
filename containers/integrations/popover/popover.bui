@@ -1,0 +1,525 @@
+' Native arbitrary-content flyout; all calls belong on the GUI thread.
+Private Class PopoverReference
+    Public Property Owner As Weak NativePopover
+End Class
+Private Class PopoverRegistry
+    Public Shared Property Items As Array Of PopoverReference = []
+End Class
+
+Public Class NativePopover
+    Event Dismissed()
+    Private Property mContent As View
+    Private Property mOwner As Weak UIControl
+    Private Property mRoot As Ptr = Nil
+    Private Property mID As Integer = -1
+    Private Property mIsOpen As Boolean = False
+    Private Property mClosed As Boolean = False
+    Private Property mWidth As Integer
+    Private Property mHeight As Integer
+    Public Property LastNativeError As String = ""
+    #If TargetLinux Then
+        Private Property mClosedSignal As UInt64 = 0
+    #ElseIf TargetWindows Then
+        Private Property mStaging As Window
+        Private Property mHook As Ptr = Nil
+        Private Property mContentStyle As Int64 = 0
+    #ElseIf TargetMac Then
+        Private Property mController As Ptr = Nil
+    #End If
+
+    Public Sub Constructor(width As Integer = 280, height As Integer = 160)
+        Me.ValidateSize(width, height)
+        Me.mWidth = width
+        Me.mHeight = height
+        Me.mContent = New View()
+        Me.mContent.Move(0, 0, width, height)
+        #If TargetLinux Then
+            ' Buoy owns unparented views; sink its initial floating reference so
+            ' detaching the popover child preserves the View until Buoy frees it.
+            If PopoverFloating(Me.mContent.NativeWidget) <> 0 Then PopoverRefSink(Me.mContent.NativeWidget)
+        #End If
+    End Sub
+    Public Property Content As View
+        Get
+            Return Me.mContent
+        End Get
+    End Property
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mIsOpen
+        End Get
+    End Property
+    Public Property IsClosed As Boolean
+        Get
+            Return Me.mClosed
+        End Get
+    End Property
+    Public Property NativeHandle As Ptr
+        Get
+            Return Me.mRoot
+        End Get
+    End Property
+    Private Sub ValidateSize(width As Integer, height As Integer)
+        If width <= 0 Or height <= 0 Or width > 10000 Or height > 10000 Then Throw New InvalidArgumentException("Popover dimensions must be 1...10000 points")
+    End Sub
+    Public Sub Resize(width As Integer, height As Integer)
+        If Me.mClosed Then Throw New InvalidArgumentException("Popover is closed")
+        Me.ValidateSize(width, height)
+        Me.mWidth = width
+        Me.mHeight = height
+        Me.mContent.Move(0, 0, width, height)
+        If Me.mRoot <> Nil Then Me.ApplySize()
+    End Sub
+    ' The anchor rectangle is in the owner's local graphics points.
+    Public Sub Show(owner As UIControl, anchor As Rect)
+        If Me.mClosed Then Throw New InvalidArgumentException("Popover is closed")
+        If owner = Nil Or anchor = Nil Then Throw New InvalidArgumentException("Popover requires an owner and anchor")
+        If anchor.Left <> anchor.Left Or anchor.Top <> anchor.Top Or anchor.Width <> anchor.Width Or anchor.Height <> anchor.Height Then Throw New InvalidArgumentException("Invalid popover anchor")
+        If Math.Abs(anchor.Left) > 100000 Or Math.Abs(anchor.Top) > 100000 Or anchor.Width <= 0 Or anchor.Height <= 0 Or anchor.Width > 100000 Or anchor.Height > 100000 Then Throw New InvalidArgumentException("Invalid popover anchor")
+        If owner.NativeWidget = Nil Then Throw New InvalidArgumentException("Popover owner has no native widget")
+        If owner.NativeWidget = Me.mContent.NativeWidget Then Throw New InvalidArgumentException("Popover cannot anchor to its own content")
+        #If TargetLinux Then
+            If PopoverIsAncestor(owner.NativeWidget, Me.mContent.NativeWidget) <> 0 Then Throw New InvalidArgumentException("Popover cannot anchor inside its own content")
+            If Me.mRoot = Nil And PopoverParent(Me.mContent.NativeWidget) <> Nil Then Throw New InvalidArgumentException("Do not attach popover Content to another container")
+        #ElseIf TargetWindows Then
+            If Me.mContent.NativeWidget <> Nil Then
+                If PopoverIsChild(Me.mContent.NativeWidget, owner.NativeWidget) <> 0 Then Throw New InvalidArgumentException("Popover cannot anchor inside its own content")
+                If Me.mStaging = Nil Then Throw New InvalidArgumentException("Do not attach popover Content to another container")
+            End If
+        #ElseIf TargetMac Then
+            If PopoverDescendant(owner.NativeWidget, Me.mContent.NativeWidget) Then Throw New InvalidArgumentException("Popover cannot anchor inside its own content")
+            If Me.mRoot = Nil And PopoverSuperview(Me.mContent.NativeWidget) <> Nil Then Throw New InvalidArgumentException("Do not attach popover Content to another container")
+        #End If
+        If Not owner.Visible Or Not owner.Enabled Then Return
+        Me.Dismiss()
+        If Me.mClosed Then Return
+        Me.LastNativeError = ""
+        Me.mOwner = owner
+        Me.EnsureNative()
+        Me.ApplySize()
+        Try
+            #If TargetLinux Then
+                If PopoverRoot(owner.NativeWidget) = Nil Or PopoverMapped(owner.NativeWidget) = 0 Then Throw New InvalidArgumentException("Attach owner to a visible window before showing popover")
+                Dim parent As Ptr = PopoverParent(Me.mRoot)
+                If parent <> owner.NativeWidget Then
+                    If parent <> Nil Then PopoverUnparent(Me.mRoot)
+                    PopoverSetParent(Me.mRoot, owner.NativeWidget)
+                End If
+                Dim location As PopoverRectangle
+                location.X = Math.Round(anchor.Left)
+                location.Y = Math.Round(anchor.Top)
+                location.Width = Math.Max(1, Math.Round(anchor.Width))
+                location.Height = Math.Max(1, Math.Round(anchor.Height))
+                PopoverPointTo(Me.mRoot, location)
+                Me.mIsOpen = True
+                PopoverPopup(Me.mRoot)
+            #ElseIf TargetWindows Then
+                If PopoverIsWindow(owner.NativeWidget) = 0 Or PopoverVisible(owner.NativeWidget) = 0 Then Throw New InvalidArgumentException("Attach owner to a visible window before showing popover")
+                Dim topWindow As Ptr = PopoverAncestor(owner.NativeWidget, 2)
+                PopoverSetLong(Me.mRoot, -8, CType(topWindow, Integer)) ' GWLP_HWNDPARENT
+                Dim scale As Double = PopoverDPI(owner.NativeWidget) / 96.0
+                Dim location As PopoverPoint
+                location.X = anchor.Left * scale
+                location.Y = anchor.Bottom * scale
+                PopoverToScreen(owner.NativeWidget, location)
+                Dim width As Integer = Me.mWidth * scale
+                Dim height As Integer = Me.mHeight * scale
+                Dim work As PopoverWorkArea
+                work.Size = 40
+                If PopoverMonitorInfo(PopoverMonitor(owner.NativeWidget, 2), work) <> 0 Then
+                    Dim leftLimit As Integer = work.WorkLeft
+                    Dim rightLimit As Integer = work.WorkRight
+                    Dim topLimit As Integer = work.WorkTop
+                    Dim bottomLimit As Integer = work.WorkBottom
+                    If location.X + width + 2 > rightLimit Then location.X = Math.Max(leftLimit, rightLimit - width - 2)
+                    If location.Y + height + 2 > bottomLimit Then
+                        Dim above As Integer = location.Y - height - anchor.Height * scale
+                        location.Y = Math.Max(topLimit, above)
+                    End If
+                End If
+                PopoverMove(Me.mRoot, location.X, location.Y, width + 2, height + 2, 1)
+                PopoverMove(Me.mContent.NativeWidget, 0, 0, width, height, 1)
+                Me.mIsOpen = True
+                PopoverShow(Me.mRoot, 5)
+                PopoverForeground(Me.mRoot)
+                Dim first As Ptr = PopoverNextTab(Me.mRoot, Nil, 0)
+                If first <> Nil Then PopoverFocus(first)
+            #ElseIf TargetMac Then
+                Dim ownerWindow As Ptr = PopoverWindow(owner.NativeWidget)
+                If ownerWindow = Nil Then Throw New InvalidArgumentException("Attach owner before showing popover")
+                If Not PopoverMacVisible(ownerWindow) Or PopoverMacHidden(owner.NativeWidget) Then Throw New InvalidArgumentException("Popover owner must be visible")
+                Dim location As PopoverMacRect
+                location.X = anchor.Left
+                location.Y = anchor.Top
+                location.Width = anchor.Width
+                location.Height = anchor.Height
+                Me.mIsOpen = True
+                PopoverMacShow(Me.mRoot, location, owner.NativeWidget, 3)
+            #End If
+        Catch e As Exception
+            Me.mIsOpen = False
+            Me.LastNativeError = e.Message
+            Throw e
+        End Try
+    End Sub
+    Public Sub Dismiss()
+        If Not Me.mIsOpen Then Return
+        Me.mIsOpen = False
+        #If TargetLinux Then
+            PopoverPopdown(Me.mRoot)
+        #ElseIf TargetWindows Then
+            PopoverShow(Me.mRoot, 0)
+        #ElseIf TargetMac Then
+            PopoverMacClose(Me.mRoot)
+        #End If
+        Me.RestoreFocus()
+        RaiseEvent Dismissed()
+    End Sub
+    ' Terminal cleanup. Populate a new instance to use another content tree.
+    Public Sub Close()
+        If Me.mClosed Then Return
+        Me.mClosed = True
+        Me.mIsOpen = False
+        If Me.mID >= 0 Then PopoverRegistry.Items(Me.mID).Owner = Nil
+        #If TargetLinux Then
+            If Me.mRoot <> Nil Then
+                If Me.mClosedSignal <> 0 Then PopoverDisconnect(Me.mRoot, Me.mClosedSignal)
+                PopoverPopdown(Me.mRoot)
+                PopoverSetChild(Me.mRoot, Nil)
+                If PopoverParent(Me.mRoot) <> Nil Then PopoverUnparent(Me.mRoot)
+                PopoverUnref(Me.mRoot)
+            End If
+            Me.mClosedSignal = 0
+        #ElseIf TargetWindows Then
+            If Me.mHook <> Nil Then PopoverUnhook(Me.mHook)
+            Me.mHook = Nil
+            If Me.mRoot <> Nil Then
+                PopoverRemoveSubclass(Me.mRoot, AddressOf PopoverWindowsMessage, Me.mID + 1)
+                If Me.mContent <> Nil And Me.mStaging <> Nil Then
+                    If PopoverIsWindow(Me.mContent.NativeWidget) <> 0 Then
+                        PopoverSetParentWindow(Me.mContent.NativeWidget, Me.mStaging.NativeWidget)
+                        PopoverSetLong(Me.mContent.NativeWidget, -20, Me.mContentStyle)
+                    End If
+                End If
+                PopoverDestroy(Me.mRoot)
+            End If
+            If Me.mStaging <> Nil Then Me.mStaging.Close()
+            Me.mStaging = Nil
+        #ElseIf TargetMac Then
+            If Me.mRoot <> Nil Then
+                PopoverMacDelegate(Me.mRoot, Nil)
+                PopoverMacClose(Me.mRoot)
+                PopoverMacContent(Me.mRoot, Nil)
+                PopoverMacRelease(Me.mRoot)
+            End If
+            If Me.mController <> Nil Then PopoverMacRelease(Me.mController)
+            Me.mController = Nil
+        #End If
+        Me.mRoot = Nil
+        Me.mID = -1
+        Me.mOwner = Nil
+        Me.mContent = Nil
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+    Private Sub RestoreFocus()
+        Dim owner As UIControl = Me.mOwner
+        If owner = Nil Then Return
+        Dim widget As Ptr = owner.NativeWidget
+        If widget = Nil Then Return
+        #If TargetLinux Then
+            If PopoverRoot(widget) <> Nil Then PopoverGrabFocus(widget)
+        #ElseIf TargetWindows Then
+            If PopoverIsWindow(widget) <> 0 Then PopoverFocus(widget)
+        #ElseIf TargetMac Then
+            Dim window As Ptr = PopoverWindow(widget)
+            If window <> Nil Then PopoverFirstResponder(window, widget)
+        #End If
+    End Sub
+    Private Sub EnsureNative()
+        If Me.mRoot <> Nil Then Return
+        For i As Integer = 0 To Array.LastIndex(PopoverRegistry.Items)
+            If PopoverRegistry.Items(i).Owner = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(PopoverRegistry.Items)
+            Array.Append(PopoverRegistry.Items, New PopoverReference())
+        End If
+        PopoverRegistry.Items(Me.mID).Owner = Me
+        Try
+            #If TargetLinux Then
+                Me.mRoot = PopoverNew()
+                PopoverRefSink(Me.mRoot)
+                PopoverSetChild(Me.mRoot, Me.mContent.NativeWidget)
+                PopoverAutohide(Me.mRoot, 1)
+                PopoverPosition(Me.mRoot, 3) ' GTK_POS_BOTTOM
+                Me.mClosedSignal = PopoverConnect(Me.mRoot, "closed", AddressOf PopoverLinuxClosed, CType(Me.mID + 1, Ptr), Nil, 0)
+            #ElseIf TargetWindows Then
+                Me.mStaging = New Window()
+                Me.mStaging.Move(0, 0, Me.mWidth, Me.mHeight)
+                Me.mStaging.AddSubview(Me.mContent)
+                Dim cls As Bytes = PopoverUTF16("STATIC")
+                ' WS_EX_TOOLWINDOW | WS_EX_CONTROLPARENT; WS_POPUP | WS_BORDER | WS_CLIPCHILDREN
+                Me.mRoot = PopoverCreate(65664, cls.DataPtr(), Nil, 2189426688, 0, 0, 1, 1, Nil, Nil, Nil, Nil)
+                If Me.mRoot = Nil Then Throw New RuntimeException("Could not create native flyout window")
+                Me.mContentStyle = PopoverGetLong(Me.mContent.NativeWidget, -20)
+                PopoverSetLong(Me.mContent.NativeWidget, -20, Me.mContentStyle Or 65536)
+                PopoverSetParentWindow(Me.mContent.NativeWidget, Me.mRoot)
+                If PopoverSubclass(Me.mRoot, AddressOf PopoverWindowsMessage, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind native flyout")
+                Me.mHook = PopoverHook(3, AddressOf PopoverWindowsKeys, Nil, PopoverThread())
+                If Me.mHook = Nil Then Throw New RuntimeException("Could not bind flyout keyboard")
+            #ElseIf TargetMac Then
+                Me.mRoot = PopoverMacInit(PopoverMacAlloc(PopoverMacClass()))
+                Me.mController = PopoverMacInit(PopoverMacAlloc(PopoverGetClass("NSViewController")))
+                PopoverControllerView(Me.mController, Me.mContent.NativeWidget)
+                PopoverMacContent(Me.mRoot, Me.mController)
+                PopoverMacBehavior(Me.mRoot, 1) ' NSPopoverBehaviorTransient
+                PopoverMacAnimates(Me.mRoot, False)
+                PopoverMacDelegate(Me.mRoot, Me.mRoot)
+            #End If
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Private Sub ApplySize()
+        #If TargetLinux Then
+            PopoverSize(Me.mContent.NativeWidget, Me.mWidth, Me.mHeight)
+        #ElseIf TargetWindows Then
+            Dim scale As Double = PopoverDPI(Me.mRoot) / 96.0
+            Dim width As Integer = Me.mWidth * scale
+            Dim height As Integer = Me.mHeight * scale
+            PopoverMove(Me.mContent.NativeWidget, 0, 0, width, height, 1)
+            PopoverSetPosition(Me.mRoot, Nil, 0, 0, width + 2, height + 2, 22)
+        #ElseIf TargetMac Then
+            Dim size As PopoverMacSize
+            size.Width = Me.mWidth
+            size.Height = Me.mHeight
+            PopoverMacSizeSet(Me.mRoot, size)
+        #End If
+    End Sub
+    ' Native callbacks contain user exceptions before returning to the OS.
+    Public Sub NativeDismissed(widget As Ptr)
+        If widget <> Me.mRoot Or Not Me.mIsOpen Then Return
+        Me.mIsOpen = False
+        #If TargetWindows Then
+            PopoverShow(Me.mRoot, 0)
+        #End If
+        Try
+            RaiseEvent Dismissed()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    Public Sub NativeEscape()
+        Try
+            Me.Dismiss()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+End Class
+
+Private Function PopoverFind(data As Ptr) As NativePopover
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(PopoverRegistry.Items) Then Return Nil
+    Return PopoverRegistry.Items(index).Owner
+End Function
+
+#If TargetLinux Then
+Sequential Structure PopoverRectangle
+    X As Int32
+    Y As Int32
+    Width As Int32
+    Height As Int32
+End Structure
+Delegate Sub PopoverLinuxClosedCallback(widget As Ptr, data As Ptr)
+Private Optional Declare Function PopoverNew Lib "libgtk-4.so.1" Alias "gtk_popover_new" () As Ptr
+Private Optional Declare Function PopoverRefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (widget As Ptr) As Ptr
+Private Optional Declare Function PopoverFloating Lib "libgobject-2.0.so.0" Alias "g_object_is_floating" (widget As Ptr) As Int32
+Private Optional Declare Sub PopoverUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (widget As Ptr)
+Private Optional Declare Sub PopoverSetChild Lib "libgtk-4.so.1" Alias "gtk_popover_set_child" (widget As Ptr, child As Ptr)
+Private Optional Declare Sub PopoverAutohide Lib "libgtk-4.so.1" Alias "gtk_popover_set_autohide" (widget As Ptr, enabled As Int32)
+Private Optional Declare Sub PopoverPosition Lib "libgtk-4.so.1" Alias "gtk_popover_set_position" (widget As Ptr, position As Int32)
+Private Optional Declare Sub PopoverSetParent Lib "libgtk-4.so.1" Alias "gtk_widget_set_parent" (widget As Ptr, parent As Ptr)
+Private Optional Declare Function PopoverIsAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_is_ancestor" (widget As Ptr, ancestor As Ptr) As Int32
+Private Optional Declare Function PopoverParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Sub PopoverUnparent Lib "libgtk-4.so.1" Alias "gtk_widget_unparent" (widget As Ptr)
+Private Optional Declare Function PopoverMapped Lib "libgtk-4.so.1" Alias "gtk_widget_get_mapped" (widget As Ptr) As Int32
+Private Optional Declare Function PopoverRoot Lib "libgtk-4.so.1" Alias "gtk_widget_get_root" (widget As Ptr) As Ptr
+Private Optional Declare Sub PopoverPointTo Lib "libgtk-4.so.1" Alias "gtk_popover_set_pointing_to" (widget As Ptr, ByRef location As PopoverRectangle)
+Private Optional Declare Sub PopoverPopup Lib "libgtk-4.so.1" Alias "gtk_popover_popup" (widget As Ptr)
+Private Optional Declare Sub PopoverPopdown Lib "libgtk-4.so.1" Alias "gtk_popover_popdown" (widget As Ptr)
+Private Optional Declare Sub PopoverSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Function PopoverGrabFocus Lib "libgtk-4.so.1" Alias "gtk_widget_grab_focus" (widget As Ptr) As Int32
+Private Optional Declare Function PopoverConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (widget As Ptr, signal As String, callback As PopoverLinuxClosedCallback, data As Ptr, destroy As Ptr, nativeFlags As Int32) As UInt64
+Private Optional Declare Sub PopoverDisconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (widget As Ptr, signal As UInt64)
+Private Sub PopoverLinuxClosed(widget As Ptr, data As Ptr)
+    Dim owner As NativePopover = PopoverFind(data)
+    If owner <> Nil Then owner.NativeDismissed(widget)
+End Sub
+#ElseIf TargetWindows Then
+Sequential Structure PopoverPoint
+    X As Int32
+    Y As Int32
+End Structure
+Sequential Structure PopoverWorkArea
+    Size As UInt32
+    MonitorLeft As Int32
+    MonitorTop As Int32
+    MonitorRight As Int32
+    MonitorBottom As Int32
+    WorkLeft As Int32
+    WorkTop As Int32
+    WorkRight As Int32
+    WorkBottom As Int32
+    NativeFlags As UInt32
+End Structure
+Sequential Structure PopoverMessage
+    Window As Ptr
+    Message As UInt32
+    Word As UInt64
+    Param As Int64
+    Time As UInt32
+    X As Int32
+    Y As Int32
+    PrivateData As UInt32
+End Structure
+Delegate Function PopoverWindowCallback(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+Delegate Function PopoverHookCallback(code As Int32, word As UInt64, param As Ptr) As Int64
+Private Optional Declare Function PopoverCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, data As Ptr) As Ptr
+Private Optional Declare Function PopoverDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Optional Declare Function PopoverSetParentWindow Lib "user32" Alias "SetParent" (widget As Ptr, parent As Ptr) As Ptr
+Private Optional Declare Function PopoverVisible Lib "user32" Alias "IsWindowVisible" (widget As Ptr) As Int32
+Private Optional Declare Function PopoverIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function PopoverAncestor Lib "user32" Alias "GetAncestor" (widget As Ptr, kind As UInt32) As Ptr
+Private Optional Declare Function PopoverIsChild Lib "user32" Alias "IsChild" (parent As Ptr, child As Ptr) As Int32
+Private Optional Declare Function PopoverParentWindow Lib "user32" Alias "GetParent" (widget As Ptr) As Ptr
+Private Optional Declare Function PopoverSetLong Lib "user32" Alias "SetWindowLongPtrW" (widget As Ptr, index As Int32, value As Int64) As Int64
+Private Optional Declare Function PopoverGetLong Lib "user32" Alias "GetWindowLongPtrW" (widget As Ptr, index As Int32) As Int64
+Private Optional Declare Function PopoverDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function PopoverToScreen Lib "user32" Alias "ClientToScreen" (widget As Ptr, ByRef location As PopoverPoint) As Int32
+Private Optional Declare Function PopoverMonitor Lib "user32" Alias "MonitorFromWindow" (widget As Ptr, nativeFlags As UInt32) As Ptr
+Private Optional Declare Function PopoverMonitorInfo Lib "user32" Alias "GetMonitorInfoW" (monitor As Ptr, ByRef info As PopoverWorkArea) As Int32
+Private Optional Declare Function PopoverMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, repaint As Int32) As Int32
+Private Optional Declare Function PopoverSetPosition Lib "user32" Alias "SetWindowPos" (widget As Ptr, after As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, nativeFlags As UInt32) As Int32
+Private Optional Declare Function PopoverShow Lib "user32" Alias "ShowWindow" (widget As Ptr, command As Int32) As Int32
+Private Optional Declare Function PopoverForeground Lib "user32" Alias "SetForegroundWindow" (widget As Ptr) As Int32
+Private Optional Declare Function PopoverFocus Lib "user32" Alias "SetFocus" (widget As Ptr) As Ptr
+Private Optional Declare Function PopoverNextTab Lib "user32" Alias "GetNextDlgTabItem" (widget As Ptr, current As Ptr, previous As Int32) As Ptr
+Private Optional Declare Function PopoverDialogMessage Lib "user32" Alias "IsDialogMessageW" (widget As Ptr, message As Ptr) As Int32
+Private Optional Declare Function PopoverSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function PopoverSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As PopoverWindowCallback, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function PopoverRemoveSubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As PopoverWindowCallback, id As UInt64) As Int32
+Private Optional Declare Function PopoverDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function PopoverHook Lib "user32" Alias "SetWindowsHookExW" (kind As Int32, callback As PopoverHookCallback, libraryHandle As Ptr, threadID As UInt32) As Ptr
+Private Optional Declare Function PopoverUnhook Lib "user32" Alias "UnhookWindowsHookEx" (hook As Ptr) As Int32
+Private Optional Declare Function PopoverNextHook Lib "user32" Alias "CallNextHookEx" (hook As Ptr, code As Int32, word As UInt64, param As Ptr) As Int64
+Private Optional Declare Function PopoverThread Lib "kernel32" Alias "GetCurrentThreadId" () As UInt32
+Private Optional Declare Sub PopoverCopy Lib "kernel32" Alias "RtlMoveMemory" (destination As Ptr, source As Ptr, count As UInt64)
+Private Function PopoverUTF16(value As String) As Bytes
+    Dim buffer As Bytes = value.AsUTF16LE()
+    buffer.Append(0)
+    buffer.Append(0)
+    Return buffer
+End Function
+Private Function PopoverWindowsMessage(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    Dim callbackID As Integer = id
+    Dim owner As NativePopover = PopoverFind(CType(callbackID, Ptr))
+    If owner <> Nil Then
+        If message = 6 And (word And 65535) = 0 Then owner.NativeDismissed(widget) ' WM_ACTIVATE / WA_INACTIVE
+        If message = 16 Then
+            owner.NativeEscape()
+            Return 0
+        End If
+        If message = 273 And param <> 0 Then
+            Dim address As Integer = param
+            Dim parent As Ptr = PopoverParentWindow(CType(address, Ptr))
+            If parent <> Nil And parent <> widget Then Return PopoverSend(parent, message, word, param)
+        End If
+    End If
+    Return PopoverDefault(widget, message, word, param)
+End Function
+Private Function PopoverWindowsKeys(code As Int32, word As UInt64, param As Ptr) As Int64
+    If code >= 0 And word = 1 And param <> Nil Then
+        Dim message As PopoverMessage
+        PopoverCopy(CType(message, Ptr), param, 48)
+        If message.Message = 256 Then
+            For Each reference As PopoverReference In PopoverRegistry.Items
+                Dim owner As NativePopover = reference.Owner
+                If owner = Nil Then Continue For
+                If Not owner.IsOpen Then Continue For
+                If PopoverAncestor(message.Window, 2) <> owner.NativeHandle Then Continue For
+                Dim handled As Boolean = False
+                If message.Word = 27 Then
+                    owner.NativeEscape()
+                    handled = True
+                ElseIf message.Word = 9 Or message.Word = 13 Then
+                    handled = PopoverDialogMessage(owner.NativeHandle, param) <> 0
+                End If
+                If handled Then
+                    message.Message = 0
+                    PopoverCopy(param, CType(message, Ptr), 48)
+                    Exit For
+                End If
+            Next
+        End If
+    End If
+    Return PopoverNextHook(Nil, code, word, param)
+End Function
+#ElseIf TargetMac Then
+Sequential Structure PopoverMacRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Sequential Structure PopoverMacSize
+    Width As Double
+    Height As Double
+End Structure
+Delegate Sub PopoverMacClosedCallback(receiver As Ptr, methodSelector As Ptr, notification As Ptr)
+Private Declare Function PopoverGetClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function PopoverAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Function PopoverAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, callback As Ptr, encoding As String) As UInt8
+Private Declare Function PopoverSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Sub PopoverRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function PopoverMacAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function PopoverMacInit Lib "AppKit" Selector "init" (widget As Ptr) As Ptr
+Private Declare Sub PopoverMacRelease Lib "AppKit" Selector "release" (widget As Ptr)
+Private Declare Sub PopoverControllerView Lib "AppKit" Selector "setView:" (controller As Ptr, widget As Ptr)
+Private Declare Sub PopoverMacContent Lib "AppKit" Selector "setContentViewController:" (widget As Ptr, controller As Ptr)
+Private Declare Sub PopoverMacBehavior Lib "AppKit" Selector "setBehavior:" (widget As Ptr, behavior As Integer)
+Private Declare Sub PopoverMacAnimates Lib "AppKit" Selector "setAnimates:" (widget As Ptr, animates As Boolean)
+Private Declare Sub PopoverMacDelegate Lib "AppKit" Selector "setDelegate:" (widget As Ptr, delegateObject As Ptr)
+Private Declare Sub PopoverMacSizeSet Lib "AppKit" Selector "setContentSize:" (widget As Ptr, size As PopoverMacSize)
+Private Declare Sub PopoverMacShow Lib "AppKit" Selector "showRelativeToRect:ofView:preferredEdge:" (widget As Ptr, location As PopoverMacRect, anchor As Ptr, edge As Integer)
+Private Declare Sub PopoverMacClose Lib "AppKit" Selector "close" (widget As Ptr)
+Private Declare Function PopoverDescendant Lib "AppKit" Selector "isDescendantOf:" (widget As Ptr, ancestor As Ptr) As Boolean
+Private Declare Function PopoverSuperview Lib "AppKit" Selector "superview" (widget As Ptr) As Ptr
+Private Declare Function PopoverMacVisible Lib "AppKit" Selector "isVisible" (window As Ptr) As Boolean
+Private Declare Function PopoverMacHidden Lib "AppKit" Selector "isHiddenOrHasHiddenAncestor" (widget As Ptr) As Boolean
+Private Declare Function PopoverWindow Lib "AppKit" Selector "window" (widget As Ptr) As Ptr
+Private Declare Function PopoverFirstResponder Lib "AppKit" Selector "makeFirstResponder:" (window As Ptr, widget As Ptr) As Boolean
+Private Function PopoverMacClass() As Ptr
+    Dim cls As Ptr = PopoverGetClass("BuoyNativePopover")
+    If cls <> Nil Then Return cls
+    cls = PopoverAllocateClass(PopoverGetClass("NSPopover"), "BuoyNativePopover", 0)
+    If cls = Nil Then Throw New RuntimeException("Could not allocate native popover class")
+    Dim callback As PopoverMacClosedCallback = AddressOf PopoverMacClosed
+    If PopoverAddMethod(cls, PopoverSelector("popoverDidClose:"), CType(callback, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not bind native popover dismissal")
+    PopoverRegisterClass(cls)
+    Return cls
+End Function
+Private Sub PopoverMacClosed(receiver As Ptr, methodSelector As Ptr, notification As Ptr)
+    For Each reference As PopoverReference In PopoverRegistry.Items
+        Dim owner As NativePopover = reference.Owner
+        If owner <> Nil Then owner.NativeDismissed(receiver)
+    Next
+End Sub
+#End If

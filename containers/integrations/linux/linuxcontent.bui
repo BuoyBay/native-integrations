@@ -1,0 +1,150 @@
+' Headless Linux content-type and icon metadata using GLib/GIO >= 2.34.
+
+Public Class ContentGuess
+    Public Property ContentType As String
+    Public Property IsUncertain As Boolean
+End Class
+
+#If TargetLinux Then
+Private Optional Declare Function NativeGuess Lib "libgio-2.0.so.0" Alias "g_content_type_guess" (filename As CString, data As Ptr, size As UInt64, ByRef uncertain As Int32) As CString
+Private Optional Declare Function NativeMime Lib "libgio-2.0.so.0" Alias "g_content_type_get_mime_type" (contentType As CString) As CString
+Private Optional Declare Function NativeFromMime Lib "libgio-2.0.so.0" Alias "g_content_type_from_mime_type" (mimeType As CString) As CString
+Private Optional Declare Function NativeDescription Lib "libgio-2.0.so.0" Alias "g_content_type_get_description" (contentType As CString) As CString
+Private Optional Declare Function NativeGenericIcon Lib "libgio-2.0.so.0" Alias "g_content_type_get_generic_icon_name" (contentType As CString) As CString
+Private Optional Declare Function NativeIcon Lib "libgio-2.0.so.0" Alias "g_content_type_get_icon" (contentType As CString) As Ptr
+Private Optional Declare Function NativeIconString Lib "libgio-2.0.so.0" Alias "g_icon_to_string" (icon As Ptr) As CString
+Private Optional Declare Sub NativeFree Lib "libglib-2.0.so.0" Alias "g_free" (text As Ptr)
+Private Optional Declare Sub NativeUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+
+Private Function CopyOwned(text As CString) As String
+    If text = Nil Then
+        Throw New RuntimeException("GIO returned no content-type text")
+    End If
+    Try
+        Return CType(text, String)
+    Finally
+        NativeFree(text)
+    End Try
+End Function
+
+Private Function CopyOptional(text As CString) As Optional Of String
+    If text = Nil Then
+        Return None
+    End If
+    Try
+        Return Some(CType(text, String))
+    Finally
+        NativeFree(text)
+    End Try
+End Function
+#End If
+
+Private Sub RequireLinux()
+    #If Not TargetLinux Then
+        Throw New UnsupportedOperationException("linuxcontent requires Linux")
+    #End If
+End Sub
+
+Private Sub ValidateText(value As String)
+    If value = "" Then
+        Throw New InvalidArgumentException("Content-type input must be nonempty and contain no NUL")
+    End If
+    ' Chr(0) is an empty String in Buoy 0.72.0; scan bytes instead.
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Content-type input must contain no NUL")
+        End If
+    Next
+End Sub
+
+Public Function IsSupported() As Boolean
+    #If TargetLinux Then
+        Return True
+    #Else
+        Return False
+    #End If
+End Function
+
+Public Function IsAvailable() As Boolean
+    #If TargetLinux Then
+        Return System.IsLibraryAvailable("libgio-2.0.so.0") And System.IsLibraryAvailable("libglib-2.0.so.0") And System.IsLibraryAvailable("libgobject-2.0.so.0")
+    #Else
+        Return False
+    #End If
+End Function
+
+''' Guess using the filename only. Does not open or read the named file.
+Public Function GuessFilename(filename As String) As ContentGuess
+    RequireLinux()
+    ValidateText(filename)
+    #If TargetLinux Then
+        Dim uncertain As Int32 = 0
+        Dim guessed As String = CopyOwned(NativeGuess(CType(filename, CString), Nil, 0, uncertain))
+        Dim info As New ContentGuess()
+        info.ContentType = guessed
+        info.IsUncertain = uncertain <> 0
+        Return info
+    #Else
+        Return Nil
+    #End If
+End Function
+
+Public Function MimeType(contentType As String) As Optional Of String
+    RequireLinux()
+    ValidateText(contentType)
+    #If TargetLinux Then
+        Return CopyOptional(NativeMime(CType(contentType, CString)))
+    #Else
+        Return None
+    #End If
+End Function
+
+Public Function FromMimeType(mimeType As String) As Optional Of String
+    RequireLinux()
+    ValidateText(mimeType)
+    #If TargetLinux Then
+        Return CopyOptional(NativeFromMime(CType(mimeType, CString)))
+    #Else
+        Return None
+    #End If
+End Function
+
+Public Function Description(contentType As String) As String
+    RequireLinux()
+    ValidateText(contentType)
+    #If TargetLinux Then
+        Return CopyOwned(NativeDescription(CType(contentType, CString)))
+    #Else
+        Return ""
+    #End If
+End Function
+
+Public Function GenericIconName(contentType As String) As Optional Of String
+    RequireLinux()
+    ValidateText(contentType)
+    #If TargetLinux Then
+        Return CopyOptional(NativeGenericIcon(CType(contentType, CString)))
+    #Else
+        Return None
+    #End If
+End Function
+
+''' Serialized GIcon metadata, not an image path or a rendered bitmap.
+Public Function IconString(contentType As String) As Optional Of String
+    RequireLinux()
+    ValidateText(contentType)
+    #If TargetLinux Then
+        Dim icon As Ptr = NativeIcon(CType(contentType, CString))
+        If icon = Nil Then
+            Return None
+        End If
+        Try
+            Return CopyOptional(NativeIconString(icon))
+        Finally
+            NativeUnref(icon)
+        End Try
+    #Else
+        Return None
+    #End If
+End Function

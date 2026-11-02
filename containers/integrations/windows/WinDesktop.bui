@@ -1,0 +1,174 @@
+' Native out-of-context WinEvents; one monitor per process, on one owning thread.
+Public Class DesktopEvent
+    Public Property EventId As Integer
+    Public Property WindowHandle As Ptr
+    Public Property ObjectId As Integer
+    Public Property ChildId As Integer
+    Public Property SourceThreadId As Integer
+    Public Property EventTimeMilliseconds As Integer
+End Class
+
+Private Class EventState
+    Public Shared Property HookHandle As Ptr
+    Public Shared Property Events As Array Of DesktopEvent = []
+    Public Shared Property Capacity As Integer = 256
+    Public Shared Property Dropped As Integer = 0
+End Class
+
+#If TargetWindows Then
+Delegate Sub NativeEventCallback(hookHandle As Ptr, eventId As UInt32, windowHandle As Ptr, objectId As Int32, childId As Int32, sourceThread As UInt32, eventTime As UInt32)
+
+' MSG is 48 bytes on Windows x64 and ARM64, including natural alignment.
+Sequential Structure NativeMessage
+    WindowHandle As Ptr
+    MessageId As UInt32
+    WordParameter As UInt64
+    LongParameter As Int64
+    Time As UInt32
+    PointX As Int32
+    PointY As Int32
+    PrivateValue As UInt32
+End Structure
+
+Private Optional Declare Function InstallHook Lib "user32" Alias "SetWinEventHook" (firstEvent As UInt32, lastEvent As UInt32, moduleHandle As Ptr, callback As NativeEventCallback, processId As UInt32, threadId As UInt32, options As UInt32) As Ptr
+Private Optional Declare Function RemoveHook Lib "user32" Alias "UnhookWinEvent" (hookHandle As Ptr) As Int32
+Private Optional Declare Function CurrentThread Lib "kernel32" Alias "GetCurrentThreadId" () As UInt32
+Private Optional Declare Function PeekNativeMessage Lib "user32" Alias "PeekMessageW" (ByRef message As NativeMessage, windowHandle As Ptr, firstMessage As UInt32, lastMessage As UInt32, options As UInt32) As Int32
+Private Optional Declare Function TranslateNativeMessage Lib "user32" Alias "TranslateMessage" (ByRef message As NativeMessage) As Int32
+Private Optional Declare Function DispatchNativeMessage Lib "user32" Alias "DispatchMessageW" (ByRef message As NativeMessage) As Int64
+Private Optional Declare Sub RepostQuit Lib "user32" Alias "PostQuitMessage" (exitCode As Int32)
+
+Private Sub ReceiveEvent(hookHandle As Ptr, eventId As UInt32, windowHandle As Ptr, objectId As Int32, childId As Int32, sourceThread As UInt32, eventTime As UInt32)
+    ' Never unwind a Buoy exception through the native callback boundary.
+    Try
+        If hookHandle <> EventState.HookHandle Or hookHandle = Nil Then
+            Exit Sub
+        End If
+        If Array.Count(EventState.Events) >= EventState.Capacity Then
+            EventState.Dropped += 1
+            Exit Sub
+        End If
+        Dim entry As New DesktopEvent
+        entry.EventId = eventId
+        entry.WindowHandle = windowHandle
+        entry.ObjectId = objectId
+        entry.ChildId = childId
+        entry.SourceThreadId = sourceThread
+        entry.EventTimeMilliseconds = eventTime
+        Array.Append(EventState.Events, entry)
+    Catch e As Exception
+        EventState.Dropped += 1
+    End Try
+End Sub
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Public Class DesktopMonitor
+    Private Property NativeHandle As Ptr
+    Private Property OwnerThread As Integer
+
+    ''' Default watches EVENT_SYSTEM_FOREGROUND on the current desktop.
+    Public Sub Constructor(firstEvent As Integer = 3, lastEvent As Integer = 3, processId As Integer = 0, capacity As Integer = 256)
+#If TargetWindows Then
+        If firstEvent < 1 Or lastEvent < firstEvent Or lastEvent > 2147483647 Then
+            Throw New InvalidArgumentException("WinEvent range must be ordered within 1..2147483647")
+        End If
+        If processId < 0 Or processId > 4294967295 Or capacity < 1 Or capacity > 65536 Then
+            Throw New InvalidArgumentException("Invalid process ID or queue capacity")
+        End If
+        If EventState.HookHandle <> Nil Then
+            Throw New InvalidArgumentException("Only one DesktopMonitor may be open per process")
+        End If
+        Me.OwnerThread = CurrentThread()
+        EventState.Events = []
+        EventState.Dropped = 0
+        EventState.Capacity = capacity
+        Me.NativeHandle = InstallHook(firstEvent, lastEvent, Nil, AddressOf ReceiveEvent, processId, 0, 0)
+        If Me.NativeHandle = Nil Then
+            ' SetWinEventHook does not document a GetLastError contract.
+            Throw New RuntimeException("SetWinEventHook failed")
+        End If
+        EventState.HookHandle = Me.NativeHandle
+#Else
+        Throw New UnsupportedOperationException("WinDesktop requires Windows")
+#End If
+    End Sub
+
+    Private Sub CheckOwner()
+#If TargetWindows Then
+        If Me.NativeHandle = Nil Then
+            Throw New InvalidArgumentException("DesktopMonitor is closed")
+        End If
+        If Me.OwnerThread <> CurrentThread() Then
+            Throw New InvalidArgumentException("DesktopMonitor must be used on its creating thread")
+        End If
+#Else
+        Throw New UnsupportedOperationException("WinDesktop requires Windows")
+#End If
+    End Sub
+
+    ''' For console loops. GUI applications may use their existing message loop.
+    Public Sub Pump(maxMessages As Integer = 64)
+        Me.CheckOwner()
+        If maxMessages < 1 Or maxMessages > 65536 Then
+            Throw New InvalidArgumentException("Message limit must be within 1..65536")
+        End If
+#If TargetWindows Then
+        For i As Integer = 1 To maxMessages
+            Dim message As NativeMessage
+            If PeekNativeMessage(message, Nil, 0, 0, 1) = 0 Then
+                Exit For
+            End If
+            If message.MessageId = 18 Then
+                RepostQuit(message.WordParameter)
+                Exit For
+            End If
+            TranslateNativeMessage(message)
+            DispatchNativeMessage(message)
+        Next
+#End If
+    End Sub
+
+    Public Function DrainEvents() As Array Of DesktopEvent
+        Me.CheckOwner()
+        Dim drained As Array Of DesktopEvent = EventState.Events
+        EventState.Events = []
+        Return drained
+    End Function
+
+    Public Function DroppedEventCount() As Integer
+        Me.CheckOwner()
+        Return EventState.Dropped
+    End Function
+
+    Public Sub Close()
+#If TargetWindows Then
+        If Me.NativeHandle = Nil Then
+            Exit Sub
+        End If
+        Me.CheckOwner()
+        If RemoveHook(Me.NativeHandle) = 0 Then
+            Throw New RuntimeException("UnhookWinEvent failed")
+        End If
+        EventState.HookHandle = Nil
+        EventState.Events = []
+        Me.NativeHandle = Nil
+#End If
+    End Sub
+
+    Public Sub Destructor()
+        ' Explicit Close is required; destruction on another thread cannot unhook.
+        Try
+            Me.Close()
+        Catch e As Exception
+            ' Native callback has static storage, so it cannot call a dead instance.
+        End Try
+    End Sub
+End Class

@@ -1,0 +1,172 @@
+' Native read-only filesystem helpers for 64-bit glibc Linux.
+Public Class FileSystemSpace
+    Public Property BlockSizeBytes As UInt64
+    Public Property FragmentSizeBytes As UInt64
+    Public Property TotalBlocks As UInt64
+    Public Property FreeBlocks As UInt64
+    Public Property AvailableBlocks As UInt64
+    Public Property TotalBytes As UInt64
+    Public Property FreeBytes As UInt64
+    Public Property AvailableBytes As UInt64
+    Public Property TotalInodes As UInt64
+    Public Property FreeInodes As UInt64
+    Public Property AvailableInodes As UInt64
+    Public Property FileSystemId As UInt64
+    Public Property MountFlags As UInt64
+    Public Property MaximumNameBytes As UInt64
+End Class
+
+#If TargetLinux Then
+' glibc LP64 statvfs: 11 unsigned long fields followed by 24 reserved bytes.
+' New glibc calls the first reserved word f_type; old releases reserve all six.
+Sequential Structure NativeStatvfs
+    BlockSize As UInt64
+    FragmentSize As UInt64
+    Blocks As UInt64
+    FreeBlocks As UInt64
+    AvailableBlocks As UInt64
+    Files As UInt64
+    FreeFiles As UInt64
+    AvailableFiles As UInt64
+    FileSystemId As UInt64
+    Flags As UInt64
+    NameMaximum As UInt64
+    Reserved0 As UInt32
+    Reserved1 As UInt32
+    Reserved2 As UInt32
+    Reserved3 As UInt32
+    Reserved4 As UInt32
+    Reserved5 As UInt32
+End Structure
+
+Private Optional Declare Function NativeSpace Lib "c" Alias "statvfs" (filePath As CString, ByRef info As NativeStatvfs) As Int32
+Private Optional Declare Function NativeReadLink Lib "c" Alias "readlink" (filePath As CString, buffer As Ptr, capacity As UInt64) As Int64
+Private Optional Declare Function NativeRealPath Lib "c" Alias "realpath" (filePath As CString, buffer As Ptr) As Ptr
+Private Optional Declare Sub NativeFree Lib "c" Alias "free" (buffer As Ptr)
+Private Optional Declare Function NativeErrno Lib "c" Alias "__errno_location" () As Ptr
+Private Optional Declare Function NativeCopyError Lib "c" Alias "memcpy" (ByRef value As Int32, source As Ptr, count As UInt64) As Ptr
+
+Private Function ErrorValue(address As Ptr) As Integer
+    Dim value As Int32 = 0
+    NativeCopyError(value, address, 4)
+    Return value
+End Function
+
+Private Function PrepareError() As Ptr
+    Dim address As Ptr = NativeErrno()
+    ' Resolve memcpy before the failing call, so its loader cannot affect errno.
+    ErrorValue(address)
+    Return address
+End Function
+
+Private Sub Fail(operation As String, address As Ptr)
+    Dim code As Integer = ErrorValue(address)
+    Throw New RuntimeException(operation + " failed (errno " + Str(code) + ")", code)
+End Sub
+#End If
+
+Private Sub RequireLinux()
+#If Not TargetLinux Then
+    Throw New UnsupportedOperationException("linuxfilesystem requires Linux")
+#End If
+End Sub
+
+Private Sub ValidatePath(filePath As String)
+    If filePath = "" Then
+        Throw New InvalidArgumentException("Path must be nonempty")
+    End If
+    Dim encoded As Bytes = Bytes.FromString(filePath, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Path cannot contain NUL")
+        End If
+    Next
+End Sub
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Query the filesystem containing an existing filePath, following symbolic links.
+Public Function ReadSpace(filePath As String) As FileSystemSpace
+    RequireLinux()
+    ValidatePath(filePath)
+#If TargetLinux Then
+    Dim address As Ptr = PrepareError()
+    Dim info As NativeStatvfs
+    If NativeSpace(CType(filePath, CString), info) <> 0 Then
+        Fail("statvfs", address)
+    End If
+    Dim snapshot As New FileSystemSpace
+    snapshot.BlockSizeBytes = info.BlockSize
+    snapshot.FragmentSizeBytes = info.FragmentSize
+    snapshot.TotalBlocks = info.Blocks
+    snapshot.FreeBlocks = info.FreeBlocks
+    snapshot.AvailableBlocks = info.AvailableBlocks
+    snapshot.TotalBytes = info.Blocks * info.FragmentSize
+    snapshot.FreeBytes = info.FreeBlocks * info.FragmentSize
+    snapshot.AvailableBytes = info.AvailableBlocks * info.FragmentSize
+    snapshot.TotalInodes = info.Files
+    snapshot.FreeInodes = info.FreeFiles
+    snapshot.AvailableInodes = info.AvailableFiles
+    snapshot.FileSystemId = info.FileSystemId
+    snapshot.MountFlags = info.Flags
+    snapshot.MaximumNameBytes = info.NameMaximum
+    Return snapshot
+#Else
+    Return Nil
+#End If
+End Function
+
+''' Return the link's stored UTF-8 target, including relative paths, without following it.
+Public Function ReadSymbolicLink(filePath As String) As String
+    RequireLinux()
+    ValidatePath(filePath)
+#If TargetLinux Then
+    Dim address As Ptr = PrepareError()
+    Dim capacity As Integer = 256
+    While capacity <= 1048576
+        Dim buffer As New Bytes(capacity)
+        For i As Integer = 1 To capacity
+            buffer.Append(0)
+        Next
+        Dim count As Integer = NativeReadLink(CType(filePath, CString), buffer.DataPtr(), capacity)
+        If count < 0 Then
+            Fail("readlink", address)
+        End If
+        If count < capacity Then
+            Dim exact As New Bytes(count)
+            exact.Append(buffer.DataPtr(), count)
+            Return exact.ToString(Text.Encodings.UTF8)
+        End If
+        capacity *= 2
+    End While
+    Throw New RuntimeException("Symbolic link exceeds the 1 MiB read limit or changed repeatedly")
+#Else
+    Return ""
+#End If
+End Function
+
+''' Resolve an existing filePath to an absolute filePath, following symbolic links.
+Public Function CanonicalPath(filePath As String) As String
+    RequireLinux()
+    ValidatePath(filePath)
+#If TargetLinux Then
+    Dim address As Ptr = PrepareError()
+    Dim resolved As Ptr = NativeRealPath(CType(filePath, CString), Nil)
+    If resolved = Nil Then
+        Fail("realpath", address)
+    End If
+    Try
+        Return CType(CType(resolved, CString), String)
+    Finally
+        NativeFree(resolved)
+    End Try
+#Else
+    Return ""
+#End If
+End Function

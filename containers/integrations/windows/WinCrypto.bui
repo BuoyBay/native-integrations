@@ -1,0 +1,86 @@
+' Windows CNG random bytes and SHA-256, with owned binary buffers.
+Const MaximumBytes As Integer = 16777216
+
+#If TargetWindows Then
+Private Optional Declare Function NativeRandom Lib "bcrypt" Alias "BCryptGenRandom" (algorithm As Ptr, buffer As Ptr, count As UInt32, options As UInt32) As Int32
+Private Optional Declare Function NativeOpenAlgorithm Lib "bcrypt" Alias "BCryptOpenAlgorithmProvider" (ByRef algorithm As Ptr, name As Ptr, provider As Ptr, options As UInt32) As Int32
+Private Optional Declare Function NativeHash Lib "bcrypt" Alias "BCryptHash" (algorithm As Ptr, secret As Ptr, secretCount As UInt32, input As Ptr, inputCount As UInt32, output As Ptr, outputCount As UInt32) As Int32
+Private Optional Declare Function NativeCloseAlgorithm Lib "bcrypt" Alias "BCryptCloseAlgorithmProvider" (algorithm As Ptr, options As UInt32) As Int32
+
+Private Sub CheckStatus(status As Int32, operation As String)
+    ' NT_SUCCESS uses the sign of NTSTATUS; it is not a Win32 GetLastError value.
+    If status < 0 Then
+        Throw New RuntimeException(operation + " failed (NTSTATUS " + Str(status) + ")", status)
+    End If
+End Sub
+#End If
+
+Private Sub RequireWindows()
+#If Not TargetWindows Then
+    Throw New UnsupportedOperationException("WinCrypto requires Windows")
+#End If
+End Sub
+
+Private Function ZeroBytes(count As Integer) As Bytes
+    Dim buffer As New Bytes(count)
+    For i As Integer = 1 To count
+        buffer.Append(0)
+    Next
+    Return buffer
+End Function
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Return 0..16 MiB of random bytes from the Windows system-preferred RNG.
+Public Function RandomBytes(count As Integer) As Bytes
+    RequireWindows()
+    If count < 0 Or count > MaximumBytes Then
+        Throw New InvalidArgumentException("Random byte count must be between 0 and 16777216")
+    End If
+    Dim output As Bytes = ZeroBytes(count)
+#If TargetWindows Then
+    If count > 0 Then
+        CheckStatus(NativeRandom(Nil, output.DataPtr(), count, 2), "BCryptGenRandom")
+    End If
+#End If
+    Return output
+End Function
+
+''' SHA-256 of binary input, including embedded NUL; returns exactly 32 bytes.
+Public Function Sha256(input As Bytes) As Bytes
+    RequireWindows()
+    If input = Nil Then
+        Throw New InvalidArgumentException("SHA-256 input must be a Bytes instance")
+    End If
+    If input.Count > MaximumBytes Then
+        Throw New InvalidArgumentException("SHA-256 input exceeds 16777216 bytes")
+    End If
+#If TargetWindows Then
+    Dim name As Bytes = "SHA256".AsUTF16LE()
+    name.Append(0)
+    name.Append(0)
+    Dim algorithm As Ptr = Nil
+    CheckStatus(NativeOpenAlgorithm(algorithm, name.DataPtr(), Nil, 0), "BCryptOpenAlgorithmProvider(SHA256)")
+    Try
+        Dim output As Bytes = ZeroBytes(32)
+        ' Keep a valid input address even for a zero-length message.
+        Dim emptyInput As Bytes = ZeroBytes(1)
+        Dim inputAddress As Ptr = emptyInput.DataPtr()
+        If input.Count > 0 Then
+            inputAddress = input.DataPtr()
+        End If
+        CheckStatus(NativeHash(algorithm, Nil, 0, inputAddress, input.Count, output.DataPtr(), 32), "BCryptHash(SHA256)")
+        Return output
+    Finally
+        CheckStatus(NativeCloseAlgorithm(algorithm, 0), "BCryptCloseAlgorithmProvider")
+    End Try
+#Else
+    Return New Bytes()
+#End If
+End Function

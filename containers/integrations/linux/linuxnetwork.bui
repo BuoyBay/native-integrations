@@ -1,0 +1,123 @@
+' Owned IPv4/IPv6 interface address snapshots for 64-bit glibc Linux.
+Public Class InterfaceAddress
+    Public Property Name As String
+    Public Property Family As Integer
+    Public Property Address As String
+    Public Property Netmask As Optional Of String
+    Public Property ScopeId As Integer
+    Public Property Flags As UInt32
+    Public Property IsUp As Boolean
+    Public Property IsLoopback As Boolean
+End Class
+
+#If TargetLinux Then
+Sequential Structure NativeIfaddrs
+    NextEntry As Ptr
+    Name As Ptr
+    Flags As UInt32
+    Address As Ptr
+    Netmask As Ptr
+    BroadcastOrDestination As Ptr
+    Data As Ptr
+End Structure
+
+Private Optional Declare Function NativeGetIfaddrs Lib "c" Alias "getifaddrs" (ByRef first As Ptr) As Int32
+Private Optional Declare Sub NativeFreeIfaddrs Lib "c" Alias "freeifaddrs" (first As Ptr)
+Private Optional Declare Function CopyEntry Lib "c" Alias "memcpy" (ByRef destination As NativeIfaddrs, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function CopyFamily Lib "c" Alias "memcpy" (ByRef destination As UInt16, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function CopyScope Lib "c" Alias "memcpy" (ByRef destination As UInt32, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function CopyError Lib "c" Alias "memcpy" (ByRef destination As Int32, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function ErrorLocation Lib "c" Alias "__errno_location" () As Ptr
+Private Optional Declare Function NativeInetNtop Lib "c" Alias "inet_ntop" (family As Int32, source As Ptr, destination As Ptr, count As UInt32) As Ptr
+
+Private Sub Fail(operation As String)
+    Dim code As Int32 = 0
+    CopyError(code, ErrorLocation(), 4)
+    Throw New RuntimeException(operation + " failed (errno " + Str(code) + ")", code)
+End Sub
+
+Private Function Offset(pointer As Ptr, amount As Integer) As Ptr
+    Return CType(CType(pointer, Integer) + amount, Ptr)
+End Function
+
+Private Function AddressFamily(address As Ptr) As Integer
+    Dim family As UInt16 = 0
+    CopyFamily(family, address, 2)
+    Return family
+End Function
+
+Private Function NumericAddress(address As Ptr, family As Integer) As String
+    Dim binaryOffset As Integer = 4
+    If family = 10 Then
+        binaryOffset = 8
+    End If
+    Dim buffer As New Bytes(46)
+    For i As Integer = 1 To 46
+        buffer.Append(0)
+    Next
+    If NativeInetNtop(family, Offset(address, binaryOffset), buffer.DataPtr(), 46) = Nil Then
+        Fail("inet_ntop")
+    End If
+    Return CType(CType(buffer.DataPtr(), CString), String)
+End Function
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' One record per IPv4/IPv6 address in this process's network namespace.
+Public Function InterfaceAddresses() As Array Of InterfaceAddress
+#If TargetLinux Then
+    Dim first As Ptr = Nil
+    If NativeGetIfaddrs(first) <> 0 Then
+        Fail("getifaddrs")
+    End If
+    Dim results As Array Of InterfaceAddress = []
+    Try
+        Dim current As Ptr = first
+        While current <> Nil
+            Dim native As NativeIfaddrs
+            CopyEntry(native, current, 56)
+            If native.Address <> Nil Then
+                Dim family As Integer = AddressFamily(native.Address)
+                If family = 2 Or family = 10 Then
+                    If native.Name = Nil Then
+                        Throw New RuntimeException("getifaddrs returned an address without an interface name")
+                    End If
+                    Dim entry As New InterfaceAddress
+                    entry.Name = CType(CType(native.Name, CString), String)
+                    entry.Family = family
+                    entry.Address = NumericAddress(native.Address, family)
+                    entry.Flags = native.Flags
+                    entry.IsUp = (native.Flags And 1) <> 0
+                    entry.IsLoopback = (native.Flags And 8) <> 0
+                    If native.Netmask <> Nil Then
+                        If AddressFamily(native.Netmask) = family Then
+                            entry.Netmask = Some(NumericAddress(native.Netmask, family))
+                        End If
+                    End If
+                    If family = 10 Then
+                        Dim scope As UInt32 = 0
+                        CopyScope(scope, Offset(native.Address, 24), 4)
+                        entry.ScopeId = scope
+                    End If
+                    Array.Append(results, entry)
+                End If
+            End If
+            current = native.NextEntry
+        End While
+        Return results
+    Finally
+        If first <> Nil Then
+            NativeFreeIfaddrs(first)
+        End If
+    End Try
+#Else
+    Throw New UnsupportedOperationException("linuxnetwork requires Linux")
+#End If
+End Function

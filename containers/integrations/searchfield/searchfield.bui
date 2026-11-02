@@ -1,0 +1,483 @@
+' Native search entry; no drawing or polling. Open after attaching the View.
+Private Class SearchReference
+    Public Property Owner As Weak SearchField
+End Class
+Private Class SearchRegistry
+    Public Shared Property Items As Array Of SearchReference = []
+End Class
+
+Public Class SearchField Inherits View
+    Event SearchChanged(query As String)
+    Event SearchCommitted(query As String)
+    Event SearchCancelled()
+    Private Property mText As String = ""
+    Private Property mPlaceholder As String = "Search"
+    Private Property mHost As Ptr = Nil
+    Private Property mHostDestroyed As Boolean = False
+    Private Property mEntry As Ptr = Nil
+    Private Property mClear As Ptr = Nil
+    Private Property mID As Integer = -1
+    Private Property mUpdating As Boolean = False
+    Private Property mComposing As Boolean = False
+    Private Property mActivationHeld As Boolean = False
+    Public Property LastNativeError As String = ""
+
+    Public Property Text As String
+        Get
+            If Me.mEntry <> Nil Then Me.mText = Me.ReadNativeText()
+            Return Me.mText
+        End Get
+        Set
+            Me.mText = value
+            Me.WriteNativeText()
+        End Set
+    End Property
+    Public Property Placeholder As String
+        Get
+            Return Me.mPlaceholder
+        End Get
+        Set
+            Me.mPlaceholder = value
+            Me.RefreshNative()
+        End Set
+    End Property
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mID >= 0 And Me.mEntry <> Nil
+        End Get
+    End Property
+    Public Property EntryHandle As Ptr
+        Get
+            Return Me.mEntry
+        End Get
+    End Property
+    Public Sub Clear()
+        Dim old As String = Me.Text
+        Me.Text = ""
+        If old <> "" Then RaiseEvent SearchChanged("")
+    End Sub
+    Public Sub CommitSearch()
+        If Not Me.Enabled Or Not Me.Visible Then Return
+        RaiseEvent SearchCommitted(Me.Text)
+    End Sub
+    Public Sub CancelSearch()
+        If Not Me.Enabled Or Not Me.Visible Then Return
+        Me.Clear()
+        RaiseEvent SearchCancelled()
+    End Sub
+    Public Sub FocusSearch()
+        If Me.mEntry = Nil Or Not Me.Enabled Or Not Me.Visible Then Return
+        #If TargetLinux Then
+            SearchGrabFocus(Me.mEntry)
+        #ElseIf TargetWindows Then
+            SearchFocus(Me.mEntry)
+        #ElseIf TargetMac Then
+            SearchResponder(SearchWindow(Me.mEntry), Me.mEntry)
+        #End If
+    End Sub
+    Public Sub Open()
+        If Me.mHostDestroyed Then Throw New InvalidArgumentException("Native SearchField host destroyed; create a new control")
+        Me.Close()
+        Me.LastNativeError = ""
+        Me.mHost = Me.NativeWidget
+        If Me.mHost = Nil Then Throw New InvalidArgumentException("Attach SearchField before Open")
+        For i As Integer = 0 To Array.LastIndex(SearchRegistry.Items)
+            If SearchRegistry.Items(i).Owner = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(SearchRegistry.Items)
+            Array.Append(SearchRegistry.Items, New SearchReference())
+        End If
+        SearchRegistry.Items(Me.mID).Owner = Me
+        Me.mUpdating = True
+        Try
+            #If TargetLinux Then
+                Me.mEntry = SearchNew()
+                SearchRef(Me.mEntry)
+                SearchPut(Me.mHost, Me.mEntry, 0, 0)
+                SearchConnect(Me.mEntry, "changed", AddressOf SearchLinuxChanged, CType(Me.mID + 1, Ptr), Nil, 0)
+                SearchConnect(Me.mEntry, "activate", AddressOf SearchLinuxCommit, CType(Me.mID + 1, Ptr), Nil, 0)
+                SearchConnect(Me.mEntry, "stop-search", AddressOf SearchLinuxCancel, CType(Me.mID + 1, Ptr), Nil, 0)
+            #ElseIf TargetWindows Then
+                Dim cls As Bytes = SearchWide("EDIT")
+                Me.mEntry = SearchCreate(512, cls.DataPtr(), Nil, 1342242944, 0, 0, 1, 1, Me.mHost, CType(1, Ptr), Nil, Nil)
+                cls = SearchWide("BUTTON")
+                Dim caption As Bytes = SearchWide("Clear")
+                Me.mClear = SearchCreate(0, cls.DataPtr(), caption.DataPtr(), 1342242816, 0, 0, 1, 1, Me.mHost, CType(2, Ptr), Nil, Nil)
+                If Me.mEntry = Nil Or Me.mClear = Nil Then Throw New RuntimeException("Could not create search controls")
+                SearchSend(Me.mEntry, 48, SearchStockFont(17), 1)
+                SearchSend(Me.mClear, 48, SearchStockFont(17), 1)
+                SearchSend(Me.mEntry, 197, 1048576, 0) ' EM_SETLIMITTEXT
+                If SearchSubclass(Me.mHost, AddressOf SearchWindowsHost, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind search container")
+                If SearchSubclass(Me.mEntry, AddressOf SearchWindowsEntry, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind search entry")
+                If SearchSubclass(Me.mClear, AddressOf SearchWindowsClear, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind search clear button")
+            #ElseIf TargetMac Then
+                Me.mEntry = SearchInit(SearchAlloc(SearchMacClass()))
+                SearchDelegate(Me.mEntry, Me.mEntry)
+                SearchTarget(Me.mEntry, Me.mEntry)
+                SearchAction(Me.mEntry, SearchSelector("buoySearchCommit:"))
+                SearchWhole(Me.mEntry, True)
+                SearchAddSubview(Me.mHost, Me.mEntry)
+                SearchAutoresizing(Me.mEntry, 18)
+                Dim cancel As Ptr = SearchCancelCell(SearchCell(Me.mEntry))
+                SearchTarget(cancel, Me.mEntry)
+                SearchAction(cancel, SearchSelector("buoySearchCancel:"))
+            #End If
+            Me.WriteNativeText()
+            Me.RefreshNative()
+            Me.mUpdating = False
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Public Sub Close()
+        If Me.mID < 0 Then Return
+        If Me.mEntry <> Nil Then Me.mText = Me.ReadNativeText()
+        SearchRegistry.Items(Me.mID).Owner = Nil
+        Me.mUpdating = True
+        #If TargetLinux Then
+            If Me.mEntry <> Nil Then
+                Dim parent As Ptr = SearchParent(Me.mEntry)
+                If parent <> Nil Then SearchRemove(parent, Me.mEntry)
+                SearchUnref(Me.mEntry)
+            End If
+        #ElseIf TargetWindows Then
+            If Me.mEntry <> Nil Then
+                SearchUnsubclass(Me.mEntry, AddressOf SearchWindowsEntry, Me.mID + 1)
+                SearchDestroy(Me.mEntry)
+            End If
+            If Me.mClear <> Nil Then
+                SearchUnsubclass(Me.mClear, AddressOf SearchWindowsClear, Me.mID + 1)
+                SearchDestroy(Me.mClear)
+            End If
+            If Me.mHost <> Nil Then SearchUnsubclass(Me.mHost, AddressOf SearchWindowsHost, Me.mID + 1)
+        #ElseIf TargetMac Then
+            If Me.mEntry <> Nil Then
+                SearchDelegate(Me.mEntry, Nil)
+                SearchTarget(Me.mEntry, Nil)
+                SearchTarget(SearchCancelCell(SearchCell(Me.mEntry)), Nil)
+                SearchRemove(Me.mEntry)
+                SearchRelease(Me.mEntry)
+            End If
+        #End If
+        Me.mEntry = Nil
+        Me.mClear = Nil
+        Me.mHost = Nil
+        Me.mID = -1
+        Me.mUpdating = False
+        Me.mComposing = False
+        Me.mActivationHeld = False
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+    Private Function ReadNativeText() As String
+        #If TargetLinux Then
+            Return SearchText(Me.mEntry)
+        #ElseIf TargetWindows Then
+            If SearchIsWindow(Me.mEntry) = 0 Then Return Me.mText
+            Dim length As Integer = SearchTextLength(Me.mEntry)
+            Dim buffer As New Bytes()
+            For i As Integer = 0 To (length + 1) * 2 - 1
+                buffer.Append(0)
+            Next
+            Dim copied As Integer = SearchGetText(Me.mEntry, buffer.DataPtr(), length + 1)
+            Dim contents As New Bytes()
+            contents.Append(buffer.DataPtr(), copied * 2)
+            Return String.FromUTF16LE(contents)
+        #ElseIf TargetMac Then
+            Return SearchUTF8(SearchValue(Me.mEntry))
+        #Else
+            Return Me.mText
+        #End If
+    End Function
+    Private Sub WriteNativeText()
+        If Me.mEntry = Nil Then Return
+        Dim updating As Boolean = Me.mUpdating
+        Me.mUpdating = True
+        #If TargetLinux Then
+            SearchSetText(Me.mEntry, Me.mText)
+        #ElseIf TargetWindows Then
+            Dim text As Bytes = SearchWide(Me.mText)
+            SearchSetText(Me.mEntry, text.DataPtr())
+        #ElseIf TargetMac Then
+            SearchSetValue(Me.mEntry, SearchString(SearchClass("NSString"), Me.mText))
+        #End If
+        Me.mUpdating = updating
+    End Sub
+    Public Sub RefreshNative()
+        If Me.mEntry = Nil Then Return
+        #If TargetLinux Then
+            SearchSize(Me.mEntry, Me.Width, Me.Height)
+            ' GtkSearchEntry delegates placeholder to its internal GtkText.
+            SearchPlaceholder(Me.mEntry, "placeholder-text", Me.mPlaceholder, Nil)
+            SearchSensitive(Me.mEntry, CType(Me.Enabled, Int32))
+        #ElseIf TargetWindows Then
+            Dim scale As Double = SearchDPI(Me.mHost) / 96.0
+            Dim width As Integer = Math.Max(1, Me.Width * scale)
+            Dim height As Integer = Math.Max(1, Me.Height * scale)
+            Dim clearWidth As Integer = Math.Min(width, 54 * scale)
+            SearchMove(Me.mEntry, 0, 0, Math.Max(1, width - clearWidth - 4 * scale), height, 1)
+            SearchMove(Me.mClear, width - clearWidth, 0, clearWidth, height, 1)
+            Dim hint As Bytes = SearchWide(Me.mPlaceholder)
+            SearchSend(Me.mEntry, 5377, 1, CType(hint.DataPtr(), Integer)) ' EM_SETCUEBANNER
+            SearchEnable(Me.mEntry, CType(Me.Enabled, Int32))
+            SearchEnable(Me.mClear, CType(Me.Enabled, Int32))
+        #ElseIf TargetMac Then
+            Dim frame As SearchRect
+            frame.X = 0
+            frame.Y = 0
+            frame.Width = Me.Width
+            frame.Height = Me.Height
+            SearchFrame(Me.mEntry, frame)
+            SearchPlaceholder(Me.mEntry, SearchString(SearchClass("NSString"), Me.mPlaceholder))
+            SearchEnabled(Me.mEntry, Me.Enabled)
+        #End If
+    End Sub
+    ' Callback bridges call this only for native events. Exceptions stay in Buoy.
+    Public Sub NativeEvent(widget As Ptr, kind As Integer)
+        If widget <> Me.mEntry Or Me.mUpdating Or Me.mID < 0 Then Return
+        Try
+            If kind = 0 Then
+                Dim current As String = Me.ReadNativeText()
+                If current <> Me.mText Then
+                    Me.mText = current
+                    RaiseEvent SearchChanged(current)
+                End If
+            ElseIf kind = 1 Then
+                Me.CommitSearch()
+            ElseIf kind = 2 Then
+                Me.CancelSearch()
+            ElseIf kind = 3 Then
+                Me.Clear()
+            End If
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    #If TargetWindows Then
+    ' Registry references are cleared before our own Close destroys any HWND.
+    ' These callbacks therefore reach only owners retained by application code.
+    Public Sub NativeWindowDestroyed(widget As Ptr)
+        If widget = Me.mEntry Then Me.mEntry = Nil
+        If widget = Me.mClear Then Me.mClear = Nil
+        If widget = Me.mHost And Me.mID >= 0 Then
+            Me.mHostDestroyed = True
+            SearchRegistry.Items(Me.mID).Owner = Nil
+            Me.mHost = Nil
+            Me.mEntry = Nil
+            Me.mClear = Nil
+            Me.mID = -1
+        End If
+        Me.mComposing = False
+        Me.mActivationHeld = False
+    End Sub
+    Public Sub NativeWindowDestroying(widget As Ptr)
+        If widget <> Me.mEntry Or Me.mEntry = Nil Then Return
+        Try
+            Me.mText = Me.ReadNativeText()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    Public Sub NativeCommand(host As Ptr, sender As Ptr, commandWord As UInt64)
+        If host <> Me.mHost Or sender = Nil Then Return
+        If sender = Me.mEntry And (commandWord >> 16) = 768 Then Me.NativeEvent(sender, 0)
+        If sender = Me.mClear And (commandWord >> 16) = 0 Then Me.NativeEvent(Me.mEntry, 3)
+    End Sub
+    Public Function NativeKey(message As UInt32, word As UInt64, param As Int64) As Boolean
+        If message = 269 Then Me.mComposing = True ' WM_IME_STARTCOMPOSITION
+        If message = 270 Then Me.mComposing = False
+        If message = 8 Then Me.mActivationHeld = False ' WM_KILLFOCUS
+        If message = 257 And (word = 13 Or word = 27) Then
+            Me.mActivationHeld = False
+            Return True
+        End If
+        If message = 258 And (word = 13 Or word = 27) And Not Me.mComposing Then Return True
+        If message = 256 And (word = 13 Or word = 27) And Not Me.mComposing Then
+            If Not Me.mActivationHeld And (param And 1073741824) = 0 Then
+                Me.mActivationHeld = True
+                If word = 13 Then Me.NativeEvent(Me.mEntry, 1)
+                If word = 27 Then Me.NativeEvent(Me.mEntry, 2)
+            End If
+            Return True
+        End If
+        Return False
+    End Function
+    #End If
+End Class
+
+Private Function SearchOwner(data As Ptr) As SearchField
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(SearchRegistry.Items) Then Return Nil
+    Return SearchRegistry.Items(index).Owner
+End Function
+
+#If TargetLinux Then
+Delegate Sub SearchLinuxCallback(widget As Ptr, data As Ptr)
+Private Optional Declare Function SearchNew Lib "libgtk-4.so.1" Alias "gtk_search_entry_new" () As Ptr
+Private Optional Declare Function SearchRef Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (widget As Ptr) As Ptr
+Private Optional Declare Sub SearchUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (widget As Ptr)
+Private Optional Declare Function SearchParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Sub SearchPut Lib "libgtk-4.so.1" Alias "gtk_fixed_put" (host As Ptr, widget As Ptr, x As Double, y As Double)
+Private Optional Declare Sub SearchRemove Lib "libgtk-4.so.1" Alias "gtk_fixed_remove" (host As Ptr, widget As Ptr)
+Private Optional Declare Function SearchText Lib "libgtk-4.so.1" Alias "gtk_editable_get_text" (widget As Ptr) As String
+Private Optional Declare Sub SearchSetText Lib "libgtk-4.so.1" Alias "gtk_editable_set_text" (widget As Ptr, value As String)
+Private Optional Declare Sub SearchPlaceholder Lib "libgobject-2.0.so.0" Alias "g_object_set" (widget As Ptr, propertyName As String, value As String, terminator As Ptr)
+Private Optional Declare Sub SearchSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Sub SearchSensitive Lib "libgtk-4.so.1" Alias "gtk_widget_set_sensitive" (widget As Ptr, enabled As Int32)
+Private Optional Declare Function SearchGrabFocus Lib "libgtk-4.so.1" Alias "gtk_widget_grab_focus" (widget As Ptr) As Int32
+Private Optional Declare Function SearchConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (widget As Ptr, signal As String, callback As SearchLinuxCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Sub SearchLinuxChanged(widget As Ptr, data As Ptr)
+    Dim owner As SearchField = SearchOwner(data)
+    If owner <> Nil Then owner.NativeEvent(widget, 0)
+End Sub
+Private Sub SearchLinuxCommit(widget As Ptr, data As Ptr)
+    Dim owner As SearchField = SearchOwner(data)
+    If owner <> Nil Then owner.NativeEvent(widget, 1)
+End Sub
+Private Sub SearchLinuxCancel(widget As Ptr, data As Ptr)
+    Dim owner As SearchField = SearchOwner(data)
+    If owner <> Nil Then owner.NativeEvent(widget, 2)
+End Sub
+#ElseIf TargetWindows Then
+Delegate Function SearchWindowsCallback(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+Private Optional Declare Function SearchSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As SearchWindowsCallback, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function SearchUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As SearchWindowsCallback, id As UInt64) As Int32
+Private Optional Declare Function SearchDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function SearchCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, parameter As Ptr) As Ptr
+Private Optional Declare Function SearchDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Optional Declare Function SearchIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function SearchSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function SearchSetText Lib "user32" Alias "SetWindowTextW" (widget As Ptr, value As Ptr) As Int32
+Private Optional Declare Function SearchTextLength Lib "user32" Alias "GetWindowTextLengthW" (widget As Ptr) As Int32
+Private Optional Declare Function SearchGetText Lib "user32" Alias "GetWindowTextW" (widget As Ptr, buffer As Ptr, capacity As Int32) As Int32
+Private Optional Declare Function SearchEnable Lib "user32" Alias "EnableWindow" (widget As Ptr, enabled As Int32) As Int32
+Private Optional Declare Function SearchMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, repaint As Int32) As Int32
+Private Optional Declare Function SearchDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function SearchStockFont Lib "gdi32" Alias "GetStockObject" (index As Int32) As UInt64
+Private Optional Declare Function SearchFocus Lib "user32" Alias "SetFocus" (widget As Ptr) As Ptr
+Private Function SearchWide(value As String) As Bytes
+    Dim buffer As Bytes = value.AsUTF16LE()
+    buffer.Append(0)
+    buffer.Append(0)
+    Return buffer
+End Function
+Private Function SearchWindowsHost(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    Dim callbackID As Integer = id
+    Dim owner As SearchField = SearchOwner(CType(callbackID, Ptr))
+    If message = 130 Then ' WM_NCDESTROY: handle values may be recycled immediately afterward.
+        SearchUnsubclass(widget, AddressOf SearchWindowsHost, id)
+        If owner <> Nil Then owner.NativeWindowDestroyed(widget)
+    ElseIf owner <> Nil And message = 273 Then
+        Dim address As Integer = param
+        owner.NativeCommand(widget, CType(address, Ptr), word)
+    End If
+    Return SearchDefault(widget, message, word, param)
+End Function
+Private Function SearchWindowsEntry(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    If message = 135 And (word = 13 Or word = 27) Then Return SearchDefault(widget, message, word, param) Or 4
+    Dim callbackID As Integer = id
+    Dim owner As SearchField = SearchOwner(CType(callbackID, Ptr))
+    If message = 130 Then
+        SearchUnsubclass(widget, AddressOf SearchWindowsEntry, id)
+        If owner <> Nil Then owner.NativeWindowDestroyed(widget)
+    ElseIf owner <> Nil Then
+        If message = 2 Then owner.NativeWindowDestroying(widget) ' Snapshot before the native edit destroys its storage.
+        If owner.NativeKey(message, word, param) Then Return 0
+    End If
+    Return SearchDefault(widget, message, word, param)
+End Function
+Private Function SearchWindowsClear(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    If message = 130 Then
+        Dim callbackID As Integer = id
+        Dim owner As SearchField = SearchOwner(CType(callbackID, Ptr))
+        SearchUnsubclass(widget, AddressOf SearchWindowsClear, id)
+        If owner <> Nil Then owner.NativeWindowDestroyed(widget)
+    End If
+    Return SearchDefault(widget, message, word, param)
+End Function
+#ElseIf TargetMac Then
+Sequential Structure SearchRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Delegate Sub SearchMacAction(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+Delegate Function SearchMacCommand(receiver As Ptr, methodSelector As Ptr, control As Ptr, editor As Ptr, command As Ptr) As UInt8
+Private Declare Function SearchClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function SearchAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Sub SearchRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function SearchAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, callback As Ptr, encoding As String) As UInt8
+Private Declare Function SearchSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function SearchAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function SearchInit Lib "AppKit" Selector "init" (widget As Ptr) As Ptr
+Private Declare Sub SearchRelease Lib "AppKit" Selector "release" (widget As Ptr)
+Private Declare Sub SearchRemove Lib "AppKit" Selector "removeFromSuperview" (widget As Ptr)
+Private Declare Sub SearchAddSubview Lib "AppKit" Selector "addSubview:" (host As Ptr, widget As Ptr)
+Private Declare Sub SearchAutoresizing Lib "AppKit" Selector "setAutoresizingMask:" (widget As Ptr, mask As Integer)
+Private Declare Sub SearchFrame Lib "AppKit" Selector "setFrame:" (widget As Ptr, frame As SearchRect)
+Private Declare Function SearchValue Lib "AppKit" Selector "stringValue" (widget As Ptr) As Ptr
+Private Declare Sub SearchSetValue Lib "AppKit" Selector "setStringValue:" (widget As Ptr, text As Ptr)
+Private Declare Sub SearchPlaceholder Lib "AppKit" Selector "setPlaceholderString:" (widget As Ptr, text As Ptr)
+Private Declare Sub SearchEnabled Lib "AppKit" Selector "setEnabled:" (widget As Ptr, enabled As Boolean)
+Private Declare Sub SearchDelegate Lib "AppKit" Selector "setDelegate:" (widget As Ptr, target As Ptr)
+Private Declare Sub SearchTarget Lib "AppKit" Selector "setTarget:" (widget As Ptr, target As Ptr)
+Private Declare Sub SearchAction Lib "AppKit" Selector "setAction:" (widget As Ptr, methodSelector As Ptr)
+Private Declare Sub SearchWhole Lib "AppKit" Selector "setSendsWholeSearchString:" (widget As Ptr, value As Boolean)
+Private Declare Function SearchCell Lib "AppKit" Selector "cell" (widget As Ptr) As Ptr
+Private Declare Function SearchCancelCell Lib "AppKit" Selector "cancelButtonCell" (cell As Ptr) As Ptr
+Private Declare Function SearchString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function SearchUTF8 Lib "Foundation" Selector "UTF8String" (text As Ptr) As String
+Private Declare Function SearchWindow Lib "AppKit" Selector "window" (widget As Ptr) As Ptr
+Private Declare Function SearchResponder Lib "AppKit" Selector "makeFirstResponder:" (window As Ptr, widget As Ptr) As Boolean
+Private Function SearchMacOwner(receiver As Ptr) As SearchField
+    For Each reference As SearchReference In SearchRegistry.Items
+        Dim owner As SearchField = reference.Owner
+        If owner <> Nil Then
+            If owner.EntryHandle = receiver Then Return owner
+        End If
+    Next
+    Return Nil
+End Function
+Private Function SearchMacClass() As Ptr
+    Dim cls As Ptr = SearchClass("BuoyStandaloneSearchField")
+    If cls <> Nil Then Return cls
+    cls = SearchAllocateClass(SearchClass("NSSearchField"), "BuoyStandaloneSearchField", 0)
+    If cls = Nil Then Throw New RuntimeException("Could not allocate search field class")
+    Dim changed As SearchMacAction = AddressOf SearchMacChanged
+    Dim commit As SearchMacAction = AddressOf SearchMacCommit
+    Dim cancel As SearchMacAction = AddressOf SearchMacCancel
+    Dim command As SearchMacCommand = AddressOf SearchMacDoCommand
+    If SearchAddMethod(cls, SearchSelector("controlTextDidChange:"), CType(changed, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not install search delegate")
+    If SearchAddMethod(cls, SearchSelector("buoySearchCommit:"), CType(commit, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not install search action")
+    If SearchAddMethod(cls, SearchSelector("buoySearchCancel:"), CType(cancel, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not install search cancel")
+    If SearchAddMethod(cls, SearchSelector("control:textView:doCommandBySelector:"), CType(command, Ptr), "C@:@@:") = 0 Then Throw New RuntimeException("Could not install search commands")
+    SearchRegisterClass(cls)
+    Return cls
+End Function
+Private Sub SearchMacChanged(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    Dim owner As SearchField = SearchMacOwner(receiver)
+    If owner <> Nil Then owner.NativeEvent(receiver, 0)
+End Sub
+Private Sub SearchMacCommit(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    Dim owner As SearchField = SearchMacOwner(receiver)
+    If owner <> Nil Then owner.NativeEvent(receiver, 1)
+End Sub
+Private Sub SearchMacCancel(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    Dim owner As SearchField = SearchMacOwner(receiver)
+    If owner <> Nil Then owner.NativeEvent(receiver, 3)
+End Sub
+Private Function SearchMacDoCommand(receiver As Ptr, methodSelector As Ptr, control As Ptr, editor As Ptr, command As Ptr) As UInt8
+    If command <> SearchSelector("cancelOperation:") Then Return 0
+    Dim owner As SearchField = SearchMacOwner(receiver)
+    If owner = Nil Then Return 0
+    owner.NativeEvent(receiver, 2)
+    Return 1
+End Function
+#End If

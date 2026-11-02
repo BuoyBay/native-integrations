@@ -1,0 +1,317 @@
+' Optional window shortcut routing where native text controls consume KeyDown.
+Private Class ShortcutReference
+    Public Property Router As Weak BevelNativeShortcuts
+End Class
+Private Class ShortcutRegistry
+    Public Shared Property Items As Array Of ShortcutReference = []
+End Class
+
+Public Class BevelNativeShortcuts
+    Private Property mOwnerWindow As Weak Window
+    Public Property OwnerWindow As Window
+        Get
+            Return Me.mOwnerWindow
+        End Get
+    End Property
+    Public Property LastError As String = ""
+    Private Property mID As Integer = -1
+    Private Property mWidget As Ptr = Nil
+    #If TargetLinux Then
+        Private Property mController As Ptr = Nil
+        Private Property mSignal As UInt64 = 0
+    #ElseIf TargetWindows Then
+        Private Property mHook As Ptr = Nil
+    #ElseIf TargetMac Then
+        Private Property mMonitor As Ptr = Nil
+        Private Property mBlock As Ptr = Nil
+        Private Property mDescriptor As Bytes
+        Private Property mSignature As Ptr = Nil
+    #End If
+
+    Public Function DispatchKey(e As KeyEvent) As Boolean
+        Return False
+    End Function
+
+    Public Sub Open(owner As Window)
+        Me.Close()
+        If owner = Nil Then Throw New InvalidArgumentException("Shortcut router needs a window")
+        If owner.NativeWidget = Nil Then Throw New InvalidArgumentException("Window has no native widget")
+        Me.mOwnerWindow = owner
+        Me.mWidget = owner.NativeWidget
+        For i As Integer = 0 To Array.LastIndex(ShortcutRegistry.Items)
+            If ShortcutRegistry.Items(i).Router <> Nil Then
+                If ShortcutRegistry.Items(i).Router.OwnerWindow Is owner Then Throw New InvalidArgumentException("Window already has a shortcut router")
+            ElseIf Me.mID < 0 Then
+                Me.mID = i
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(ShortcutRegistry.Items)
+            Array.Append(ShortcutRegistry.Items, New ShortcutReference())
+        End If
+        ShortcutRegistry.Items(Me.mID).Router = Me
+        Try
+            #If TargetLinux Then
+                Me.mController = KeysControllerNew()
+                KeysRef(Me.mController)
+                KeysPhase(Me.mController, 1) ' GTK_PHASE_CAPTURE
+                Me.mSignal = KeysConnect(Me.mController, "key-pressed", AddressOf LinuxShortcut, CType(Me.mID + 1, Ptr), Nil, 0)
+                KeysAdd(Me.mWidget, Me.mController)
+            #ElseIf TargetWindows Then
+                Me.mHook = KeysHook(3, AddressOf WindowsShortcut, Nil, KeysThread()) ' WH_GETMESSAGE
+                If Me.mHook = Nil Then Throw New RuntimeException("Could not install window shortcut hook")
+            #ElseIf TargetMac Then
+                ' Use AppKit's supported local monitor. Replacing an initialized
+                ' NSWindow's isa breaks its dynamic properties/KVO during display.
+                Me.mSignature = KeysDuplicate("@16@?0@8")
+                Dim descriptor As ShortcutBlockDescriptor
+                descriptor.Size = 40
+                descriptor.Signature = Me.mSignature
+                Me.mDescriptor = New Bytes()
+                For i As Integer = 1 To 24
+                    Me.mDescriptor.Append(0)
+                Next
+                KeysCopy(Me.mDescriptor.DataPtr(), CType(descriptor, Ptr), 24)
+                Dim nativeBlock As ShortcutBlock
+                nativeBlock.Isa = KeysSymbol(CType(-2, Ptr), "_NSConcreteStackBlock")
+                If nativeBlock.Isa = Nil Then Throw New RuntimeException("Blocks runtime unavailable")
+                nativeBlock.Options = 1073741824 ' BLOCK_HAS_SIGNATURE; no retained captures.
+                Dim invoke As MacShortcutCallback = AddressOf MacShortcut
+                nativeBlock.Invoke = CType(invoke, Ptr)
+                nativeBlock.Descriptor = Me.mDescriptor.DataPtr()
+                nativeBlock.ID = Me.mID + 1
+                Me.mBlock = KeysBlockCopy(CType(nativeBlock, Ptr))
+                If Me.mBlock = Nil Then Throw New RuntimeException("Could not copy shortcut nativeBlock")
+                Me.mMonitor = KeysMonitor(KeysClass("NSEvent"), 1024, Me.mBlock)
+                If Me.mMonitor = Nil Then Throw New RuntimeException("Could not install local shortcut monitor")
+            #End If
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+
+    Public Sub Close()
+        #If TargetLinux Then
+            If Me.mController <> Nil Then
+                If Me.mSignal <> 0 Then KeysDisconnect(Me.mController, Me.mSignal)
+                Dim widget As Ptr = KeysWidget(Me.mController)
+                If widget <> Nil Then KeysRemove(widget, Me.mController)
+                KeysUnref(Me.mController)
+            End If
+            Me.mController = Nil
+            Me.mSignal = 0
+        #ElseIf TargetWindows Then
+            If Me.mHook <> Nil Then KeysUnhook(Me.mHook)
+            Me.mHook = Nil
+        #ElseIf TargetMac Then
+            If Me.mMonitor <> Nil Then KeysRemoveMonitor(KeysClass("NSEvent"), Me.mMonitor)
+            Me.mMonitor = Nil
+            If Me.mBlock <> Nil Then KeysBlockRelease(Me.mBlock)
+            Me.mBlock = Nil
+            Me.mDescriptor = Nil
+            If Me.mSignature <> Nil Then KeysFree(Me.mSignature)
+            Me.mSignature = Nil
+        #End If
+        If Me.mID >= 0 Then ShortcutRegistry.Items(Me.mID).Router = Nil
+        Me.mID = -1
+        Me.mWidget = Nil
+        Me.mOwnerWindow = Nil
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+Private Function FindShortcut(index As Integer) As BevelNativeShortcuts
+    If index < 0 Or index >= Array.Count(ShortcutRegistry.Items) Then Return Nil
+    Return ShortcutRegistry.Items(index).Router
+End Function
+
+#If TargetLinux Then
+Delegate Function LinuxShortcutCallback(controller As Ptr, key As UInt32, code As UInt32, state As UInt32, data As Ptr) As Int32
+Private Optional Declare Function KeysControllerNew Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_new" () As Ptr
+Private Optional Declare Sub KeysPhase Lib "libgtk-4.so.1" Alias "gtk_event_controller_set_propagation_phase" (controller As Ptr, phase As Int32)
+Private Optional Declare Function KeysWidget Lib "libgtk-4.so.1" Alias "gtk_event_controller_get_widget" (controller As Ptr) As Ptr
+Private Optional Declare Sub KeysAdd Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Sub KeysRemove Lib "libgtk-4.so.1" Alias "gtk_widget_remove_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Function KeysRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (instance As Ptr) As Ptr
+Private Optional Declare Sub KeysUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (instance As Ptr)
+Private Optional Declare Sub KeysDisconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (instance As Ptr, signal As UInt64)
+Private Optional Declare Function KeysConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As LinuxShortcutCallback, data As Ptr, destroy As Ptr, nativeFlags As Int32) As UInt64
+Private Optional Declare Function KeysUnicode Lib "libgtk-4.so.1" Alias "gdk_keyval_to_unicode" (key As UInt32) As UInt32
+Private Optional Declare Function KeysWindowFocus Lib "libgtk-4.so.1" Alias "gtk_window_get_focus" (widget As Ptr) As Ptr
+Private Optional Declare Function KeysAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_get_ancestor" (widget As Ptr, typeID As UInt64) As Ptr
+Private Optional Declare Function KeysPopoverType Lib "libgtk-4.so.1" Alias "gtk_popover_get_type" () As UInt64
+
+Private Function LinuxShortcut(controller As Ptr, key As UInt32, code As UInt32, state As UInt32, data As Ptr) As Int32
+    Dim router As BevelNativeShortcuts = FindShortcut(CType(data, Integer) - 1)
+    If router = Nil Then Return 0
+    Try
+        Dim owner As Window = router.OwnerWindow
+        If owner = Nil Then Return 0
+        Dim focus As Ptr = KeysWindowFocus(owner.NativeWidget)
+        If focus <> Nil Then
+            If KeysAncestor(focus, KeysPopoverType()) <> Nil Then Return 0
+        End If
+        Dim e As New KeyEvent()
+        e.Modifiers = New ModifierKeys()
+        e.KeyCode = code
+        e.Character = KeysUnicode(key)
+        e.Key = KeyName.Other
+        If key = 65293 Or key = 65421 Then e.Key = KeyName.Return
+        If key = 65307 Then e.Key = KeyName.Escape
+        e.Modifiers.Shift = (state And 1) <> 0
+        e.Modifiers.Control = (state And 4) <> 0
+        e.Modifiers.Option = (state And 8) <> 0
+        e.Modifiers.Command = (state And 67108864) <> 0
+        If router.DispatchKey(e) Then Return 1
+    Catch e As Exception
+        router.LastError = e.Message
+    End Try
+    Return 0
+End Function
+#ElseIf TargetWindows Then
+Sequential Structure ShortcutMessage
+    Window As Ptr
+    Message As UInt32
+    Word As UInt64
+    Param As Int64
+    Time As UInt32
+    X As Int32
+    Y As Int32
+    PrivateData As UInt32
+End Structure
+Delegate Function WindowsShortcutCallback(code As Int32, word As UInt64, param As Ptr) As Int64
+Private Optional Declare Function KeysHook Lib "user32" Alias "SetWindowsHookExW" (kind As Int32, callback As WindowsShortcutCallback, libraryHandle As Ptr, threadID As UInt32) As Ptr
+Private Optional Declare Function KeysUnhook Lib "user32" Alias "UnhookWindowsHookEx" (hook As Ptr) As Int32
+Private Optional Declare Function KeysNext Lib "user32" Alias "CallNextHookEx" (hook As Ptr, code As Int32, word As UInt64, param As Ptr) As Int64
+Private Optional Declare Function KeysThread Lib "kernel32" Alias "GetCurrentThreadId" () As UInt32
+Private Optional Declare Function KeysRoot Lib "user32" Alias "GetAncestor" (widget As Ptr, kind As UInt32) As Ptr
+Private Optional Declare Function KeysState Lib "user32" Alias "GetKeyState" (key As Int32) As Int16
+Private Optional Declare Sub KeysCopy Lib "kernel32" Alias "RtlMoveMemory" (destination As Ptr, source As Ptr, count As UInt64)
+
+Private Function WindowsShortcut(code As Int32, word As UInt64, param As Ptr) As Int64
+    If code >= 0 And word = 1 And param <> Nil Then
+        Dim message As ShortcutMessage
+        KeysCopy(CType(message, Ptr), param, 48)
+        If message.Message = 256 Or message.Message = 262 Then ' WM_KEYDOWN / WM_SYSCHAR
+            For Each entry As ShortcutReference In ShortcutRegistry.Items
+                Dim router As BevelNativeShortcuts = entry.Router
+                If router = Nil Then Continue For
+                Dim owner As Window = router.OwnerWindow
+                If owner = Nil Then Continue For
+                If KeysRoot(message.Window, 2) <> owner.NativeWidget Then Continue For
+                Try
+                    Dim e As New KeyEvent()
+                    e.Key = KeyName.Other
+                    e.Modifiers = New ModifierKeys()
+                    e.IsRepeat = (message.Param And 1073741824) <> 0
+                    e.Modifiers.Shift = KeysState(16) < 0
+                    e.Modifiers.Control = KeysState(17) < 0
+                    e.Modifiers.Option = KeysState(18) < 0
+                    e.Modifiers.Command = KeysState(91) < 0 Or KeysState(92) < 0
+                    If message.Message = 262 Then
+                        e.Character = message.Word
+                    Else
+                        If message.Word = 13 Then e.Key = KeyName.Return
+                        If message.Word = 27 Then e.Key = KeyName.Escape
+                    End If
+                    If router.DispatchKey(e) Then
+                        message.Message = 0 ' WM_NULL; don't dispatch or translate a handled key.
+                        KeysCopy(param, CType(message, Ptr), 48)
+                        Exit For
+                    End If
+                Catch e As Exception
+                    router.LastError = e.Message
+                End Try
+            Next
+        End If
+    End If
+    Return KeysNext(Nil, code, word, param)
+End Function
+#ElseIf TargetMac Then
+' Apple Blocks ABI: 32-byte header plus an integer registry ID capture.
+Sequential Structure ShortcutBlock
+    Isa As Ptr
+    Options As Int32
+    Reserved As Int32
+    Invoke As Ptr
+    Descriptor As Ptr
+    ID As Integer
+End Structure
+Sequential Structure ShortcutBlockDescriptor
+    Reserved As UInt64
+    Size As UInt64
+    Signature As Ptr
+End Structure
+Delegate Function MacShortcutCallback(nativeBlock As Ptr, nativeEvent As Ptr) As Ptr
+Private Declare Function KeysClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function KeysSymbol Lib "c" Alias "dlsym" (handle As Ptr, name As String) As Ptr
+Private Declare Sub KeysCopy Lib "c" Alias "memcpy" (destination As Ptr, source As Ptr, count As UInt64)
+Private Declare Function KeysDuplicate Lib "c" Alias "strdup" (value As String) As Ptr
+Private Declare Sub KeysFree Lib "c" Alias "free" (value As Ptr)
+Private Declare Function KeysMonitor Lib "AppKit" Selector "addLocalMonitorForEventsMatchingMask:handler:" (cls As Ptr, mask As UInt64, nativeBlock As Ptr) As Ptr
+Private Declare Sub KeysRemoveMonitor Lib "AppKit" Selector "removeMonitor:" (cls As Ptr, monitor As Ptr)
+Private Declare Function KeysEventWindow Lib "AppKit" Selector "window" (nativeEvent As Ptr) As Ptr
+Private Declare Function KeysKeyCode Lib "AppKit" Selector "keyCode" (nativeEvent As Ptr) As UInt16
+Private Declare Function KeysFlags Lib "AppKit" Selector "modifierFlags" (nativeEvent As Ptr) As Integer
+Private Declare Function KeysRepeat Lib "AppKit" Selector "isARepeat" (nativeEvent As Ptr) As Boolean
+Private Declare Function KeysCharacters Lib "AppKit" Selector "charactersIgnoringModifiers" (nativeEvent As Ptr) As Ptr
+Private Declare Function KeysUTF8 Lib "Foundation" Selector "UTF8String" (value As Ptr) As String
+Private Declare Function KeysCurrentLoop Lib "Foundation" Selector "currentRunLoop" (cls As Ptr) As Ptr
+Private Declare Function KeysCurrentMode Lib "Foundation" Selector "currentMode" (nativeLoop As Ptr) As Ptr
+
+Delegate Function CopyShortcutBlock(nativeBlock As Ptr) As Ptr
+Delegate Sub ReleaseShortcutBlock(nativeBlock As Ptr)
+
+' Buoy 0.72's libSystem stub omits these exported Blocks runtime functions.
+' Resolve them against the already-loaded system runtime instead of altering stubs.
+Private Function KeysBlockCopy(nativeBlock As Ptr) As Ptr
+    Dim address As Ptr = KeysSymbol(CType(-2, Ptr), "_Block_copy")
+    If address = Nil Then Throw New RuntimeException("Blocks copy runtime unavailable")
+    Dim copyBlock As CopyShortcutBlock = CType(address, CopyShortcutBlock)
+    Return copyBlock(nativeBlock)
+End Function
+Private Sub KeysBlockRelease(nativeBlock As Ptr)
+    Dim address As Ptr = KeysSymbol(CType(-2, Ptr), "_Block_release")
+    If address = Nil Then Throw New RuntimeException("Blocks release runtime unavailable")
+    Dim releaseBlock As ReleaseShortcutBlock = CType(address, ReleaseShortcutBlock)
+    releaseBlock(nativeBlock)
+End Sub
+
+Private Function MacShortcut(nativeBlock As Ptr, nativeEvent As Ptr) As Ptr
+    Dim capture As ShortcutBlock
+    KeysCopy(CType(capture, Ptr), nativeBlock, 40)
+    Dim router As BevelNativeShortcuts = FindShortcut(capture.ID - 1)
+    If router = Nil Then Return nativeEvent
+    Dim owner As Window = router.OwnerWindow
+    If owner = Nil Then Return nativeEvent
+    If KeysEventWindow(nativeEvent) <> owner.NativeWidget Then Return nativeEvent
+    Try
+        Dim mode As Ptr = KeysCurrentMode(KeysCurrentLoop(KeysClass("NSRunLoop")))
+        If mode <> Nil Then
+            If KeysUTF8(mode) = "NSEventTrackingRunLoopMode" Then Return nativeEvent
+        End If
+        Dim e As New KeyEvent()
+        e.Key = KeyName.Other
+        Dim code As Integer = KeysKeyCode(nativeEvent)
+        Dim nativeFlags As Integer = KeysFlags(nativeEvent)
+        e.IsRepeat = KeysRepeat(nativeEvent)
+        e.Modifiers = New ModifierKeys()
+        e.Modifiers.Shift = (nativeFlags And 131072) <> 0
+        e.Modifiers.Control = (nativeFlags And 262144) <> 0
+        e.Modifiers.Option = (nativeFlags And 524288) <> 0
+        e.Modifiers.Command = (nativeFlags And 1048576) <> 0
+        If code = 36 Or code = 76 Then e.Key = KeyName.Return
+        If code = 53 Then e.Key = KeyName.Escape
+        Dim characters As String = KeysUTF8(KeysCharacters(nativeEvent))
+        If String.Len(characters) > 0 Then e.Character = String.Asc(characters)
+        If router.DispatchKey(e) Then Return Nil
+    Catch e As Exception
+        router.LastError = e.Message
+    End Try
+    Return nativeEvent
+End Function
+#End If

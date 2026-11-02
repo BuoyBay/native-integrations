@@ -1,0 +1,75 @@
+' Read-only current-user known-folder paths. GUIDs use Windows memory byte order.
+#If TargetWindows Then
+Private Optional Declare Function NativeKnownFolder Lib "shell32" Alias "SHGetKnownFolderPath" (identifier As Ptr, options As UInt32, token As Ptr, ByRef folderPath As Ptr) As Int32
+Private Optional Declare Sub NativeFree Lib "ole32" Alias "CoTaskMemFree" (value As Ptr)
+Private Optional Declare Function NativeWideLength Lib "kernel32" Alias "lstrlenW" (value As Ptr) As Int32
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Private Function ReadFolder(identifierHex As String) As String
+#If TargetWindows Then
+    Dim identifier As Bytes = Bytes.FromHex(identifierHex).Value
+    Dim folderPath As Ptr = Nil
+    Try
+        ' DONT_VERIFY allows an uncreated/redirected directory; CREATE is never used.
+        Dim status As Int32 = NativeKnownFolder(identifier.DataPtr(), 16384, Nil, folderPath)
+        If status < 0 Then
+            Throw New RuntimeException("SHGetKnownFolderPath failed (HRESULT " + Str(status) + ")", status)
+        End If
+        If folderPath = Nil Then
+            Throw New RuntimeException("SHGetKnownFolderPath returned no folderPath")
+        End If
+        Dim count As Integer = NativeWideLength(folderPath)
+        If count <= 0 Or count > 32767 Then
+            Throw New RuntimeException("Known-folder folderPath has an invalid UTF-16 length")
+        End If
+        Dim encoded As New Bytes(count * 2)
+        encoded.Append(folderPath, count * 2)
+        Return String.FromUTF16LE(encoded)
+    Finally
+        ' Microsoft's contract requires freeing the output even after failure.
+        If folderPath <> Nil Then
+            NativeFree(folderPath)
+        End If
+    End Try
+#Else
+    Throw New UnsupportedOperationException("WinShell requires Windows")
+#End If
+End Function
+
+Public Function ProfileDirectory() As String
+    ' FOLDERID_Profile: 5E6C858F-0E22-4760-9AFE-EA3317B67173.
+    Return ReadFolder("8f856c5e220e60479afeea3317b67173")
+End Function
+
+Public Function DocumentsDirectory() As String
+    ' FOLDERID_Documents: FDD39AD0-238F-46AF-ADB4-6C85480369C7.
+    Return ReadFolder("d09ad3fd8f23af46adb46c85480369c7")
+End Function
+
+Public Function DesktopDirectory() As String
+    ' FOLDERID_Desktop: B4BFCC3A-DB2C-424C-B029-7FE99A87C641.
+    Return ReadFolder("3accbfb42cdb4c42b0297fe99a87c641")
+End Function
+
+Public Function DownloadsDirectory() As String
+    ' FOLDERID_Downloads: 374DE290-123F-4565-9164-39C4925E467B.
+    Return ReadFolder("90e24d373f126545916439c4925e467b")
+End Function
+
+Public Function LocalAppDataDirectory() As String
+    ' FOLDERID_LocalAppData: F1B32785-6FBA-4FCF-9D55-7B8E7F157091.
+    Return ReadFolder("8527b3f1ba6fcf4f9d557b8e7f157091")
+End Function
+
+Public Function RoamingAppDataDirectory() As String
+    ' FOLDERID_RoamingAppData: 3EB685DB-65F9-4CF6-A03A-E3EF65729F3D.
+    Return ReadFolder("db85b63ef965f64ca03ae3ef65729f3d")
+End Function

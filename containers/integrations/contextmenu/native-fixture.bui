@@ -1,0 +1,157 @@
+' Built-in Buoy context menus: deliberately does not import gtkcontextmenu.
+Class MenuEvidence
+    Public Shared Property Output As String = ""
+    Public Shared Sub Record(value As String)
+        Print value
+        If MenuEvidence.Output <> "" Then
+            Dim written As Result Of Integer, String = New FileSystemItem(MenuEvidence.Output).AppendAllText(value + "\n")
+            If written.IsErr Then Throw New Exception("Cannot write menu evidence: " + written.Error)
+        End If
+    End Sub
+End Class
+
+Class BuiltinMenuCanvas Inherits Canvas
+    Public Property Host As Window
+    Public Property Builds As Integer = 0
+    Public Property Selections As Integer = 0
+    Public Property LastTag As String = "none"
+    Private Property mOpen As MenuItem
+    Private Property mChecked As MenuItem
+    Private Property mNested As MenuItem
+    Private Property mDeep As MenuItem
+    Private Property mIcon As Picture
+
+    Public Sub Build(base As MenuItem)
+        Me.Builds += 1
+        Me.mOpen = Me.MakeItem("Open", "open")
+        Me.mIcon = New Picture(16, 16)
+        Me.mIcon.Graphics.FillRect(0, 0, 16, 16, Color.RGB(0.1, 0.7, 0.2))
+        Me.mOpen.Icon = Me.mIcon
+        base.AddMenuItem(Me.mOpen)
+        Dim disabled As MenuItem = Me.MakeItem("Unavailable", "disabled")
+        disabled.Enabled = False
+        base.AddMenuItem(disabled)
+        Me.mChecked = Me.MakeItem("Show Details", "checked")
+        Me.mChecked.Checked = True
+        base.AddMenuItem(Me.mChecked)
+        base.AddSeparator()
+        Dim more As MenuItem = Me.MakeItem("More", "more")
+        Me.mNested = Me.MakeItem("Nested Action", "nested")
+        more.AddMenuItem(Me.mNested)
+        Dim deeper As MenuItem = Me.MakeItem("Deeper", "deeper")
+        Me.mDeep = Me.MakeItem("Deep Action", "deep")
+        deeper.AddMenuItem(Me.mDeep)
+        more.AddMenuItem(deeper)
+        base.AddMenuItem(more)
+        Dim disabledMore As MenuItem = Me.MakeItem("Disabled Submenu", "disabled-parent")
+        disabledMore.Enabled = False
+        disabledMore.AddMenuItem(Me.MakeItem("Must not run", "disabled-child"))
+        base.AddMenuItem(disabledMore)
+        base.AddMenuItem(Me.MakeItem("Build " + Str(Me.Builds), "dynamic"))
+        MenuEvidence.Record("built " + Str(Me.Builds))
+    End Sub
+
+    Private Function MakeItem(caption As String, tag As String) As MenuItem
+        Dim item As New MenuItem()
+        item.Caption = caption
+        item.Tag = tag
+        Return item
+    End Function
+
+    Handle ConstructContextualMenu(base As MenuItem, location As Point)
+        MenuEvidence.Record("request " + Str(location.X) + " " + Str(location.Y))
+        Me.Build(base)
+        Me.UpdateTitle()
+    End Handle
+
+    Handle ContextualMenuAction(hitItem As MenuItem)
+        If hitItem = Nil Then Throw New Exception("Nil menu selection")
+        If hitItem.Tag = "disabled" Or hitItem.Tag = "disabled-child" Then Throw New Exception("Disabled item selected")
+        If hitItem.Tag = "open" And Not (hitItem Is Me.mOpen) Then Throw New Exception("Open identity changed")
+        If hitItem.Tag = "checked" And Not (hitItem Is Me.mChecked) Then Throw New Exception("Checked identity changed")
+        If hitItem.Tag = "nested" And Not (hitItem Is Me.mNested) Then Throw New Exception("Nested identity changed")
+        If hitItem.Tag = "deep" And Not (hitItem Is Me.mDeep) Then Throw New Exception("Deep identity changed")
+        Me.Selections += 1
+        Me.LastTag = hitItem.Tag
+        MenuEvidence.Record("selected " + Str(Me.Selections) + " " + hitItem.Tag + " " + hitItem.Caption)
+        Me.UpdateTitle()
+    End Handle
+
+    Public Sub UpdateTitle()
+        If Me.Host <> Nil Then Me.Host.Title = "Buoy Native Context b" + Str(Me.Builds) + " s" + Str(Me.Selections) + " " + Me.LastTag
+    End Sub
+End Class
+
+Class ProgrammaticMenuButton Inherits Button
+    Public Property OwnerCanvas As BuiltinMenuCanvas
+    Private Property mMenu As ContextMenu
+    Handle Action()
+        Me.mMenu = New ContextMenu()
+        Dim item As New MenuItem()
+        item.Caption = "Programmatic Action"
+        item.Tag = "programmatic"
+        Me.mMenu.AddItem(item)
+        MenuEvidence.Record("programmatic-before " + Str(Me.OwnerCanvas.Selections))
+        Dim location As Point = { X: 120.0, Y: 60.0 }
+        Me.mMenu.Show(Me.OwnerCanvas, location)
+        MenuEvidence.Record("programmatic-returned " + Str(Me.OwnerCanvas.Selections))
+    End Handle
+End Class
+
+Class MenuFixtureWindow Inherits Window
+    Handle Closed()
+        MenuEvidence.Record("closed")
+        Application.Quit()
+    End Handle
+End Class
+
+Class MenuFixtureWatchdog Inherits Timer
+    Private Property mTicks As Integer = 0
+    Public Overrides Sub NotifyTick()
+        Me.mTicks += 1
+        If Me.mTicks >= 600 Then
+            MenuEvidence.Record("watchdog-timeout")
+            Application.Quit()
+        End If
+    End Sub
+End Class
+
+Sub Main(args As Array Of String)
+    If Array.Count(args) > 2 Then MenuEvidence.Output = args(2)
+    Dim contract As Boolean = Array.Count(args) > 1 And args(1) = "--contract"
+    Dim w As New MenuFixtureWindow()
+    Dim canvas As New BuiltinMenuCanvas()
+    canvas.Host = w
+    canvas.Move(20, 50, 560, 300)
+    w.Move(100, 100, 600, 380)
+    w.AddSubview(canvas)
+    If contract Then
+        Dim root As New MenuItem()
+        canvas.Build(root)
+        If root.Count() <> 6 Then Throw New Exception("Unexpected public item count")
+        If root.Item(0).Icon = Nil Then Throw New Exception("Lost icon property")
+        If root.Item(1).Enabled Then Throw New Exception("Lost disabled property")
+        If Not root.Item(2).Checked Then Throw New Exception("Lost checked property")
+        If root.Item(3).Item(1).Item(0).Tag <> "deep" Then Throw New Exception("Lost nested model")
+        MenuEvidence.Record("model-contract-passed")
+        Return
+    End If
+    Dim label As New Label()
+    label.Text = "Built-in menu: right-click the canvas."
+    label.Move(20, 10, 390, 30)
+    w.AddSubview(label)
+    Dim showButton As New ProgrammaticMenuButton()
+    showButton.Caption = "Programmatic menu"
+    showButton.OwnerCanvas = canvas
+    showButton.Move(420, 10, 160, 30)
+    w.AddSubview(showButton)
+    canvas.UpdateTitle()
+    w.Show()
+    Dim watchdog As New MenuFixtureWatchdog()
+    watchdog.Period = 1000
+    watchdog.Start()
+    MenuEvidence.Record("ready")
+    Application.Run()
+    watchdog.Stop()
+    MenuEvidence.Record("run-loop-returned")
+End Sub

@@ -1,0 +1,492 @@
+--- a/modules/PDF.bui
++++ b/modules/PDF.bui
+@@ -6,6 +6,13 @@
+ ' libharu's real exported name. See docs-internal/superpowers/specs/
+ ' 2026-08-17-libharu-pdf-package-design.md for the full design.
+ '
++' LOCAL PATCH (buoy workspace integrations/pdf-patch, not an upstream
++' release): PDFGraphics records IGraphics paths and replays them only after
++' selecting colour, alpha and line width, so path painting no longer fails
++' with HPDF_PAGE_INVALID_GMODE (4177). Colour alpha is applied through
++' libharu ExtGState objects. Their HPDF_REAL setters are declared with
++' Single, which Buoy 0.72.0 maps to C float on all six targets.
++'
+ ' NOTE on visibility: this language has no `Friend` (package-internal)
+ ' access modifier — only Public/Private (confirmed by grep across
+ ' runtime/stdlib/*.bui and packages-src/*/modules/*.bui). Members below that
+@@ -95,6 +102,7 @@
+     ''' Internal — see mHasError.
+     Public Property mLastDetailNo As Integer = 0
+     Private Property mCustomFonts As Map Of String, String = New Map Of String, String()
++    Private Property mAlphaStates As Map Of Integer, Ptr = New Map Of Integer, Ptr()
+ 
+     Public Enum PageSize As Integer
+         Letter
+@@ -144,6 +152,28 @@
+         Return Me.mCustomFonts
+     End Function
+ 
++    ''' Internal (local patch) — a cached ExtGState whose /ca and /CA are
++    ''' fillKey and strokeKey divided by 10000. States are document-wide and
++    ''' immutable once a page uses them, so each distinct pair is created once.
++    Public Function AlphaState(fillKey As Integer, strokeKey As Integer) As Ptr
++        Dim key As Integer = fillKey * (PDFAlphaSteps + 1) + strokeKey
++        Dim cached As Optional Of Ptr = Me.mAlphaStates.Get(key)
++        If cached.HasValue Then Return cached.Value
++        Dim ext As Ptr = HPDF_CreateExtGState(Me.mHandle)
++        Me.CheckError()
++        If ext = Nil Then
++            Throw New PDFException("PDFDocument: HPDF_CreateExtGState failed")
++        End If
++        Dim fillAlpha As Single = fillKey / 10000.0
++        Dim strokeAlpha As Single = strokeKey / 10000.0
++        HPDF_ExtGState_SetAlphaFill(ext, fillAlpha)
++        Me.CheckError()
++        HPDF_ExtGState_SetAlphaStroke(ext, strokeAlpha)
++        Me.CheckError()
++        Me.mAlphaStates.Set(key, ext)
++        Return ext
++    End Function
++
+     ''' Throws PDFException if the error callback has stashed a failure
+     ''' since the last check, then clears it. Called after every libharu
+     ''' call this wrapper makes. Internal — conventionally used only by
+@@ -279,6 +309,37 @@
+ Declare Function HPDF_LoadPngImageFromMem Lib "pdf" (pdf As Ptr, buffer As Ptr, size As Integer) As Ptr
+ Declare Function bui_pdf_page_draw_image Lib "pdf" (page As Ptr, image As Ptr, x As Double, y As Double, width As Double, height As Double) As Integer
+ 
++' ── Local patch: constant alpha through libharu ExtGState (/ca, /CA).
++' HPDF_REAL is a C float, so the setters take Single, not Double. HPDF_STATUS
++' is C unsigned long: 32-bit on Windows (LLP64), 64-bit elsewhere (LP64).
++' The patched Windows pdf.dll adds these four existing libharu functions to
++' its export table; Linux and macOS already export them.
++Declare Function HPDF_CreateExtGState Lib "pdf" (pdf As Ptr) As Ptr
++#If TargetWindows Then
++    Declare Function HPDF_ExtGState_SetAlphaFill   Lib "pdf" (ext As Ptr, value As Single) As UInt32
++    Declare Function HPDF_ExtGState_SetAlphaStroke Lib "pdf" (ext As Ptr, value As Single) As UInt32
++    Declare Function HPDF_Page_SetExtGState        Lib "pdf" (page As Ptr, ext As Ptr) As UInt32
++#Else
++    Declare Function HPDF_ExtGState_SetAlphaFill   Lib "pdf" (ext As Ptr, value As Single) As UInt64
++    Declare Function HPDF_ExtGState_SetAlphaStroke Lib "pdf" (ext As Ptr, value As Single) As UInt64
++    Declare Function HPDF_Page_SetExtGState        Lib "pdf" (page As Ptr, ext As Ptr) As UInt64
++#End If
++
++' Alpha is quantized to 1/10000 so equal colours share one ExtGState.
++Const PDFAlphaSteps As Integer = 10000
++
++Private Function __pdf_alpha_key(alpha As Double) As Integer
++    If Not (alpha - alpha = 0.0) Then Return PDFAlphaSteps
++    If alpha <= 0.0 Then Return 0
++    If alpha >= 1.0 Then Return PDFAlphaSteps
++    Dim key As Integer = Math.Round(alpha * 10000.0)
++    Return key
++End Function
++
++Private Function __pdf_finite(v As Double) As Boolean
++    Return v - v = 0.0
++End Function
++
+ ''' One page of a PDFDocument. Draw onto it via Graphics.
+ Public Class PDFPage
+     Private Property mHandle As Ptr
+@@ -317,6 +378,25 @@
+     Private Property mDoc As PDFDocument
+     Private Property mLineStyle As Graphics.LineStyle = Graphics.LineStyle.Solid
+     Private Property mLineStyleStack As Array Of Graphics.LineStyle = []
++    ' Local patch: the IGraphics path is recorded here, in the page's
++    ' top-left/y-down base space, and replayed only when painted. libharu
++    ' rejects colour, alpha and line-width operators inside a PDF path object.
++    ' Ops: 0 MoveTo (2 values), 1 LineTo (2), 2 CurveTo (6), 3 ClosePath (0).
++    Private Property mPathOps As Array Of Integer = []
++    Private Property mPathValues As Array Of Double = []
++    ' Mirror of the CTM concatenated since construction (row-vector affine
++    ' matrix [a b; c d; e f], as in PDF), saved and restored with the state.
++    Private Property mCtmA As Double = 1.0
++    Private Property mCtmB As Double = 0.0
++    Private Property mCtmC As Double = 0.0
++    Private Property mCtmD As Double = 1.0
++    Private Property mCtmE As Double = 0.0
++    Private Property mCtmF As Double = 0.0
++    Private Property mCtmStack As Array Of Double = []
++    ' The /ca and /CA currently in the PDF graphics state, in 1/10000 steps.
++    Private Property mFillAlphaKey As Integer = 10000
++    Private Property mStrokeAlphaKey As Integer = 10000
++    Private Property mAlphaStack As Array Of Integer = []
+ 
+     ''' Internal — constructed only by PDFPage.Graphics. No Friend modifier
+     ''' exists in this language (see file header note); public but
+@@ -378,39 +458,112 @@
+         Me.mDoc.CheckError()
+     End Sub
+ 
++    ''' Saves the PDF graphics state (CTM, clip, colours, line width, dash,
++    ''' alpha) plus this wrapper's mirrors of the line style, CTM and alpha.
++    ''' The current path is not part of the state, matching native Graphics.
+     Public Sub Save()
+-        Array.Append(Me.mLineStyleStack, Me.mLineStyle)
+         HPDF_Page_GSave(Me.mHandle)
+         Me.mDoc.CheckError()
++        Array.Append(Me.mLineStyleStack, Me.mLineStyle)
++        Array.Append(Me.mCtmStack, Me.mCtmA)
++        Array.Append(Me.mCtmStack, Me.mCtmB)
++        Array.Append(Me.mCtmStack, Me.mCtmC)
++        Array.Append(Me.mCtmStack, Me.mCtmD)
++        Array.Append(Me.mCtmStack, Me.mCtmE)
++        Array.Append(Me.mCtmStack, Me.mCtmF)
++        Array.Append(Me.mAlphaStack, Me.mFillAlphaKey)
++        Array.Append(Me.mAlphaStack, Me.mStrokeAlphaKey)
+     End Sub
+ 
++    ''' Restores the most recent Save. An unmatched Restore is a no-op, so it
++    ''' can never pop the page's own top-left coordinate flip.
+     Public Sub Restore()
++        If Array.Count(Me.mLineStyleStack) = 0 Then Return
+         HPDF_Page_GRestore(Me.mHandle)
+         Me.mDoc.CheckError()
+-        If Array.Count(Me.mLineStyleStack) > 0 Then
+-            Dim topIndex As Integer = Array.LastIndex(Me.mLineStyleStack)
+-            Me.mLineStyle = Me.mLineStyleStack(topIndex)
+-            Array.RemoveAt(Me.mLineStyleStack, topIndex)
+-        End If
++        Dim topIndex As Integer = Array.LastIndex(Me.mLineStyleStack)
++        Me.mLineStyle = Me.mLineStyleStack(topIndex)
++        Array.RemoveAt(Me.mLineStyleStack, topIndex)
++        Dim base As Integer = Array.Count(Me.mCtmStack) - 6
++        Me.mCtmA = Me.mCtmStack(base)
++        Me.mCtmB = Me.mCtmStack(base + 1)
++        Me.mCtmC = Me.mCtmStack(base + 2)
++        Me.mCtmD = Me.mCtmStack(base + 3)
++        Me.mCtmE = Me.mCtmStack(base + 4)
++        Me.mCtmF = Me.mCtmStack(base + 5)
++        Array.ResizeTo(Me.mCtmStack, base)
++        Dim alphaBase As Integer = Array.Count(Me.mAlphaStack) - 2
++        Me.mFillAlphaKey = Me.mAlphaStack(alphaBase)
++        Me.mStrokeAlphaKey = Me.mAlphaStack(alphaBase + 1)
++        Array.ResizeTo(Me.mAlphaStack, alphaBase)
++    End Sub
++
++    ''' Concatenates [a b; c d; e f] onto the page CTM and its mirror.
++    Private Sub Concat(a As Double, b As Double, c As Double, d As Double, e As Double, f As Double)
++        bui_pdf_page_concat(Me.mHandle, a, b, c, d, e, f)
++        Me.mDoc.CheckError()
++        Dim na As Double = a * Me.mCtmA + b * Me.mCtmC
++        Dim nb As Double = a * Me.mCtmB + b * Me.mCtmD
++        Dim nc As Double = c * Me.mCtmA + d * Me.mCtmC
++        Dim nd As Double = c * Me.mCtmB + d * Me.mCtmD
++        Dim ne As Double = e * Me.mCtmA + f * Me.mCtmC + Me.mCtmE
++        Dim nf As Double = e * Me.mCtmB + f * Me.mCtmD + Me.mCtmF
++        Me.mCtmA = na
++        Me.mCtmB = nb
++        Me.mCtmC = nc
++        Me.mCtmD = nd
++        Me.mCtmE = ne
++        Me.mCtmF = nf
+     End Sub
+ 
+     Public Sub Translate(dx As Double, dy As Double)
+-        bui_pdf_page_concat(Me.mHandle, 1.0, 0.0, 0.0, 1.0, dx, dy)
+-        Me.mDoc.CheckError()
++        Me.Concat(1.0, 0.0, 0.0, 1.0, dx, dy)
+     End Sub
+ 
+     Public Sub Scale(sx As Double, sy As Double)
+-        bui_pdf_page_concat(Me.mHandle, sx, 0.0, 0.0, sy, 0.0, 0.0)
+-        Me.mDoc.CheckError()
++        Me.Concat(sx, 0.0, 0.0, sy, 0.0, 0.0)
+     End Sub
+ 
+     Public Sub Rotate(angle As Double)
+         Dim c As Double = Math.Cos(angle)
+         Dim s As Double = Math.Sin(angle)
+-        bui_pdf_page_concat(Me.mHandle, c, s, -s, c, 0.0, 0.0)
++        Me.Concat(c, s, -s, c, 0.0, 0.0)
++    End Sub
++
++    ''' Sets /ca and /CA (in 1/10000 steps) when they differ from the state.
++    Private Sub SetAlphaKeys(fillKey As Integer, strokeKey As Integer)
++        If fillKey = Me.mFillAlphaKey And strokeKey = Me.mStrokeAlphaKey Then Return
++        Dim ext As Ptr = Me.mDoc.AlphaState(fillKey, strokeKey)
++        HPDF_Page_SetExtGState(Me.mHandle, ext)
+         Me.mDoc.CheckError()
++        Me.mFillAlphaKey = fillKey
++        Me.mStrokeAlphaKey = strokeKey
+     End Sub
+ 
++    ''' Selects c's colour and alpha for filling, leaving stroke alpha alone.
++    ''' Returns False, selecting nothing, when c is fully transparent.
++    Private Function UseFill(c As Color) As Boolean
++        Dim key As Integer = __pdf_alpha_key(c.A)
++        If key = 0 Then Return False
++        bui_pdf_page_set_rgb_fill(Me.mHandle, c.R, c.G, c.B)
++        Me.mDoc.CheckError()
++        Me.SetAlphaKeys(key, Me.mStrokeAlphaKey)
++        Return True
++    End Function
++
++    ''' Selects c's colour and alpha plus lineWidth for stroking, leaving fill
++    ''' alpha alone. Returns False when c is fully transparent.
++    Private Function UseStroke(lineWidth As Double, c As Color) As Boolean
++        Dim key As Integer = __pdf_alpha_key(c.A)
++        If key = 0 Then Return False
++        bui_pdf_page_set_rgb_stroke(Me.mHandle, c.R, c.G, c.B)
++        Me.mDoc.CheckError()
++        bui_pdf_page_set_line_width(Me.mHandle, lineWidth)
++        Me.mDoc.CheckError()
++        Me.SetAlphaKeys(Me.mFillAlphaKey, key)
++        Return True
++    End Function
++
+     Public Sub ClipToRect(x As Double, y As Double, w As Double, h As Double)
+         bui_pdf_page_rectangle(Me.mHandle, x, y, w, h)
+         Me.mDoc.CheckError()
+@@ -421,8 +574,7 @@
+     End Sub
+ 
+     Public Sub FillRect(x As Double, y As Double, w As Double, h As Double, c As Color)
+-        bui_pdf_page_set_rgb_fill(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
++        If Not Me.UseFill(c) Then Return
+         bui_pdf_page_rectangle(Me.mHandle, x, y, w, h)
+         Me.mDoc.CheckError()
+         HPDF_Page_Fill(Me.mHandle)
+@@ -430,10 +582,7 @@
+     End Sub
+ 
+     Public Sub StrokeRect(x As Double, y As Double, w As Double, h As Double, lineWidth As Double, c As Color)
+-        bui_pdf_page_set_rgb_stroke(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+-        bui_pdf_page_set_line_width(Me.mHandle, lineWidth)
+-        Me.mDoc.CheckError()
++        If Not Me.UseStroke(lineWidth, c) Then Return
+         bui_pdf_page_rectangle(Me.mHandle, x, y, w, h)
+         Me.mDoc.CheckError()
+         HPDF_Page_Stroke(Me.mHandle)
+@@ -462,8 +611,7 @@
+     End Sub
+ 
+     Public Sub FillRoundedRect(x As Double, y As Double, w As Double, h As Double, radius As Double, c As Color)
+-        bui_pdf_page_set_rgb_fill(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
++        If Not Me.UseFill(c) Then Return
+         Me.BuildRoundedRectPath(x, y, w, h, radius)
+         Me.mDoc.CheckError()
+         HPDF_Page_Fill(Me.mHandle)
+@@ -471,10 +619,7 @@
+     End Sub
+ 
+     Public Sub StrokeRoundedRect(x As Double, y As Double, w As Double, h As Double, radius As Double, lineWidth As Double, c As Color)
+-        bui_pdf_page_set_rgb_stroke(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+-        bui_pdf_page_set_line_width(Me.mHandle, lineWidth)
+-        Me.mDoc.CheckError()
++        If Not Me.UseStroke(lineWidth, c) Then Return
+         Me.BuildRoundedRectPath(x, y, w, h, radius)
+         Me.mDoc.CheckError()
+         HPDF_Page_Stroke(Me.mHandle)
+@@ -482,8 +627,7 @@
+     End Sub
+ 
+     Public Sub FillOval(x As Double, y As Double, w As Double, h As Double, c As Color)
+-        bui_pdf_page_set_rgb_fill(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
++        If Not Me.UseFill(c) Then Return
+         bui_pdf_page_ellipse(Me.mHandle, x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0)
+         Me.mDoc.CheckError()
+         HPDF_Page_Fill(Me.mHandle)
+@@ -491,10 +635,7 @@
+     End Sub
+ 
+     Public Sub StrokeOval(x As Double, y As Double, w As Double, h As Double, lineWidth As Double, c As Color)
+-        bui_pdf_page_set_rgb_stroke(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+-        bui_pdf_page_set_line_width(Me.mHandle, lineWidth)
+-        Me.mDoc.CheckError()
++        If Not Me.UseStroke(lineWidth, c) Then Return
+         bui_pdf_page_ellipse(Me.mHandle, x + w / 2.0, y + h / 2.0, w / 2.0, h / 2.0)
+         Me.mDoc.CheckError()
+         HPDF_Page_Stroke(Me.mHandle)
+@@ -502,10 +643,7 @@
+     End Sub
+ 
+     Public Sub DrawLine(x1 As Double, y1 As Double, x2 As Double, y2 As Double, lineWidth As Double, c As Color)
+-        bui_pdf_page_set_rgb_stroke(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+-        bui_pdf_page_set_line_width(Me.mHandle, lineWidth)
+-        Me.mDoc.CheckError()
++        If Not Me.UseStroke(lineWidth, c) Then Return
+         bui_pdf_page_move_to(Me.mHandle, x1, y1)
+         Me.mDoc.CheckError()
+         bui_pdf_page_line_to(Me.mHandle, x2, y2)
+@@ -514,46 +652,131 @@
+         Me.mDoc.CheckError()
+     End Sub
+ 
+-    ''' No-op: libharu implicitly starts a fresh path on the next MoveTo
+-    ''' (Fill/Stroke already consume and clear the previous one per PDF
+-    ''' path-painting semantics) — there is no explicit "begin" call.
++    ''' Starts a new, empty path (local patch: previously a no-op, so an
++    ''' unpainted path leaked into the next one).
+     Public Sub BeginPath()
++        Array.Clear(Me.mPathOps)
++        Array.Clear(Me.mPathValues)
++    End Sub
++
++    ''' Records (x, y), transformed by the current CTM as native Graphics
++    ''' does: a transform changed mid-path affects only later points.
++    Private Sub RecordPoint(x As Double, y As Double)
++        Array.Append(Me.mPathValues, Me.mCtmA * x + Me.mCtmC * y + Me.mCtmE)
++        Array.Append(Me.mPathValues, Me.mCtmB * x + Me.mCtmD * y + Me.mCtmF)
+     End Sub
+ 
+     Public Sub MoveTo(x As Double, y As Double)
+-        bui_pdf_page_move_to(Me.mHandle, x, y)
+-        Me.mDoc.CheckError()
++        Array.Append(Me.mPathOps, 0)
++        Me.RecordPoint(x, y)
+     End Sub
+ 
+     Public Sub LineTo(x As Double, y As Double)
+-        bui_pdf_page_line_to(Me.mHandle, x, y)
+-        Me.mDoc.CheckError()
++        Array.Append(Me.mPathOps, 1)
++        Me.RecordPoint(x, y)
+     End Sub
+ 
+     Public Sub CurveTo(cp1x As Double, cp1y As Double, cp2x As Double, cp2y As Double, x As Double, y As Double)
+-        bui_pdf_page_curve_to(Me.mHandle, cp1x, cp1y, cp2x, cp2y, x, y)
+-        Me.mDoc.CheckError()
++        Array.Append(Me.mPathOps, 2)
++        Me.RecordPoint(cp1x, cp1y)
++        Me.RecordPoint(cp2x, cp2y)
++        Me.RecordPoint(x, y)
+     End Sub
+ 
+     Public Sub ClosePath()
+-        HPDF_Page_ClosePath(Me.mHandle)
+-        Me.mDoc.CheckError()
++        Array.Append(Me.mPathOps, 3)
+     End Sub
+ 
++    ''' Emits the recorded path in the current user space. Returns False,
++    ''' emitting nothing, for an empty path, a singular CTM or a non-finite
++    ''' coordinate. A LineTo or CurveTo without a current point starts the
++    ''' subpath at its first point, matching native Graphics.
++    Private Function EmitPath() As Boolean
++        Dim count As Integer = Array.Count(Me.mPathOps)
++        If count = 0 Then Return False
++        Dim det As Double = Me.mCtmA * Me.mCtmD - Me.mCtmB * Me.mCtmC
++        If det = 0.0 Or Not __pdf_finite(det) Then Return False
++        Dim ia As Double = Me.mCtmD / det
++        Dim ib As Double = -Me.mCtmB / det
++        Dim ic As Double = -Me.mCtmC / det
++        Dim id As Double = Me.mCtmA / det
++        Dim ie As Double = (Me.mCtmC * Me.mCtmF - Me.mCtmD * Me.mCtmE) / det
++        Dim iff As Double = (Me.mCtmB * Me.mCtmE - Me.mCtmA * Me.mCtmF) / det
++        Dim local As Array Of Double = []
++        Dim n As Integer = Array.Count(Me.mPathValues)
++        Dim i As Integer = 0
++        While i < n
++            Dim px As Double = Me.mPathValues(i)
++            Dim py As Double = Me.mPathValues(i + 1)
++            Dim lx As Double = ia * px + ic * py + ie
++            Dim ly As Double = ib * px + id * py + iff
++            If Not (__pdf_finite(lx) And __pdf_finite(ly)) Then Return False
++            Array.Append(local, lx)
++            Array.Append(local, ly)
++            i += 2
++        End While
++        Dim emitted As Boolean = False
++        Dim hasPoint As Boolean = False
++        Dim v As Integer = 0
++        For k As Integer = 0 To count - 1
++            Dim op As Integer = Me.mPathOps(k)
++            If op = 0 Then
++                bui_pdf_page_move_to(Me.mHandle, local(v), local(v + 1))
++                v += 2
++                hasPoint = True
++            ElseIf op = 1 Then
++                If hasPoint Then
++                    bui_pdf_page_line_to(Me.mHandle, local(v), local(v + 1))
++                Else
++                    bui_pdf_page_move_to(Me.mHandle, local(v), local(v + 1))
++                End If
++                v += 2
++                hasPoint = True
++            ElseIf op = 2 Then
++                If Not hasPoint Then
++                    bui_pdf_page_move_to(Me.mHandle, local(v), local(v + 1))
++                End If
++                bui_pdf_page_curve_to(Me.mHandle, local(v), local(v + 1), _
++                    local(v + 2), local(v + 3), local(v + 4), local(v + 5))
++                v += 6
++                hasPoint = True
++            ElseIf hasPoint Then
++                HPDF_Page_ClosePath(Me.mHandle)
++            Else
++                Continue For
++            End If
++            emitted = True
++            Me.mDoc.CheckError()
++        Next
++        Return emitted
++    End Function
++
++    ''' Fills the current path with the nonzero rule, then clears it, as
++    ''' native Graphics does. Colour and alpha are selected before the path.
+     Public Sub FillPath(c As Color)
+-        bui_pdf_page_set_rgb_fill(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+-        HPDF_Page_Fill(Me.mHandle)
+-        Me.mDoc.CheckError()
++        Try
++            If Not Me.UseFill(c) Then Return
++            If Me.EmitPath() Then
++                HPDF_Page_Fill(Me.mHandle)
++                Me.mDoc.CheckError()
++            End If
++        Finally
++            Me.BeginPath()
++        End Try
+     End Sub
+ 
++    ''' Strokes the current path, then clears it, as native Graphics does.
++    ''' The line width is in the user space current at this call.
+     Public Sub StrokePath(lineWidth As Double, c As Color)
+-        bui_pdf_page_set_rgb_stroke(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+-        bui_pdf_page_set_line_width(Me.mHandle, lineWidth)
+-        Me.mDoc.CheckError()
+-        HPDF_Page_Stroke(Me.mHandle)
+-        Me.mDoc.CheckError()
++        Try
++            If Not Me.UseStroke(lineWidth, c) Then Return
++            If Me.EmitPath() Then
++                HPDF_Page_Stroke(Me.mHandle)
++                Me.mDoc.CheckError()
++            End If
++        Finally
++            Me.BeginPath()
++        End Try
+     End Sub
+ 
+     ''' Resolves a caller-supplied font name to libharu's real font-name
+@@ -601,9 +824,8 @@
+     ''' at the same device position, so text renders right-side-up in the
+     ''' same top-left/y-down coordinates as every other IGraphics call.
+     Public Sub DrawString(text As String, x As Double, y As Double, fontName As String, fontSize As Double, c As Color)
++        If Not Me.UseFill(c) Then Return
+         Me.ResolveFont(fontName, fontSize)
+-        bui_pdf_page_set_rgb_fill(Me.mHandle, c.R, c.G, c.B)
+-        Me.mDoc.CheckError()
+         HPDF_Page_GSave(Me.mHandle)
+         Me.mDoc.CheckError()
+         bui_pdf_page_concat(Me.mHandle, 1.0, 0.0, 0.0, -1.0, 0.0, 2.0 * y)
+@@ -665,6 +887,8 @@
+         ' in DrawString) a local GSave/counter-concat/GRestore cancels the
+         ' outer flip's mirror effect just for this one draw call, without
+         ' disturbing the CTM anywhere else.
++        ' Pictures carry their own alpha; draw them with an opaque /ca.
++        Me.SetAlphaKeys(PDFAlphaSteps, Me.mStrokeAlphaKey)
+         HPDF_Page_GSave(Me.mHandle)
+         Me.mDoc.CheckError()
+         bui_pdf_page_concat(Me.mHandle, 1.0, 0.0, 0.0, -1.0, 0.0, 2.0 * y + h)

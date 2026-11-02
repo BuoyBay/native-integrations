@@ -1,0 +1,381 @@
+Import desktopmenus
+Import plistkit
+Import bundleinfo
+Import filemetadata
+Import diskspace
+Import filetypes
+Import systeminfo
+Import speech
+Import sound
+Import pdfkit
+Import printing
+Import spellcheck
+Import richtext
+
+Window MoreIntegrationsLayout
+    Title = "More macOS Integrations"
+    Frame = (140, 100, 1060, 790)
+    Control Label heading
+        Text = "Files, documents and media"
+        FontSize = 26.0
+        Bold = True
+        Frame = (24, 20, 1008, 36)
+    End Control
+    Control Label subtitle
+        Text = "Explore twelve more native features using local samples or a file you choose."
+        Frame = (24, 62, 1008, 24)
+    End Control
+    Control Button plistButton
+        Caption = "Property-list roundtrip"
+        Frame = (24, 108, 492, 32)
+    End Control
+    Control Button bundleButton
+        Caption = "App bundle and resources"
+        Frame = (24, 152, 492, 32)
+    End Control
+    Control Button metadataButton
+        Caption = "Read selected file metadata"
+        Frame = (24, 196, 492, 32)
+    End Control
+    Control Button diskButton
+        Caption = "Read selected disk capacity"
+        Frame = (24, 240, 492, 32)
+    End Control
+    Control Button typesButton
+        Caption = "Inspect PDF file type"
+        Frame = (24, 284, 492, 32)
+    End Control
+    Control Button systemButton
+        Caption = "Read system information"
+        Frame = (24, 328, 492, 32)
+    End Control
+    Control Button voicesButton
+        Caption = "List installed speech voices"
+        Frame = (540, 108, 492, 32)
+    End Control
+    Control Button soundButton
+        Caption = "Play bundled test tone"
+        Frame = (540, 152, 492, 32)
+    End Control
+    Control Button pdfButton
+        Caption = "Read PDF text and title"
+        Frame = (540, 196, 492, 32)
+    End Control
+    Control Button printingButton
+        Caption = "Create report PDF in memory"
+        Frame = (540, 240, 492, 32)
+    End Control
+    Control Button spellingButton
+        Caption = "Check sample spelling"
+        Frame = (540, 284, 492, 32)
+    End Control
+    Control Button rtfButton
+        Caption = "Rich-text roundtrip"
+        Frame = (540, 328, 492, 32)
+    End Control
+    Control Button chooseButton
+        Caption = "Choose file for metadata…"
+        Frame = (24, 384, 320, 32)
+    End Control
+    Control Button choosePDFButton
+        Caption = "Choose PDF…"
+        Frame = (366, 384, 320, 32)
+    End Control
+    Control Button printButton
+        Caption = "Print report…"
+        Frame = (708, 384, 324, 32)
+    End Control
+    Control Label selection
+        Frame = (24, 430, 1008, 24)
+    End Control
+    Control Label printSample
+        Text = "Buoy · native documents and media"
+        FontSize = 20.0
+        Frame = (24, 468, 1008, 40)
+    End Control
+    Control TextArea report
+        IsReadOnly = True
+        Frame = (24, 526, 1008, 240)
+    End Control
+End Window
+
+Public Class MoreIntegrationsWindow Inherits MoreIntegrationsLayout
+    Public Property SelectedFile As FileSystemItem = Nil
+    Public Property Reader As PDFReader = Nil
+    Public Property Audio As SoundPlayer = Nil
+    Public Property ResourcesClosed As Boolean = False
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.SetMinSize(1060.0, 790.0)
+        Me.MenuBar = StandardDesktopMenuBar()
+        Me.SelectedFile = FileSystemItem.AppResource("integration-sample.txt")
+        If Me.SelectedFile <> Nil Then Me.selection.Text = "Selected file · " + Me.SelectedFile.Name()
+        Dim pdfFile As FileSystemItem = FileSystemItem.AppResource("integration-sample.pdf")
+        If pdfFile <> Nil Then Me.Reader = New PDFReader(pdfFile)
+        Dim soundFile As FileSystemItem = FileSystemItem.AppResource("integration-tone.wav")
+        If soundFile <> Nil Then Me.Audio = New SoundPlayer(soundFile)
+        Me.report.Text = "Choose an action above. The bundled tone plays only when you click Play.\nSpeech lists installed voices silently. Print report opens the native print panel.\nMetadata and PDF reading stay on this computer."
+    End Sub
+
+    Public Sub ReleaseResources()
+        If Me.ResourcesClosed Then Return
+        Me.ResourcesClosed = True
+        If Me.Audio <> Nil Then Me.Audio.Close()
+        Me.Audio = Nil
+        If Me.Reader <> Nil Then Me.Reader.Close()
+        Me.Reader = Nil
+    End Sub
+
+    Public Sub Destructor()
+        Me.ReleaseResources()
+    End Sub
+
+    Public Sub Demo(action As String)
+        Select Case action
+            Case "plist"
+                Dim source As JSONItem = Json.Parse("{\"greeting\":\"Hello, Café Δ\",\"count\":12}")
+                Dim encoded As Bytes = EncodePropertyList(source, True)
+                Me.report.Text = "Property-list roundtrip · " + Str(encoded.Count) + " bytes\n" + Json.Stringify(DecodePropertyList(encoded))
+            Case "bundle"
+                Dim bundle As New BundleSnapshot()
+                Me.report.Text = "App · " + bundle.Name + "\nIdentifier · " + bundle.Identifier + "\nVersion · " + bundle.Version + " (" + bundle.Build + ")\nLocation · " + bundle.Path + "\nBundled sample available · " + Str(bundle.Resource("integration-sample", "txt").HasValue)
+            Case "metadata"
+                If Me.SelectedFile = Nil Then Throw New Exception("Choose a local file first.")
+                Dim metadata As New FileMetadataSnapshot(Me.SelectedFile)
+                Me.report.Text = "File · " + metadata.DisplayName + "\nHidden · " + Str(metadata.IsHidden) + " · package · " + Str(metadata.IsPackage) + "\nFinder tags · " + Str(Array.Count(metadata.Tags))
+                For Each tag As String In metadata.Tags
+                    Me.report.Text += "\n• " + tag
+                Next
+            Case "disk"
+                If Me.SelectedFile = Nil Then Throw New Exception("Choose a local file first.")
+                Dim disk As New DiskSpaceSnapshot(Me.SelectedFile)
+                Me.report.Text = "Disk containing " + Me.SelectedFile.Name() + "\nCapacity · " + Str(disk.TotalBytes) + " bytes\nAvailable · " + Str(disk.FreeBytes) + " bytes"
+            Case "types"
+                Dim kind As New FileTypeInfo("pdf")
+                Me.report.Text = kind.Description + "\nType · " + kind.Identifier + "\nMIME · " + kind.MIMEType + "\nConforms to document content · " + Str(kind.ConformsTo("public.content"))
+            Case "system"
+                Dim info As New SystemInfoSnapshot()
+                Me.report.Text = info.OperatingSystem + "\nProcessors · " + Str(info.ActiveProcessors) + " active of " + Str(info.ProcessorCount) + "\nPhysical memory · " + Str(info.MemoryBytes) + " bytes\nUptime · " + Str(info.UptimeSeconds) + " seconds\nLow power mode · " + Str(info.LowPowerMode)
+            Case "voices"
+                Dim voices As Array Of SpeechVoice = SpeechVoices()
+                Me.report.Text = "Installed voices · " + Str(Array.Count(voices))
+                Dim shown As Integer = 0
+                For Each voice As SpeechVoice In voices
+                    If shown >= 12 Then Exit For
+                    Me.report.Text += "\n" + voice.Name + " · " + voice.Language
+                    shown += 1
+                Next
+                Me.report.Text += "\nNo speech was started."
+            Case "sound"
+                If Me.Audio = Nil Then Throw New Exception("The bundled tone is unavailable.")
+                If Me.Audio.IsPlaying Then
+                    Me.Audio.Stop()
+                    Me.report.Text = "Test tone stopped."
+                Else
+                    Me.report.Text = "Play accepted · " + Str(Me.Audio.Play()) + "\nDuration · " + Str(Me.Audio.Duration) + " seconds"
+                End If
+            Case "pdf"
+                If Me.Reader = Nil Then Throw New Exception("Choose a PDF first.")
+                Me.report.Text = "PDF title · " + Me.Reader.Metadata("Title") + "\nPages · " + Str(Me.Reader.PageCount) + " · locked · " + Str(Me.Reader.IsLocked)
+                If Not Me.Reader.IsLocked And Me.Reader.PageCount > 0 Then Me.report.Text += "\n\n" + Me.Reader.PageText(0)
+            Case "printing"
+                Dim pdf As Bytes = ExportControlPDF(Me.printSample)
+                If pdf.Count < 100 Then Throw New Exception("The report PDF is empty.")
+                Dim settings As New PrintSettingsSnapshot()
+                Me.report.Text = "Report PDF created · " + Str(pdf.Count) + " bytes\nPaper · " + settings.PaperName + "\nThe PDF is in memory. Use Print report to open print and Save as PDF options."
+            Case "spelling"
+                Dim match As Optional Of SpellingMatch = FirstMisspelling("Hello spelingg", "en_US")
+                Me.report.Text = "Sample · Hello spelingg"
+                If match.HasValue Then
+                    Me.report.Text += "\nPossible misspelling · " + match.Value.Word
+                    Dim suggestions As Array Of String = SpellingSuggestions(match.Value.Word, "en_US", 5)
+                    For Each suggestion As String In suggestions
+                        Me.report.Text += "\n• " + suggestion
+                    Next
+                Else
+                    Me.report.Text += "\nNo misspelling found with the installed dictionary."
+                End If
+            Case "rtf"
+                Dim text As String = "Hello, Café Δ 😀"
+                Dim encoded As Bytes = EncodeRTF(text)
+                Dim decoded As String = DecodeRTF(encoded)
+                If decoded <> text Then Throw New Exception("The rich-text roundtrip changed the text.")
+                Me.report.Text = "Rich-text roundtrip · " + Str(encoded.Count) + " bytes\n" + decoded
+        End Select
+    End Sub
+
+    Public Sub RunSmoke()
+        If Me.SelectedFile = Nil Or Me.Reader = Nil Or Me.Audio = Nil Then Throw New Exception("More integrations fixtures missing")
+        If Me.Audio.IsPlaying Then Throw New Exception("Audio construction must be silent")
+        Dim actions As Array Of String = ["plist", "bundle", "metadata", "disk", "types", "system", "voices", "pdf", "printing", "spelling", "rtf"]
+        For Each action As String In actions
+            Me.Demo(action)
+        Next
+        If Me.Reader.PageCount <> 1 Then Throw New Exception("PDF fixture page count changed")
+        If Me.Audio.Duration <= 0.0 Then Throw New Exception("Tone fixture duration missing")
+    End Sub
+    With plistButton
+        Handle Action()
+            Try
+                Me.Demo("plist")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With bundleButton
+        Handle Action()
+            Try
+                Me.Demo("bundle")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With metadataButton
+        Handle Action()
+            Try
+                Me.Demo("metadata")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With diskButton
+        Handle Action()
+            Try
+                Me.Demo("disk")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With typesButton
+        Handle Action()
+            Try
+                Me.Demo("types")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With systemButton
+        Handle Action()
+            Try
+                Me.Demo("system")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With voicesButton
+        Handle Action()
+            Try
+                Me.Demo("voices")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With soundButton
+        Handle Action()
+            Try
+                Me.Demo("sound")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With pdfButton
+        Handle Action()
+            Try
+                Me.Demo("pdf")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With printingButton
+        Handle Action()
+            Try
+                Me.Demo("printing")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With spellingButton
+        Handle Action()
+            Try
+                Me.Demo("spelling")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With rtfButton
+        Handle Action()
+            Try
+                Me.Demo("rtf")
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With chooseButton
+        Handle Action()
+            Try
+                Dim dialog As New OpenFileDialog()
+                If dialog.Show(Me) Then
+                    Me.SelectedFile = dialog.SelectedItem
+                    Me.selection.Text = "Selected file · " + Me.SelectedFile.Name()
+                    Me.Demo("metadata")
+                End If
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With choosePDFButton
+        Handle Action()
+            Try
+                Dim dialog As New OpenFileDialog()
+                If dialog.Show(Me) Then
+                    Dim nextReader As New PDFReader(dialog.SelectedItem)
+                    If Me.Reader <> Nil Then Me.Reader.Close()
+                    Me.Reader = nextReader
+                    Me.Demo("pdf")
+                End If
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With printButton
+        Handle Action()
+            Try
+                Dim completed As Boolean = PrintControl(Me.printSample)
+                Me.report.Text = "Print panel completed · " + Str(completed)
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    Handle MenuSelected(item As MenuItem) As Boolean
+        Return PerformDesktopCommand(Me, item.Tag)
+    End Handle
+    Handle MenuNeedsUpdate(menu As Menu)
+        RegisterSystemMenus()
+        UpdateNativeEditingCommands(Me)
+    End Handle
+    Handle Activated()
+        RegisterSystemMenus()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.report.Move(24, 526, width - 48, height - 550)
+    End Handle
+    Handle Closed()
+        Me.ReleaseResources()
+    End Handle
+End Class

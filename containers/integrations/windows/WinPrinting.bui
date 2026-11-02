@@ -1,0 +1,563 @@
+' Native Windows printer discovery and explicit Unicode GDI text jobs.
+Import "../printing/printingtypes"
+
+Public Class WindowsPrinterInfo
+    Public Property Name As String
+    Public Property IsDefault As Boolean
+End Class
+
+#If TargetWindows Then
+Sequential Structure WinPrintingPrinter4
+    PrinterName As Ptr
+    ServerName As Ptr
+    Attributes As UInt32
+End Structure
+
+Sequential Structure WinPrintingDocument
+    Size As Int32
+    DocumentName As Ptr
+    OutputName As Ptr
+    DataType As Ptr
+    Options As UInt32
+End Structure
+
+Sequential Structure WinPrintingSize
+    Width As Int32
+    Height As Int32
+End Structure
+
+Delegate Function WinPrintingEnum(options As UInt32, serverName As Ptr, level As UInt32, buffer As Ptr, capacity As UInt32, ByRef required As UInt32, ByRef returned As UInt32) As Int32
+Delegate Function WinPrintingDefault(buffer As Ptr, ByRef capacity As UInt32) As Int32
+Private Optional Declare Function NativeSystemDirectory Lib "kernel32" Alias "GetSystemDirectoryW" (buffer As Ptr, capacity As UInt32) As UInt32
+Private Optional Declare Function NativeLoad Lib "kernel32" Alias "LoadLibraryExW" (fileName As Ptr, fileHandle As Ptr, options As UInt32) As Ptr
+Private Optional Declare Function NativeSymbol Lib "kernel32" Alias "GetProcAddress" (moduleHandle As Ptr, symbolName As CString) As Ptr
+Private Optional Declare Function NativeRelease Lib "kernel32" Alias "FreeLibrary" (moduleHandle As Ptr) As Int32
+Private Optional Declare Function NativeError Lib "kernel32" Alias "GetLastError" () As UInt32
+Private Optional Declare Function NativeCopyPrinter Lib "c" Alias "memcpy" (ByRef destination As WinPrintingPrinter4, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function NativeCreateDC Lib "gdi32" Alias "CreateDCW" (driverName As Ptr, deviceName As Ptr, portName As Ptr, settings As Ptr) As Ptr
+Private Optional Declare Function NativeDeleteDC Lib "gdi32" Alias "DeleteDC" (device As Ptr) As Int32
+Private Optional Declare Function NativeCaps Lib "gdi32" Alias "GetDeviceCaps" (device As Ptr, index As Int32) As Int32
+Private Optional Declare Function NativeCreateFont Lib "gdi32" Alias "CreateFontW" (height As Int32, width As Int32, escapement As Int32, orientation As Int32, weight As Int32, italic As UInt32, underline As UInt32, strikeout As UInt32, charset As UInt32, precision As UInt32, clipping As UInt32, quality As UInt32, pitch As UInt32, faceName As Ptr) As Ptr
+Private Optional Declare Function NativeSelect Lib "gdi32" Alias "SelectObject" (device As Ptr, obj As Ptr) As Ptr
+Private Optional Declare Function NativeDeleteObject Lib "gdi32" Alias "DeleteObject" (obj As Ptr) As Int32
+Private Optional Declare Function NativeExtent Lib "gdi32" Alias "GetTextExtentExPointW" (device As Ptr, text As Ptr, count As Int32, maximumWidth As Int32, ByRef fitting As Int32, widths As Ptr, ByRef size As WinPrintingSize) As Int32
+Private Optional Declare Function NativeText Lib "gdi32" Alias "TextOutW" (device As Ptr, x As Int32, y As Int32, text As Ptr, count As Int32) As Int32
+Private Optional Declare Function NativeStartDocument Lib "gdi32" Alias "StartDocW" (device As Ptr, ByRef document As WinPrintingDocument) As Int32
+Private Optional Declare Function NativeStartPage Lib "gdi32" Alias "StartPage" (device As Ptr) As Int32
+Private Optional Declare Function NativeEndPage Lib "gdi32" Alias "EndPage" (device As Ptr) As Int32
+Private Optional Declare Function NativeEndDocument Lib "gdi32" Alias "EndDoc" (device As Ptr) As Int32
+Private Optional Declare Function NativeAbort Lib "gdi32" Alias "AbortDoc" (device As Ptr) As Int32
+Private Optional Declare Function NativeAlign Lib "gdi32" Alias "SetTextAlign" (device As Ptr, options As UInt32) As UInt32
+Private Optional Declare Function NativeClip Lib "gdi32" Alias "IntersectClipRect" (device As Ptr, left As Int32, top As Int32, right As Int32, bottom As Int32) As Int32
+
+Private Sub FailNative(operation As String)
+    Dim code As Integer = NativeError()
+    Throw New RuntimeException(operation + " failed (Win32 error " + Str(code) + ")", code)
+End Sub
+
+Private Function WideOutput(address As Ptr, storage As Bytes) As String
+    If address = Nil Then
+        Throw New RuntimeException("Windows printer name was NULL")
+    End If
+    ' Validate native pointers before reading, then require a terminator in storage.
+    Dim offset As Integer = CType(address, Integer) - CType(storage.DataPtr(), Integer)
+    If offset < 0 Or offset >= storage.Count Or offset Mod 2 <> 0 Then
+        Throw New RuntimeException("Windows printer name lies outside its buffer")
+    End If
+    Dim count As Integer = 0
+    While offset + count * 2 + 1 < storage.Count And count <= 32767
+        If storage.Item(offset + count * 2) = 0 And storage.Item(offset + count * 2 + 1) = 0 Then
+            If count = 0 Then Throw New RuntimeException("Windows printer name is empty")
+            Dim exact As New Bytes(count * 2)
+            exact.Append(address, count * 2)
+            Return String.FromUTF16LE(exact)
+        End If
+        count += 1
+    End While
+    Throw New RuntimeException("Windows printer name is unterminated or too long")
+End Function
+
+Private Function LoadSpooler() As Ptr
+    ' Resolve GetLastError before any operation whose failure code is observed.
+    NativeError()
+    Dim directory As Bytes = ZeroBytes(65536)
+    Dim count As Integer = NativeSystemDirectory(directory.DataPtr(), 32768)
+    If count = 0 Then
+        FailNative("GetSystemDirectoryW")
+    End If
+    If count >= 32768 Then
+        Throw New RuntimeException("Windows system directory exceeded buffer capacity")
+    End If
+    Dim exact As New Bytes(count * 2)
+    exact.Append(directory.DataPtr(), count * 2)
+    Dim libraryPath As Bytes = Wide(String.FromUTF16LE(exact) + "\\winspool.drv")
+    ' Absolute path, with dependencies searched only in its directory/System32.
+    Dim handle As Ptr = NativeLoad(libraryPath.DataPtr(), Nil, 2304)
+    If handle = Nil Then
+        FailNative("LoadLibraryExW(winspool.drv)")
+    End If
+    Return handle
+End Function
+
+Private Function ResolveSpooler(handle As Ptr, name As String) As Ptr
+    Dim symbol As Ptr = NativeSymbol(handle, CType(name, CString))
+    If symbol = Nil Then
+        FailNative("GetProcAddress(" + name + ")")
+    End If
+    Return symbol
+End Function
+#End If
+
+Private Function ZeroBytes(count As Integer) As Bytes
+    Dim value As New Bytes(count)
+    For i As Integer = 1 To count
+        value.Append(0)
+    Next
+    Return value
+End Function
+
+Private Sub ValidateText(value As String, required As Boolean, maximum As Integer = 1048576)
+    If required And value = "" Then
+        Throw New InvalidArgumentException("Printer name and document title must be nonempty")
+    End If
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    If encoded.Count > maximum Then
+        Throw New InvalidArgumentException("Printing input exceeds its UTF-8 size limit")
+    End If
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Printing text cannot contain NUL")
+        End If
+    Next
+End Sub
+
+Private Function Wide(value As String) As Bytes
+    Dim encoded As Bytes = value.AsUTF16LE()
+    encoded.Append(0)
+    encoded.Append(0)
+    Return encoded
+End Function
+
+Private Function ValidNumber(value As Double, minimum As Double, maximum As Double) As Boolean
+    Return value = value And value >= minimum And value <= maximum
+End Function
+
+Private Sub ValidateDocument(document As BuoyPrintDocument)
+    If document = Nil Then
+        Throw New InvalidArgumentException("Print document must be non-Nil")
+    End If
+    If Not ValidNumber(document.PageWidth, 1.0, 14400.0) Or Not ValidNumber(document.PageHeight, 1.0, 14400.0) Then
+        Throw New InvalidArgumentException("Logical page size must be finite and within 1..14400 points")
+    End If
+    If Array.Count(document.Pages) < 1 Or Array.Count(document.Pages) > 1000 Then
+        Throw New InvalidArgumentException("Print document must contain 1..1000 pages")
+    End If
+    Dim runCount As Integer = 0
+    Dim textBytes As Integer = 0
+    For Each page In document.Pages
+        If page = Nil Then
+            Throw New InvalidArgumentException("Print page must be non-Nil")
+        End If
+        For Each item In page.Items
+            runCount += 1
+            If runCount > 100000 Or item = Nil Then
+                Throw New InvalidArgumentException("Print runs must be non-Nil and total at most 100000")
+            End If
+            If Not ValidNumber(item.X, 0.0, document.PageWidth) Or Not ValidNumber(item.Y, 0.0, document.PageHeight) Or Not ValidNumber(item.FontSize, 1.0, 1000.0) Then
+                Throw New InvalidArgumentException("Text coordinates/font size are invalid")
+            End If
+            ValidateText(item.Content, False, 16777216)
+            ValidateText(item.FontName, True)
+            If item.FontName.AsUTF16LE().Count > 62 Then
+                Throw New InvalidArgumentException("Font name exceeds 31 UTF-16 units")
+            End If
+            If String.Contains(item.Content, "\r") Or String.Contains(item.Content, "\n") Or String.Contains(item.Content, "\t") Or String.Contains(item.Content, String.Chr(8232)) Or String.Contains(item.Content, String.Chr(8233)) Then
+                Throw New InvalidArgumentException("DrawText runs must be single-line and contain no tabs")
+            End If
+            textBytes += String.LenBytes(item.Content)
+            If textBytes > 16777216 Then
+                Throw New InvalidArgumentException("Print document exceeds 16 MiB of UTF-8 text")
+            End If
+        Next
+    Next
+End Sub
+
+''' Explicit pages of baseline-positioned text; requested page sizes are logical clipping only.
+Public Function PrintPages(printerName As String, title As String, document As BuoyPrintDocument) As Integer
+    RequireWindows()
+    ValidateText(printerName, True)
+    ValidateText(title, True)
+    ValidateDocument(document)
+#If TargetWindows Then
+    Dim deviceName As Bytes = Wide(printerName)
+    Dim device As Ptr = NativeCreateDC(Nil, deviceName.DataPtr(), Nil, Nil)
+    If device = Nil Then
+        Throw New RuntimeException("CreateDCW(printer) failed")
+    End If
+    Dim started As Boolean = False
+    Try
+        Dim dpiX As Double = NativeCaps(device, 88)
+        Dim dpiY As Double = NativeCaps(device, 90)
+        Dim offsetX As Integer = NativeCaps(device, 112)
+        Dim offsetY As Integer = NativeCaps(device, 113)
+        If dpiX <= 0.0 Or dpiY <= 0.0 Or dpiX > 100000.0 Or dpiY > 100000.0 Then
+            Throw New RuntimeException("Printer exposes invalid resolution")
+        End If
+        ' Coordinates are measured from physical paper origin, not printable-area origin.
+        Dim right As Int32 = document.PageWidth * dpiX / 72.0 - offsetX
+        Dim bottom As Int32 = document.PageHeight * dpiY / 72.0 - offsetY
+        Dim wideTitle As Bytes = Wide(title)
+        Dim nativeDocument As WinPrintingDocument
+        nativeDocument.Size = 40
+        nativeDocument.DocumentName = wideTitle.DataPtr()
+        Dim jobId As Integer = NativeStartDocument(device, nativeDocument)
+        If jobId <= 0 Then
+            Throw New RuntimeException("StartDocW failed or was cancelled")
+        End If
+        started = True
+        For Each page In document.Pages
+            If NativeStartPage(device) <= 0 Then
+                Throw New RuntimeException("StartPage failed")
+            End If
+            If NativeAlign(device, 24) = 4294967295 Then
+                Throw New RuntimeException("SetTextAlign(TA_BASELINE) failed")
+            End If
+            If NativeClip(device, -offsetX, -offsetY, right, bottom) = 0 Then
+                Throw New RuntimeException("IntersectClipRect failed")
+            End If
+            For Each item In page.Items
+                Dim faceName As String = item.FontName
+                Dim generic As String = String.LCase(faceName)
+                If generic = "sans-serif" Or generic = "system" Or generic = "smallsystem" Then
+                    faceName = "Segoe UI"
+                ElseIf generic = "serif" Then
+                    faceName = "Times New Roman"
+                ElseIf generic = "monospace" Then
+                    faceName = "Consolas"
+                End If
+                Dim face As Bytes = Wide(faceName)
+                Dim fontHeight As Int32 = -(item.FontSize * dpiY / 72.0)
+                If fontHeight = 0 Then
+                    fontHeight = -1
+                End If
+                Dim font As Ptr = NativeCreateFont(fontHeight, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.DataPtr())
+                If font = Nil Then
+                    Throw New RuntimeException("CreateFontW failed")
+                End If
+                Dim oldFont As Ptr = Nil
+                Try
+                    oldFont = NativeSelect(device, font)
+                    If oldFont = Nil Or CType(oldFont, Integer) = -1 Then
+                        Throw New RuntimeException("SelectObject(font) failed")
+                    End If
+                    Dim encoded As Bytes = Wide(item.Content)
+                    Dim units As Integer = encoded.Count \ 2 - 1
+                    Dim offset As Integer = 0
+                    Dim x As Int32 = item.X * dpiX / 72.0 - offsetX
+                    Dim y As Int32 = item.Y * dpiY / 72.0 - offsetY
+                    While offset < units And x < right
+                        Dim count As Integer = units - offset
+                        If count > 4096 Then
+                            count = 4096
+                        End If
+                        Dim lastUnit As Integer = encoded.Item((offset + count - 1) * 2) + encoded.Item((offset + count - 1) * 2 + 1) * 256
+                        If lastUnit >= 55296 And lastUnit <= 56319 Then
+                            count -= 1
+                        End If
+                        Dim address As Ptr = CType(CType(encoded.DataPtr(), Integer) + offset * 2, Ptr)
+                        If NativeText(device, x, y, address, count) = 0 Then
+                            Throw New RuntimeException("TextOutW failed")
+                        End If
+                        Dim fitting As Int32 = 0
+                        Dim measured As WinPrintingSize
+                        If NativeExtent(device, address, count, 2147483647, fitting, Nil, measured) = 0 Or measured.Width < 0 Then
+                            Throw New RuntimeException("GetTextExtentExPointW failed")
+                        End If
+                        ' Clamp continuation once the run extends beyond logical page clipping.
+                        If measured.Width > right - x Then
+                            Exit While
+                        End If
+                        x += measured.Width
+                        offset += count
+                    End While
+                Finally
+                    If oldFont <> Nil And CType(oldFont, Integer) <> -1 Then
+                        NativeSelect(device, oldFont)
+                    End If
+                    NativeDeleteObject(font)
+                End Try
+            Next
+            If NativeEndPage(device) <= 0 Then
+                Throw New RuntimeException("EndPage failed")
+            End If
+        Next
+        If NativeEndDocument(device) <= 0 Then
+            Throw New RuntimeException("EndDoc failed")
+        End If
+        started = False
+        Return jobId
+    Finally
+        If started Then
+            NativeAbort(device)
+        End If
+        NativeDeleteDC(device)
+    End Try
+#Else
+    Return 0
+#End If
+End Function
+
+Private Sub RequireWindows()
+#If Not TargetWindows Then
+    Throw New UnsupportedOperationException("WinPrinting requires Windows")
+#End If
+End Sub
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Tests system library loading, not spooler service health or printer presence.
+Public Function IsAvailable() As Boolean
+#If TargetWindows Then
+    If Not System.IsLibraryAvailable("gdi32") Then
+        Return False
+    End If
+    Try
+        Dim handle As Ptr = LoadSpooler()
+        NativeRelease(handle)
+        Return True
+    Catch e As RuntimeException
+        Return False
+    End Try
+#Else
+    Return False
+#End If
+End Function
+
+Public Function DefaultPrinter() As Optional Of String
+    RequireWindows()
+#If TargetWindows Then
+    Dim handle As Ptr = LoadSpooler()
+    Try
+        Dim query As WinPrintingDefault = CType(ResolveSpooler(handle, "GetDefaultPrinterW"), WinPrintingDefault)
+        Dim buffer As Bytes = ZeroBytes(65536)
+        Dim capacity As UInt32 = 32768
+        If query(buffer.DataPtr(), capacity) = 0 Then
+            Dim code As Integer = NativeError()
+            If code = 2 Then
+                Return None
+            End If
+            Throw New RuntimeException("GetDefaultPrinterW failed (Win32 error " + Str(code) + ")", code)
+        End If
+        If capacity < 2 Or capacity > 32768 Then
+            Throw New RuntimeException("Default printer returned invalid UTF-16 length")
+        End If
+        Return Some(WideOutput(buffer.DataPtr(), buffer))
+    Finally
+        NativeRelease(handle)
+    End Try
+#Else
+    Return None
+#End If
+End Function
+
+''' Current user's local printers and established remote connections, level 4.
+Public Function Printers() As Array Of WindowsPrinterInfo
+    RequireWindows()
+#If TargetWindows Then
+    Dim preferred As Optional Of String = DefaultPrinter()
+    Dim handle As Ptr = LoadSpooler()
+    Try
+        Dim query As WinPrintingEnum = CType(ResolveSpooler(handle, "EnumPrintersW"), WinPrintingEnum)
+        Dim required As UInt32 = 0
+        Dim returned As UInt32 = 0
+        Dim status As Int32 = query(6, Nil, 4, Nil, 0, required, returned)
+        If status = 0 Then
+            Dim code As Integer = NativeError()
+            If code <> 122 Then
+                Throw New RuntimeException("EnumPrintersW(size) failed (Win32 error " + Str(code) + ")", code)
+            End If
+        End If
+        Dim printers As Array Of WindowsPrinterInfo = []
+        If required = 0 Then
+            Return printers
+        End If
+        For attempt As Integer = 1 To 4
+            If required > 16777216 Then
+                Throw New RuntimeException("Printer enumeration exceeds 16 MiB")
+            End If
+            Dim buffer As Bytes = ZeroBytes(required)
+            status = query(6, Nil, 4, buffer.DataPtr(), buffer.Count, required, returned)
+            If status = 0 Then
+                Dim code As Integer = NativeError()
+                If code = 122 Then
+                    Continue For
+                End If
+                Throw New RuntimeException("EnumPrintersW(data) failed (Win32 error " + Str(code) + ")", code)
+            End If
+            Dim returnedCount As Integer = returned
+            If returnedCount * 24 > buffer.Count Then
+                Throw New RuntimeException("Invalid printer enumeration size")
+            End If
+            For i As Integer = 0 To returnedCount - 1
+                Dim record As WinPrintingPrinter4
+                NativeCopyPrinter(record, CType(CType(buffer.DataPtr(), Integer) + i * 24, Ptr), 24)
+                Dim printer As New WindowsPrinterInfo
+                printer.Name = WideOutput(record.PrinterName, buffer)
+                If preferred.HasValue Then
+                    printer.IsDefault = String.LCase(printer.Name) = String.LCase(preferred.Value)
+                End If
+                Array.Append(printers, printer)
+            Next
+            Return printers
+        Next
+        Throw New RuntimeException("Printer list changed size repeatedly")
+    Finally
+        NativeRelease(handle)
+    End Try
+#Else
+    Return []
+#End If
+End Function
+
+''' Explicit GDI text job, 12-point Segoe UI, half-inch printable-area margins.
+Public Function PrintText(printerName As String, title As String, text As String) As Integer
+    RequireWindows()
+    ValidateText(printerName, True)
+    ValidateText(title, True)
+    ValidateText(text, False)
+#If TargetWindows Then
+    Dim deviceName As Bytes = Wide(printerName)
+    Dim device As Ptr = NativeCreateDC(Nil, deviceName.DataPtr(), Nil, Nil)
+    If device = Nil Then
+        FailNative("CreateDCW(printer)")
+    End If
+    Dim font As Ptr = Nil
+    Dim oldFont As Ptr = Nil
+    Dim started As Boolean = False
+    Try
+        Dim dpiX As Integer = NativeCaps(device, 88)
+        Dim dpiY As Integer = NativeCaps(device, 90)
+        Dim width As Integer = NativeCaps(device, 8)
+        Dim height As Integer = NativeCaps(device, 10)
+        If dpiX <= 0 Or dpiY <= 0 Or width <= dpiX Or height <= dpiY Then
+            Throw New RuntimeException("Printer does not expose a usable page geometry")
+        End If
+        Dim marginX As Integer = dpiX \ 2
+        Dim marginY As Integer = dpiY \ 2
+        Dim pageWidth As Integer = width - marginX * 2
+        Dim bottom As Integer = height - marginY
+        Dim face As Bytes = Wide("Segoe UI")
+        font = NativeCreateFont(-(dpiY * 12 \ 72), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, face.DataPtr())
+        If font = Nil Then
+            FailNative("CreateFontW")
+        End If
+        oldFont = NativeSelect(device, font)
+        If oldFont = Nil Or CType(oldFont, Integer) = -1 Then
+            Throw New RuntimeException("SelectObject(font) failed")
+        End If
+        Dim sample As Bytes = Wide("Mg")
+        Dim fit As Int32 = 0
+        Dim measured As WinPrintingSize
+        If NativeExtent(device, sample.DataPtr(), 2, pageWidth, fit, Nil, measured) = 0 Then
+            FailNative("GetTextExtentExPointW")
+        End If
+        Dim lineHeight As Integer = measured.Height + dpiY \ 36
+        If lineHeight <= 0 Or lineHeight > bottom - marginY Then
+            Throw New RuntimeException("Printer font cannot fit the printable page")
+        End If
+        Dim wideTitle As Bytes = Wide(title)
+        Dim document As WinPrintingDocument
+        document.Size = 40
+        document.DocumentName = wideTitle.DataPtr()
+        Dim jobId As Integer = NativeStartDocument(device, document)
+        If jobId <= 0 Then
+            Throw New RuntimeException("StartDocW failed or was cancelled")
+        End If
+        started = True
+        If NativeStartPage(device) <= 0 Then
+            Throw New RuntimeException("StartPage failed")
+        End If
+        Dim y As Integer = marginY
+        Dim pageCount As Integer = 1
+        Dim normalized As String = String.Replace(String.Replace(text, "\r\n", "\n"), "\r", "\n")
+        normalized = String.Replace(normalized, "\t", "    ")
+        For Each line As String In String.Split(normalized, "\n")
+            Dim encoded As Bytes = Wide(line)
+            Dim units As Integer = encoded.Count \ 2 - 1
+            Dim offset As Integer = 0
+            Do
+                If y + lineHeight > bottom Then
+                    If NativeEndPage(device) <= 0 Then
+                        Throw New RuntimeException("EndPage failed")
+                    End If
+                    pageCount += 1
+                    If pageCount > 10000 Then
+                        Throw New RuntimeException("Text job exceeded 10000 pages")
+                    End If
+                    If NativeStartPage(device) <= 0 Then
+                        Throw New RuntimeException("StartPage failed")
+                    End If
+                    y = marginY
+                End If
+                If units > offset Then
+                    Dim address As Ptr = CType(CType(encoded.DataPtr(), Integer) + offset * 2, Ptr)
+                    fit = 0
+                    Dim candidate As Integer = units - offset
+                    If candidate > 4096 Then
+                        candidate = 4096
+                    End If
+                    If NativeExtent(device, address, candidate, pageWidth, fit, Nil, measured) = 0 Then
+                        FailNative("GetTextExtentExPointW")
+                    End If
+                    Dim count As Integer = fit
+                    If count > candidate Then
+                        Throw New RuntimeException("Printer returned an invalid fitted text length")
+                    End If
+                    If count > 0 Then
+                        ' Never break a UTF-16 surrogate pair at a wrapping boundary.
+                        Dim lastUnit As Integer = encoded.Item((offset + count - 1) * 2) + encoded.Item((offset + count - 1) * 2 + 1) * 256
+                        If lastUnit >= 55296 And lastUnit <= 56319 Then
+                            count -= 1
+                        End If
+                    End If
+                    If count < 1 Then
+                        Throw New RuntimeException("A text character cannot fit the printable width")
+                    End If
+                    If NativeText(device, marginX, y, address, count) = 0 Then
+                        FailNative("TextOutW")
+                    End If
+                    offset += count
+                End If
+                y += lineHeight
+            Loop While offset < units
+        Next
+        If NativeEndPage(device) <= 0 Then
+            Throw New RuntimeException("EndPage failed")
+        End If
+        If NativeEndDocument(device) <= 0 Then
+            Throw New RuntimeException("EndDoc failed")
+        End If
+        started = False
+        Return jobId
+    Finally
+        If started Then
+            NativeAbort(device)
+        End If
+        If oldFont <> Nil And CType(oldFont, Integer) <> -1 Then
+            NativeSelect(device, oldFont)
+        End If
+        If font <> Nil Then
+            NativeDeleteObject(font)
+        End If
+        NativeDeleteDC(device)
+    End Try
+#Else
+    Return 0
+#End If
+End Function

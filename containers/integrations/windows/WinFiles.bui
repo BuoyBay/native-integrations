@@ -1,0 +1,163 @@
+' Read-only Windows file metadata with explicit Unicode marshalling.
+Public Class FileInfo
+    Public Property Attributes As UInt32
+    Public Property IsDirectory As Boolean
+    Public Property IsReadOnly As Boolean
+    Public Property IsHidden As Boolean
+    Public Property IsReparsePoint As Boolean
+    Public Property SizeBytes As UInt64
+    Public Property CreationFileTime As UInt64
+    Public Property LastAccessFileTime As UInt64
+    Public Property LastWriteFileTime As UInt64
+End Class
+
+Public Class DiskSpace
+    Public Property AvailableToCallerBytes As UInt64
+    Public Property TotalBytes As UInt64
+    Public Property TotalFreeBytes As UInt64
+End Class
+
+#If TargetWindows Then
+' DWORD fields, including split FILETIME and size values: 36 bytes, alignment 4.
+Sequential Structure NativeFileData
+    Attributes As UInt32
+    CreationLow As UInt32
+    CreationHigh As UInt32
+    AccessLow As UInt32
+    AccessHigh As UInt32
+    WriteLow As UInt32
+    WriteHigh As UInt32
+    SizeHigh As UInt32
+    SizeLow As UInt32
+End Structure
+Private Optional Declare Function NativeFileInfo Lib "kernel32" Alias "GetFileAttributesExW" (filePath As Ptr, level As Int32, ByRef data As NativeFileData) As Int32
+Private Optional Declare Function NativeDiskSpace Lib "kernel32" Alias "GetDiskFreeSpaceExW" (filePath As Ptr, ByRef available As UInt64, ByRef total As UInt64, ByRef free As UInt64) As Int32
+Private Optional Declare Function NativeFullPath Lib "kernel32" Alias "GetFullPathNameW" (filePath As Ptr, capacity As UInt32, buffer As Ptr, filePart As Ptr) As UInt32
+' Import eagerly: lazy symbol resolution can overwrite the failure being read.
+Private Declare Function NativeError Lib "kernel32" Alias "GetLastError" () As UInt32
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Private Sub RequireWindows()
+#If Not TargetWindows Then
+    Throw New UnsupportedOperationException("WinFiles requires Windows")
+#End If
+End Sub
+
+Private Function WidePath(filePath As String) As Bytes
+    If filePath = "" Then
+        Throw New InvalidArgumentException("Path must be nonempty")
+    End If
+    Dim utf8 As Bytes = Bytes.FromString(filePath, Text.Encodings.UTF8)
+    For i As Integer = 0 To utf8.Count - 1
+        If utf8.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Path cannot contain NUL")
+        End If
+    Next
+    Dim encoded As Bytes = filePath.AsUTF16LE()
+    If encoded.Count > 65532 Then
+        Throw New InvalidArgumentException("Path exceeds 32766 UTF-16 code units")
+    End If
+    encoded.Append(0)
+    encoded.Append(0)
+    Return encoded
+End Function
+
+Private Function JoinWords(low As UInt32, high As UInt32) As UInt64
+    Dim upper As UInt64 = high
+    Dim lower As UInt64 = low
+    Return upper * 4294967296 + lower
+End Function
+
+Public Function ReadFileInfo(filePath As String) As FileInfo
+    RequireWindows()
+    Dim snapshot As New FileInfo
+#If TargetWindows Then
+    Dim encoded As Bytes = WidePath(filePath)
+    Dim data As NativeFileData
+    If NativeFileInfo(encoded.DataPtr(), 0, data) = 0 Then
+        Dim code As Integer = NativeError()
+        Throw New RuntimeException("GetFileAttributesExW failed (Win32 error " + Str(code) + ")", code)
+    End If
+    snapshot.Attributes = data.Attributes
+    snapshot.IsDirectory = (data.Attributes And 16) <> 0
+    snapshot.IsReadOnly = (data.Attributes And 1) <> 0
+    snapshot.IsHidden = (data.Attributes And 2) <> 0
+    snapshot.IsReparsePoint = (data.Attributes And 1024) <> 0
+    snapshot.SizeBytes = JoinWords(data.SizeLow, data.SizeHigh)
+    snapshot.CreationFileTime = JoinWords(data.CreationLow, data.CreationHigh)
+    snapshot.LastAccessFileTime = JoinWords(data.AccessLow, data.AccessHigh)
+    snapshot.LastWriteFileTime = JoinWords(data.WriteLow, data.WriteHigh)
+#End If
+    Return snapshot
+End Function
+
+''' False only for missing file/path; access errors remain exceptions.
+Public Function Exists(filePath As String) As Boolean
+    RequireWindows()
+#If TargetWindows Then
+    Dim encoded As Bytes = WidePath(filePath)
+    Dim data As NativeFileData
+    If NativeFileInfo(encoded.DataPtr(), 0, data) <> 0 Then
+        Return True
+    End If
+    Dim code As Integer = NativeError()
+    If code = 2 Or code = 3 Then
+        Return False
+    End If
+    Throw New RuntimeException("GetFileAttributesExW failed (Win32 error " + Str(code) + ")", code)
+#Else
+    Return False
+#End If
+End Function
+
+Public Function ReadDiskSpace(directoryPath As String) As DiskSpace
+    RequireWindows()
+    Dim snapshot As New DiskSpace
+#If TargetWindows Then
+    Dim encoded As Bytes = WidePath(directoryPath)
+    Dim available As UInt64 = 0
+    Dim total As UInt64 = 0
+    Dim free As UInt64 = 0
+    If NativeDiskSpace(encoded.DataPtr(), available, total, free) = 0 Then
+        Dim code As Integer = NativeError()
+        Throw New RuntimeException("GetDiskFreeSpaceExW failed (Win32 error " + Str(code) + ")", code)
+    End If
+    snapshot.AvailableToCallerBytes = available
+    snapshot.TotalBytes = total
+    snapshot.TotalFreeBytes = free
+#End If
+    Return snapshot
+End Function
+
+''' Absolute lexical path; does not resolve links or require existence.
+Public Function FullPath(filePath As String) As String
+    RequireWindows()
+#If TargetWindows Then
+    Dim encoded As Bytes = WidePath(filePath)
+    Dim buffer As New Bytes(65536)
+    For i As Integer = 1 To 65536
+        buffer.Append(0)
+    Next
+    Dim count As Integer = NativeFullPath(encoded.DataPtr(), 32768, buffer.DataPtr(), Nil)
+    If count = 0 Then
+        Dim code As Integer = NativeError()
+        Throw New RuntimeException("GetFullPathNameW failed (Win32 error " + Str(code) + ")", code)
+    End If
+    If count >= 32768 Then
+        Throw New RuntimeException("Absolute path exceeds output capacity")
+    End If
+    Dim exact As New Bytes(count * 2)
+    exact.Append(buffer.DataPtr(), count * 2)
+    Return String.FromUTF16LE(exact)
+#Else
+    Return ""
+#End If
+End Function

@@ -1,0 +1,782 @@
+' Retained vector pictures and versioned, portable Object2D scene persistence.
+Import object2d
+
+Const VectorPictureMaxBytes As Integer = 33554432
+Const VectorPictureMaxNodes As Integer = 10000
+Const VectorPictureMaxDepth As Integer = 64
+Const VectorPictureMaxPixels As Integer = 4194304
+
+Private Class VectorBudget
+    Public Property Nodes As Integer = 0
+    Public Property Pixels As Integer = 0
+    Public Property TextBytes As Integer = 0
+    Public Property OutputBytes As Integer = 0
+    Public Sub Output(length As Integer)
+        OutputBytes += length
+        If OutputBytes > VectorPictureMaxBytes Then
+            Throw New InvalidArgumentException("Vector picture SVG exceeds 32 MiB")
+        End If
+    End Sub
+    Public Sub Text(value As String)
+        TextBytes += String.LenBytes(value)
+        If TextBytes > 16777216 Then
+            Throw New InvalidArgumentException("Vector picture text exceeds 16 MiB")
+        End If
+    End Sub
+    Public Sub Visit(depth As Integer)
+        Nodes += 1
+        If Nodes > VectorPictureMaxNodes Or depth > VectorPictureMaxDepth Then
+            Throw New InvalidArgumentException("Vector picture exceeds shape or nesting limit")
+        End If
+    End Sub
+    Public Sub Image(width As Integer, height As Integer)
+        If width < 1 Or height < 1 Or width > 32767 Or height > 32767 Then
+            Throw New InvalidArgumentException("Invalid vector picture image dimensions")
+        End If
+        Pixels += width * height
+        If Pixels > VectorPictureMaxPixels Then
+            Throw New InvalidArgumentException("Vector picture exceeds total image pixel limit")
+        End If
+    End Sub
+End Class
+
+Private Sub VectorRequire(passed As Boolean, message As String)
+    If Not passed Then
+        Throw New InvalidArgumentException("Vector picture: " + message)
+    End If
+End Sub
+
+Private Function VectorFinite(n As Double) As Boolean
+    Return n > -Double.Infinity And n < Double.Infinity
+End Function
+
+Private Function VectorNumber(node As JSONItem, key As String) As Double
+    Dim value As JSONItem = node.Value(key)
+    VectorRequire(value.IsNumber(), "expected number for " + key)
+    Dim n As Double = value.AsNumber().Value
+    VectorRequire(VectorFinite(n), "nonfinite number for " + key)
+    Return n
+End Function
+
+Private Function VectorInteger(node As JSONItem, key As String, lo As Integer, hi As Integer) As Integer
+    Dim n As Double = VectorNumber(node, key)
+    VectorRequire(n >= lo And n <= hi And Math.Floor(n) = n, "integer outside range for " + key)
+    Return n
+End Function
+
+Private Function VectorString(node As JSONItem, key As String) As String
+    Dim value As JSONItem = node.Value(key)
+    VectorRequire(value.IsString(), "expected string for " + key)
+    Return value.AsString().Value
+End Function
+
+Private Function VectorBoolean(node As JSONItem, key As String) As Boolean
+    Dim value As JSONItem = node.Value(key)
+    VectorRequire(value.IsBoolean(), "expected boolean for " + key)
+    Return value.AsBoolean().Value
+End Function
+
+Private Sub VectorSetNumber(node As JSONItem, key As String, n As Double)
+    VectorRequire(VectorFinite(n), "nonfinite number for " + key)
+    node.Value(key) = n
+End Sub
+
+Private Function VectorColor(c As Color) As JSONItem
+    If c Is Nil Then
+        Return JSONItem.Null()
+    End If
+    Dim node As JSONItem = JSONItem.NewObject()
+    VectorSetNumber(node, "r", c.R)
+    VectorSetNumber(node, "g", c.G)
+    VectorSetNumber(node, "b", c.B)
+    VectorSetNumber(node, "a", c.A)
+    Return node
+End Function
+
+Private Function VectorReadColor(node As JSONItem) As Color
+    If node.IsNull() Then
+        Return Nil
+    End If
+    VectorRequire(node.IsObject(), "invalid color")
+    Dim r As Double = VectorNumber(node, "r")
+    Dim g As Double = VectorNumber(node, "g")
+    Dim b As Double = VectorNumber(node, "b")
+    Dim a As Double = VectorNumber(node, "a")
+    VectorRequire(r >= 0.0 And r <= 1.0 And g >= 0.0 And g <= 1.0 And b >= 0.0 And b <= 1.0 And a >= 0.0 And a <= 1.0, "color channel outside 0..1")
+    Return Color.RGBA(r, g, b, a)
+End Function
+
+Private Sub VectorWriteCommon(node As JSONItem, shape As Object2D)
+    VectorSetNumber(node, "X", shape.X)
+    VectorSetNumber(node, "Y", shape.Y)
+    VectorSetNumber(node, "Rotation", shape.Rotation)
+    VectorSetNumber(node, "Scale", shape.Scale)
+    VectorSetNumber(node, "BorderWidth", shape.BorderWidth)
+    VectorSetNumber(node, "FillOpacity", shape.FillOpacity)
+    VectorSetNumber(node, "BorderOpacity", shape.BorderOpacity)
+    node.Value("FillColor") = VectorColor(shape.FillColor)
+    node.Value("BorderColor") = VectorColor(shape.BorderColor)
+End Sub
+
+Private Sub VectorReadCommon(node As JSONItem, shape As Object2D)
+    shape.X = VectorNumber(node, "X")
+    shape.Y = VectorNumber(node, "Y")
+    shape.Rotation = VectorNumber(node, "Rotation")
+    shape.Scale = VectorNumber(node, "Scale")
+    Dim borderWidth As Double = VectorNumber(node, "BorderWidth")
+    Dim fillOpacity As Double = VectorNumber(node, "FillOpacity")
+    Dim borderOpacity As Double = VectorNumber(node, "BorderOpacity")
+    VectorRequire(borderWidth >= 0.0, "negative border width")
+    VectorRequire(fillOpacity >= 0.0 And fillOpacity <= 100.0 And borderOpacity >= 0.0 And borderOpacity <= 100.0, "opacity outside 0..100")
+    shape.BorderWidth = borderWidth
+    shape.FillOpacity = fillOpacity
+    shape.BorderOpacity = borderOpacity
+    VectorRequire(node.HasKey("FillColor") And node.HasKey("BorderColor"), "missing color")
+    shape.FillColor = VectorReadColor(node.Value("FillColor"))
+    shape.BorderColor = VectorReadColor(node.Value("BorderColor"))
+End Sub
+
+Private Function VectorWriteImage(img As Picture, budget As VectorBudget) As JSONItem
+    If img Is Nil Then
+        Return JSONItem.Null()
+    End If
+    budget.Image(img.Width, img.Height)
+    Dim length As Integer = img.Width * img.Height * 4
+    Dim staging As New Bytes(length)
+    VectorRequire(img.GetBacking(staging.DataPtr(), length, 0) = length, "could not read image pixels")
+    Dim data As New Bytes(length)
+    data.Append(staging.DataPtr(), length)
+    Dim node As JSONItem = JSONItem.NewObject()
+    node.Value("width") = img.Width
+    node.Value("height") = img.Height
+    node.Value("rgba") = data.ToBase64()
+    Return node
+End Function
+
+Private Function VectorReadImage(node As JSONItem, budget As VectorBudget) As Picture
+    If node.IsNull() Then
+        Return Nil
+    End If
+    VectorRequire(node.IsObject(), "invalid embedded image")
+    Dim width As Integer = VectorInteger(node, "width", 1, 32767)
+    Dim height As Integer = VectorInteger(node, "height", 1, 32767)
+    budget.Image(width, height)
+    Dim encoded As String = VectorString(node, "rgba")
+    Dim length As Integer = width * height * 4
+    VectorRequire(String.LenBytes(encoded) = ((length + 2) \ 3) * 4, "invalid encoded pixel length")
+    Dim decoded As Result Of Bytes, String = Bytes.FromBase64(encoded)
+    If decoded.IsErr Then
+        Throw New InvalidArgumentException("Vector picture: malformed embedded pixels: " + decoded.Error)
+    End If
+    Dim data As Bytes = decoded.Value
+    VectorRequire(data.Count = length, "incorrect decoded pixel length")
+    Return Picture.FromBuffer(data.DataPtr(), data.Count, 0, width, height)
+End Function
+
+Private Function VectorEncodeShape(shape As Object2D, budget As VectorBudget, depth As Integer) As JSONItem
+    VectorRequire(shape IsNot Nil, "nil shape")
+    budget.Visit(depth)
+    Dim kind As String = shape.TypeName()
+    Select Case kind
+        Case "Object2D", "RectShape", "RoundRectShape", "OvalShape", "ArcShape", "CurveShape", "FigureShape", "PixmapShape", "TextShape", "StringShape", "Group2D"
+        Case Else
+            Throw New UnsupportedOperationException("Cannot serialize custom Object2D class " + kind)
+    End Select
+    Dim node As JSONItem = JSONItem.NewObject()
+    node.Value("kind") = kind
+    VectorWriteCommon(node, shape)
+    Dim rect As RectShape = TryCast(shape, RectShape)
+    If rect IsNot Nil Then
+        VectorSetNumber(node, "Width", rect.Width)
+        VectorSetNumber(node, "Height", rect.Height)
+    End If
+    Dim rounded As RoundRectShape = TryCast(shape, RoundRectShape)
+    If rounded IsNot Nil Then
+        VectorSetNumber(node, "CornerWidth", rounded.CornerWidth)
+        VectorSetNumber(node, "CornerHeight", rounded.CornerHeight)
+        VectorRequire(rounded.Segments >= -100000 And rounded.Segments <= 100000, "segment count outside persistence limit")
+        node.Value("Segments") = rounded.Segments
+    End If
+    Dim oval As OvalShape = TryCast(shape, OvalShape)
+    If oval IsNot Nil Then
+        VectorRequire(oval.Segments >= -100000 And oval.Segments <= 100000, "segment count outside persistence limit")
+        node.Value("Segments") = oval.Segments
+    End If
+    Dim arc As ArcShape = TryCast(shape, ArcShape)
+    If arc IsNot Nil Then
+        VectorSetNumber(node, "StartAngle", arc.StartAngle)
+        VectorSetNumber(node, "ArcAngle", arc.ArcAngle)
+    End If
+    Dim curve As CurveShape = TryCast(shape, CurveShape)
+    If curve IsNot Nil Then
+        VectorSetNumber(node, "X2", curve.X2)
+        VectorSetNumber(node, "Y2", curve.Y2)
+        node.Value("Order") = curve.Order
+        VectorRequire(curve.Segments >= -100000 And curve.Segments <= 100000, "segment count outside persistence limit")
+        node.Value("Segments") = curve.Segments
+        VectorSetNumber(node, "ControlX0", curve.ControlX(0))
+        VectorSetNumber(node, "ControlY0", curve.ControlY(0))
+        VectorSetNumber(node, "ControlX1", curve.ControlX(1))
+        VectorSetNumber(node, "ControlY1", curve.ControlY(1))
+    End If
+    Dim figure As FigureShape = TryCast(shape, FigureShape)
+    If figure IsNot Nil Then
+        Dim curves As JSONItem = JSONItem.NewArray()
+        For i As Integer = 0 To figure.Count - 1
+            curves.Add(VectorEncodeShape(figure.CurveAt(i), budget, depth + 1))
+        Next
+        node.Value("curves") = curves
+    End If
+    Dim bitmap As PixmapShape = TryCast(shape, PixmapShape)
+    If bitmap IsNot Nil Then
+        VectorRequire(VectorFinite(bitmap.SourceLeft) And VectorFinite(bitmap.SourceTop) And Math.Abs(bitmap.SourceLeft) <= 2147483647.0 And Math.Abs(bitmap.SourceTop) <= 2147483647.0, "source offsets outside pixel range")
+        VectorRequire(bitmap.SourceWidth >= 0 And bitmap.SourceWidth <= 32767 And bitmap.SourceHeight >= 0 And bitmap.SourceHeight <= 32767, "source dimensions outside pixel range")
+        VectorRequire(bitmap.SourceWidth * bitmap.SourceHeight <= VectorPictureMaxPixels, "source crop exceeds pixel limit")
+        node.Value("image") = VectorWriteImage(bitmap.Image, budget)
+        VectorSetNumber(node, "SourceLeft", bitmap.SourceLeft)
+        VectorSetNumber(node, "SourceTop", bitmap.SourceTop)
+        node.Value("SourceWidth") = bitmap.SourceWidth
+        node.Value("SourceHeight") = bitmap.SourceHeight
+    End If
+    Dim text As TextShape = TryCast(shape, TextShape)
+    If text IsNot Nil Then
+        VectorRequire(CType(text.HorizontalAlignment, Integer) >= 0 And CType(text.HorizontalAlignment, Integer) <= 5 And CType(text.VerticalAlignment, Integer) >= 0 And CType(text.VerticalAlignment, Integer) <= 5, "invalid text alignment")
+        budget.Text(text.Text)
+        budget.Text(text.FontName)
+        node.Value("Text") = text.Text
+        node.Value("FontName") = text.FontName
+        VectorSetNumber(node, "FontSize", text.FontSize)
+        node.Value("Bold") = text.Bold
+        node.Value("Italic") = text.Italic
+        node.Value("Underline") = text.Underline
+        node.Value("HorizontalAlignment") = CType(text.HorizontalAlignment, Integer)
+        node.Value("VerticalAlignment") = CType(text.VerticalAlignment, Integer)
+        node.Value("FontUnit") = CType(text.FontUnit, Integer)
+        VectorSetNumber(node, "PixelsPerPoint", text.PixelsPerPoint)
+    End If
+    Dim group As Group2D = TryCast(shape, Group2D)
+    If group IsNot Nil Then
+        Dim children As JSONItem = JSONItem.NewArray()
+        For i As Integer = 0 To group.Count - 1
+            children.Add(VectorEncodeShape(group.Item(i), budget, depth + 1))
+        Next
+        node.Value("children") = children
+    End If
+    Return node
+End Function
+
+Private Function VectorDecodeShape(node As JSONItem, budget As VectorBudget, depth As Integer) As Object2D
+    budget.Visit(depth)
+    VectorRequire(node.IsObject(), "expected shape object")
+    Dim kind As String = VectorString(node, "kind")
+    Dim shape As Object2D
+    Select Case kind
+        Case "Object2D"
+            shape = New Object2D
+        Case "RectShape"
+            shape = New RectShape
+        Case "RoundRectShape"
+            shape = New RoundRectShape
+        Case "OvalShape"
+            shape = New OvalShape
+        Case "ArcShape"
+            shape = New ArcShape
+        Case "CurveShape"
+            shape = New CurveShape
+        Case "FigureShape"
+            shape = New FigureShape
+        Case "PixmapShape"
+            shape = New PixmapShape
+        Case "TextShape"
+            shape = New TextShape
+        Case "StringShape"
+            shape = New StringShape
+        Case "Group2D"
+            shape = New Group2D
+        Case Else
+            Throw New UnsupportedOperationException("Unknown vector shape kind " + kind)
+    End Select
+    VectorReadCommon(node, shape)
+    Dim bitmap As PixmapShape = TryCast(shape, PixmapShape)
+    If bitmap IsNot Nil Then
+        VectorRequire(node.HasKey("image"), "missing image")
+        bitmap.Image = VectorReadImage(node.Value("image"), budget)
+        bitmap.SourceLeft = VectorNumber(node, "SourceLeft")
+        bitmap.SourceTop = VectorNumber(node, "SourceTop")
+        VectorRequire(Math.Abs(bitmap.SourceLeft) <= 2147483647.0 And Math.Abs(bitmap.SourceTop) <= 2147483647.0, "source offsets outside pixel range")
+        bitmap.SourceWidth = VectorInteger(node, "SourceWidth", 0, 32767)
+        bitmap.SourceHeight = VectorInteger(node, "SourceHeight", 0, 32767)
+        VectorRequire(bitmap.SourceWidth * bitmap.SourceHeight <= VectorPictureMaxPixels, "source crop exceeds pixel limit")
+    End If
+    ' Image assignment resets dimensions, so restore the destination size after it.
+    Dim rect As RectShape = TryCast(shape, RectShape)
+    If rect IsNot Nil Then
+        rect.Width = VectorNumber(node, "Width")
+        rect.Height = VectorNumber(node, "Height")
+    End If
+    Dim rounded As RoundRectShape = TryCast(shape, RoundRectShape)
+    If rounded IsNot Nil Then
+        rounded.CornerWidth = VectorNumber(node, "CornerWidth")
+        rounded.CornerHeight = VectorNumber(node, "CornerHeight")
+        rounded.Segments = VectorInteger(node, "Segments", -100000, 100000)
+    End If
+    Dim oval As OvalShape = TryCast(shape, OvalShape)
+    If oval IsNot Nil Then
+        oval.Segments = VectorInteger(node, "Segments", -100000, 100000)
+    End If
+    Dim arc As ArcShape = TryCast(shape, ArcShape)
+    If arc IsNot Nil Then
+        arc.StartAngle = VectorNumber(node, "StartAngle")
+        arc.ArcAngle = VectorNumber(node, "ArcAngle")
+    End If
+    Dim curve As CurveShape = TryCast(shape, CurveShape)
+    If curve IsNot Nil Then
+        curve.X2 = VectorNumber(node, "X2")
+        curve.Y2 = VectorNumber(node, "Y2")
+        curve.Order = VectorInteger(node, "Order", 0, 2)
+        curve.Segments = VectorInteger(node, "Segments", -100000, 100000)
+        curve.ControlX(0) = VectorNumber(node, "ControlX0")
+        curve.ControlY(0) = VectorNumber(node, "ControlY0")
+        curve.ControlX(1) = VectorNumber(node, "ControlX1")
+        curve.ControlY(1) = VectorNumber(node, "ControlY1")
+    End If
+    Dim figure As FigureShape = TryCast(shape, FigureShape)
+    If figure IsNot Nil Then
+        Dim curves As JSONItem = node.Value("curves")
+        VectorRequire(curves.IsArray(), "expected curves array")
+        VectorRequire(curves.Count() <= VectorPictureMaxNodes - budget.Nodes, "too many curves")
+        For i As Integer = 0 To curves.Count() - 1
+            Dim child As Object2D = VectorDecodeShape(curves.ValueAt(i), budget, depth + 1)
+            Dim member As CurveShape = TryCast(child, CurveShape)
+            VectorRequire(member IsNot Nil, "figure member is not a curve")
+            figure.AddCurve(member)
+        Next
+    End If
+    Dim text As TextShape = TryCast(shape, TextShape)
+    If text IsNot Nil Then
+        text.Text = VectorString(node, "Text")
+        text.FontName = VectorString(node, "FontName")
+        text.FontSize = VectorNumber(node, "FontSize")
+        text.Bold = VectorBoolean(node, "Bold")
+        text.Italic = VectorBoolean(node, "Italic")
+        text.Underline = VectorBoolean(node, "Underline")
+        text.HorizontalAlignment = CType(VectorInteger(node, "HorizontalAlignment", 0, 5), TextShape.Alignment)
+        text.VerticalAlignment = CType(VectorInteger(node, "VerticalAlignment", 0, 5), TextShape.Alignment)
+        text.FontUnit = CType(VectorInteger(node, "FontUnit", 0, 4), FontUnits)
+        text.PixelsPerPoint = VectorNumber(node, "PixelsPerPoint")
+        VectorRequire(text.PixelsPerPoint > 0.0, "pixels per point must be positive")
+    End If
+    Dim group As Group2D = TryCast(shape, Group2D)
+    If group IsNot Nil Then
+        Dim children As JSONItem = node.Value("children")
+        VectorRequire(children.IsArray(), "expected children array")
+        VectorRequire(children.Count() <= VectorPictureMaxNodes - budget.Nodes, "too many children")
+        For i As Integer = 0 To children.Count() - 1
+            group.AddObject(VectorDecodeShape(children.ValueAt(i), budget, depth + 1))
+        Next
+    End If
+    Return shape
+End Function
+
+' Bound nesting before invoking the JSON parser. Scan UTF-8 bytes once,
+' ignoring brackets in strings, to avoid parser recursion on hostile input.
+Private Sub VectorPreflight(source As String)
+    VectorRequire(String.LenBytes(source) <= VectorPictureMaxBytes, "document exceeds 32 MiB")
+    Dim data As Bytes = Bytes.FromString(source, Text.Encodings.UTF8)
+    Dim nesting As Integer = 0
+    Dim quoted As Boolean = False
+    Dim escaped As Boolean = False
+    For i As Integer = 0 To data.Count - 1
+        Dim ch As Integer = data.Item(i)
+        If quoted Then
+            If escaped Then
+                escaped = False
+            ElseIf ch = 92 Then
+                escaped = True
+            ElseIf ch = 34 Then
+                quoted = False
+            End If
+        ElseIf ch = 34 Then
+            quoted = True
+        ElseIf ch = 123 Or ch = 91 Then
+            nesting += 1
+            VectorRequire(nesting <= VectorPictureMaxDepth * 2 + 8, "JSON nesting exceeds limit")
+        ElseIf ch = 125 Or ch = 93 Then
+            nesting -= 1
+            VectorRequire(nesting >= 0, "unbalanced JSON")
+        End If
+    Next
+    VectorRequire(Not quoted And nesting = 0, "incomplete JSON")
+End Sub
+
+Private Function VectorXML(value As String) As String
+    Dim data As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To data.Count - 1
+        Dim ch As Integer = data.Item(i)
+        VectorRequire(ch >= 32 Or ch = 9 Or ch = 10 Or ch = 13, "text contains an XML control character")
+    Next
+    Return String.Replace(String.Replace(String.Replace(String.Replace(value, "&", "&amp;"), "<", "&lt;"), ">", "&gt;"), "\"", "&quot;")
+End Function
+
+Private Function VectorScalar(n As Double) As String
+    VectorRequire(VectorFinite(n), "nonfinite SVG coordinate")
+    Return Json.Stringify(JSONItem.From(n))
+End Function
+
+Private Function VectorXY(x As Double, y As Double) As String
+    Return VectorScalar(x) + " " + VectorScalar(y)
+End Function
+
+Private Function VectorSVGPaint(c As Color, opacity As Double, label As String) As String
+    If c Is Nil Or opacity <= 0.0 Then
+        Return " " + label + "=\"none\""
+    End If
+    Return " " + label + "=\"rgb(" + VectorScalar(c.R * 100.0) + "%," + VectorScalar(c.G * 100.0) + "%," + VectorScalar(c.B * 100.0) + "%)\" " + label + "-opacity=\"" + VectorScalar(c.A * opacity / 100.0) + "\""
+End Function
+
+Private Function VectorSVGStyle(shape As Object2D, fill As Boolean) As String
+    Dim style As String = ""
+    If fill Then
+        style = VectorSVGPaint(shape.FillColor, shape.FillOpacity, "fill")
+    Else
+        style = " fill=\"none\""
+    End If
+    If shape.BorderWidth > 0.0 Then
+        style += VectorSVGPaint(shape.BorderColor, shape.BorderOpacity, "stroke")
+        style += " stroke-width=\"" + VectorScalar(shape.BorderWidth) + "\""
+    Else
+        style += " stroke=\"none\""
+    End If
+    Return style
+End Function
+
+Private Function VectorSVGCurve(curve As CurveShape, ox As Double, oy As Double, first As Boolean) As String
+    Dim start As String = " L "
+    If first Then
+        start = "M "
+    End If
+    start += VectorXY(curve.X - ox, curve.Y - oy)
+    If curve.Segments > 0 And curve.Order > 0 Then
+        VectorRequire(curve.Segments <= 4096, "SVG curve has more than 4096 segments")
+        Dim parts As Array Of String = []
+        Array.Append(parts, start)
+        Dim count As Double = curve.Segments
+        For i As Integer = 1 To curve.Segments
+            Dim t As Double = i / count
+            Dim u As Double = 1.0 - t
+            Dim x As Double
+            Dim y As Double
+            If curve.Order = 1 Then
+                x = u * u * curve.X + 2.0 * u * t * curve.ControlX(0) + t * t * curve.X2
+                y = u * u * curve.Y + 2.0 * u * t * curve.ControlY(0) + t * t * curve.Y2
+            Else
+                x = u * u * u * curve.X + 3.0 * u * u * t * curve.ControlX(0) + 3.0 * u * t * t * curve.ControlX(1) + t * t * t * curve.X2
+                y = u * u * u * curve.Y + 3.0 * u * u * t * curve.ControlY(0) + 3.0 * u * t * t * curve.ControlY(1) + t * t * t * curve.Y2
+            End If
+            Array.Append(parts, " L " + VectorXY(x - ox, y - oy))
+        Next
+        Return String.Join(parts, "")
+    End If
+    Select Case curve.Order
+        Case 1
+            Return start + " Q " + VectorXY(curve.ControlX(0) - ox, curve.ControlY(0) - oy) + " " + VectorXY(curve.X2 - ox, curve.Y2 - oy)
+        Case 2
+            Return start + " C " + VectorXY(curve.ControlX(0) - ox, curve.ControlY(0) - oy) + " " + VectorXY(curve.ControlX(1) - ox, curve.ControlY(1) - oy) + " " + VectorXY(curve.X2 - ox, curve.Y2 - oy)
+    End Select
+    Return start + " L " + VectorXY(curve.X2 - ox, curve.Y2 - oy)
+End Function
+
+Private Function VectorSVGArcPart(cx As Double, cy As Double, rx As Double, ry As Double, t0 As Double, sweep As Double, segments As Integer) As String
+    Dim n As Integer = Math.Max(1, Math.Ceiling(Math.Abs(sweep) / (Math.Pi / 2.0) - 0.000000001))
+    If segments > 0 Then
+        VectorRequire(segments <= 4096, "SVG arc has more than 4096 segments")
+        n = segments
+    End If
+    Dim count As Double = n
+    Dim delta As Double = sweep / count
+    Dim k As Double = 4.0 / 3.0 * Math.Tan(delta / 4.0)
+    Dim parts As Array Of String = []
+    For i As Integer = 1 To n
+        Dim a As Double = t0 + (i - 1) * delta
+        Dim b As Double = t0 + i * delta
+        Dim x0 As Double = cx + rx * Math.Cos(a)
+        Dim y0 As Double = cy + ry * Math.Sin(a)
+        Dim x3 As Double = cx + rx * Math.Cos(b)
+        Dim y3 As Double = cy + ry * Math.Sin(b)
+        If segments > 0 Then
+            Array.Append(parts, " L " + VectorXY(x3, y3))
+        Else
+            Array.Append(parts, " C " + VectorXY(x0 - k * rx * Math.Sin(a), y0 + k * ry * Math.Cos(a)) + " " + VectorXY(x3 + k * rx * Math.Sin(b), y3 - k * ry * Math.Cos(b)) + " " + VectorXY(x3, y3))
+        End If
+    Next
+    Return String.Join(parts, "")
+End Function
+
+Private Function VectorSVGText(text As TextShape) As String
+    Dim raster As New Picture(1, 1)
+    Dim g As Graphics = raster.Graphics
+    g.Bold = text.Bold
+    g.Italic = text.Italic
+    text.Measure(g)
+    Dim font As String = text.ResolvedFontName()
+    Dim size As Double = text.ResolvedFontSize()
+    Dim lineHeight As Double = g.MeasureStringHeight("Xg", font, size)
+    If Not (lineHeight > 0.0) Then
+        lineHeight = size * 1.2
+    End If
+    Dim baseline As Double = text.LayoutBox().Top + lineHeight * TextShape.AscentRatio
+    Dim anchor As String = "middle"
+    If text.HorizontalAlignment = TextShape.Alignment.Left Then
+        anchor = "start"
+    ElseIf text.HorizontalAlignment = TextShape.Alignment.Right Then
+        anchor = "end"
+    End If
+    Dim style As String = " font-family=\"" + VectorXML(font) + "\" font-size=\"" + VectorScalar(size) + "\" text-anchor=\"" + anchor + "\""
+    If text.Bold Then
+        style += " font-weight=\"bold\""
+    End If
+    If text.Italic Then
+        style += " font-style=\"italic\""
+    End If
+    If text.Underline Then
+        style += " text-decoration=\"underline\""
+    End If
+    style += VectorSVGPaint(text.FillColor, text.FillOpacity, "fill")
+    Dim parts As Array Of String = []
+    Dim lines As Array Of String = text.Lines()
+    For i As Integer = 0 To Array.Count(lines) - 1
+        Array.Append(parts, "<text xml:space=\"preserve\" x=\"0\" y=\"" + VectorScalar(baseline + i * lineHeight * TextShape.LineSpacing) + "\"" + style + ">" + VectorXML(lines(i)) + "</text>")
+    Next
+    Return String.Join(parts, "")
+End Function
+
+Private Function VectorSVGShape(shape As Object2D, budget As VectorBudget, depth As Integer) As String
+    budget.Visit(depth)
+    Dim kind As String = shape.TypeName()
+    Dim content As String = ""
+    Select Case kind
+        Case "Group2D"
+            Dim group As Group2D = CType(shape, Group2D)
+            Dim parts As Array Of String = []
+            For i As Integer = 0 To group.Count - 1
+                Array.Append(parts, VectorSVGShape(group.Item(i), budget, depth + 1))
+            Next
+            content = String.Join(parts, "")
+        Case "TextShape", "StringShape"
+            content = VectorSVGText(CType(shape, TextShape))
+        Case "PixmapShape"
+            Dim bitmap As PixmapShape = CType(shape, PixmapShape)
+            Dim image As Picture = bitmap.SourcePicture()
+            If image IsNot Nil Then
+                budget.Image(image.Width, image.Height)
+                Dim png As Bytes = image.ToPNG()
+                Dim w As Double = Math.Abs(bitmap.Width)
+                Dim h As Double = Math.Abs(bitmap.Height)
+                content = "<image x=\"" + VectorScalar(-w / 2.0) + "\" y=\"" + VectorScalar(-h / 2.0) + "\" width=\"" + VectorScalar(w) + "\" height=\"" + VectorScalar(h) + "\" preserveAspectRatio=\"none\" href=\"data:image/png;base64," + png.ToBase64() + "\"/>"
+            End If
+        Case "CurveShape"
+            Dim curve As CurveShape = CType(shape, CurveShape)
+            content = "<path d=\"" + VectorSVGCurve(curve, curve.X, curve.Y, True) + "\"" + VectorSVGStyle(shape, False) + "/>"
+        Case "FigureShape"
+            Dim figure As FigureShape = CType(shape, FigureShape)
+            Dim parts As Array Of String = []
+            For i As Integer = 0 To figure.Count - 1
+                budget.Visit(depth + 1)
+                Array.Append(parts, VectorSVGCurve(figure.CurveAt(i), 0.0, 0.0, i = 0))
+            Next
+            If figure.Count > 0 Then
+                content = "<path d=\"" + String.Join(parts, "") + " Z\"" + VectorSVGStyle(shape, True) + "/>"
+            End If
+        Case "RectShape", "RoundRectShape", "OvalShape", "ArcShape"
+            Dim rect As RectShape = CType(shape, RectShape)
+            Dim w As Double = Math.Abs(rect.Width)
+            Dim h As Double = Math.Abs(rect.Height)
+            Dim rx As Double = w / 2.0
+            Dim ry As Double = h / 2.0
+            Dim d As String = ""
+            Select Case kind
+                Case "RectShape"
+                    If w = 0.0 Or h = 0.0 Then
+                        If w <> 0.0 Or h <> 0.0 Then
+                            d = "M " + VectorXY(-rx, -ry) + " L " + VectorXY(rx, ry) + " Z"
+                        End If
+                    Else
+                        content = "<rect x=\"" + VectorScalar(-rx) + "\" y=\"" + VectorScalar(-ry) + "\" width=\"" + VectorScalar(w) + "\" height=\"" + VectorScalar(h) + "\"" + VectorSVGStyle(shape, True) + "/>"
+                    End If
+                Case "OvalShape"
+                    Dim oval As OvalShape = CType(shape, OvalShape)
+                    If oval.Segments <= 0 Then
+                        content = "<ellipse cx=\"0\" cy=\"0\" rx=\"" + VectorScalar(rx) + "\" ry=\"" + VectorScalar(ry) + "\"" + VectorSVGStyle(shape, True) + "/>"
+                    Else
+                        d = "M " + VectorXY(rx, 0.0) + VectorSVGArcPart(0.0, 0.0, rx, ry, 0.0, Math.Pi * 2.0, Math.Max(3, oval.Segments)) + " Z"
+                    End If
+                Case "ArcShape"
+                    Dim arc As ArcShape = CType(shape, ArcShape)
+                    Dim sweep As Double = Math.Max(-Math.Pi * 2.0, Math.Min(Math.Pi * 2.0, arc.ArcAngle))
+                    If sweep <> 0.0 Then
+                        d = "M " + VectorXY(rx * Math.Cos(arc.StartAngle), ry * Math.Sin(arc.StartAngle))
+                        If Math.Abs(sweep) < Math.Pi * 2.0 Then
+                            d = "M 0 0 L " + VectorXY(rx * Math.Cos(arc.StartAngle), ry * Math.Sin(arc.StartAngle))
+                        End If
+                        d += VectorSVGArcPart(0.0, 0.0, rx, ry, arc.StartAngle, sweep, arc.Segments) + " Z"
+                    End If
+                Case "RoundRectShape"
+                    Dim rounded As RoundRectShape = CType(shape, RoundRectShape)
+                    Dim cx As Double = Math.Min(rx, Math.Max(0.0, rounded.CornerWidth) / 2.0)
+                    Dim cy As Double = Math.Min(ry, Math.Max(0.0, rounded.CornerHeight) / 2.0)
+                    Dim segments As Integer = 0
+                    If rounded.Segments > 0 Then
+                        segments = Math.Max(1, rounded.Segments \ 4)
+                    End If
+                    d = "M " + VectorXY(-rx + cx, -ry) + " L " + VectorXY(rx - cx, -ry)
+                    d += VectorSVGArcPart(rx - cx, -ry + cy, cx, cy, -Math.Pi / 2.0, Math.Pi / 2.0, segments)
+                    d += " L " + VectorXY(rx, ry - cy) + VectorSVGArcPart(rx - cx, ry - cy, cx, cy, 0.0, Math.Pi / 2.0, segments)
+                    d += " L " + VectorXY(-rx + cx, ry) + VectorSVGArcPart(-rx + cx, ry - cy, cx, cy, Math.Pi / 2.0, Math.Pi / 2.0, segments)
+                    d += " L " + VectorXY(-rx, -ry + cy) + VectorSVGArcPart(-rx + cx, -ry + cy, cx, cy, Math.Pi, Math.Pi / 2.0, segments) + " Z"
+            End Select
+            If d <> "" Then
+                content = "<path d=\"" + d + "\"" + VectorSVGStyle(shape, True) + "/>"
+            End If
+        Case "Object2D"
+        Case Else
+            Throw New UnsupportedOperationException("Cannot export custom Object2D class " + kind)
+    End Select
+    Dim transform As String = "translate(" + VectorXY(shape.X, shape.Y) + ") rotate(" + VectorScalar(shape.Rotation * 180.0 / Math.Pi) + ") scale(" + VectorScalar(shape.Scale) + ")"
+    If kind <> "Group2D" Then
+        budget.Output(String.LenBytes(content))
+    End If
+    budget.Output(String.LenBytes(transform) + 21)
+    Dim encoded As String = "<g transform=\"" + transform + "\">" + content + "</g>"
+    VectorRequire(String.LenBytes(encoded) <= VectorPictureMaxBytes, "SVG exceeds 32 MiB")
+    Return encoded
+End Function
+
+' Retained drawing plus a portable editable scene. This is distinct from
+' native Picture: native Picture remains raster and cannot gain properties.
+Public Class VectorPicture
+    Private Property mWidth As Integer
+    Private Property mHeight As Integer
+    Public Property Objects As Group2D = New Group2D
+
+    Public Property Width As Integer
+        Get
+            Return mWidth
+        End Get
+    End Property
+    Public Property Height As Integer
+        Get
+            Return mHeight
+        End Get
+    End Property
+
+    Public Sub Constructor(width As Integer, height As Integer)
+        VectorRequire(width > 0 And height > 0 And width <= 32767 And height <= 32767, "invalid canvas dimensions")
+        VectorRequire(width * height <= VectorPictureMaxPixels, "canvas exceeds 4 million pixels")
+        mWidth = width
+        mHeight = height
+    End Sub
+
+    Public Sub Draw(g As IGraphics, dx As Double = 0.0, dy As Double = 0.0)
+        If Objects Is Nil Then
+            Throw New NilObjectException("VectorPicture.Objects cannot be Nil")
+        End If
+        Objects.Draw(g, dx, dy)
+    End Sub
+
+    Public Function Render() As Picture
+        Dim pic As New Picture(mWidth, mHeight)
+        Draw(pic.Graphics)
+        Return pic
+    End Function
+
+    Public Function ToSVG() As String
+        If Objects Is Nil Then
+            Throw New NilObjectException("VectorPicture.Objects cannot be Nil")
+        End If
+        Dim source As String = "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" + Str(mWidth) + "\" height=\"" + Str(mHeight) + "\" viewBox=\"0 0 " + Str(mWidth) + " " + Str(mHeight) + "\">" _
+            + VectorSVGShape(Objects, New VectorBudget, 0) + "</svg>"
+        VectorRequire(String.LenBytes(source) <= VectorPictureMaxBytes, "SVG exceeds 32 MiB")
+        Return source
+    End Function
+
+    Public Sub SaveSVG(file As FileSystemItem)
+        If file Is Nil Then
+            Throw New NilObjectException("VectorPicture.SaveSVG requires a file")
+        End If
+        Dim source As String = ToSVG()
+        Dim written As Result Of Integer, String = file.WriteAllText(source)
+        If written.IsErr Then
+            Throw New IOException(written.Error)
+        End If
+        VectorRequire(written.Value = String.LenBytes(source), "incomplete SVG write")
+    End Sub
+
+    Public Function ToJSON() As String
+        Dim node As JSONItem = JSONItem.NewObject()
+        node.Value("format") = "buoy-vector"
+        node.Value("version") = 1
+        node.Value("width") = mWidth
+        node.Value("height") = mHeight
+        node.Value("objects") = VectorEncodeShape(Objects, New VectorBudget, 0)
+        Dim source As String = Json.Stringify(node)
+        VectorRequire(String.LenBytes(source) <= VectorPictureMaxBytes, "encoded document exceeds 32 MiB")
+        Return source
+    End Function
+
+    Public Shared Function FromJSON(source As String) As VectorPicture
+        VectorPreflight(source)
+        Dim node As JSONItem = Json.Parse(source)
+        VectorRequire(node.IsObject(), "document root must be an object")
+        VectorRequire(VectorString(node, "format") = "buoy-vector", "unknown document format")
+        VectorRequire(VectorInteger(node, "version", 1, 1) = 1, "unsupported version")
+        Dim pic As New VectorPicture(VectorInteger(node, "width", 1, 32767), VectorInteger(node, "height", 1, 32767))
+        Dim root As Object2D = VectorDecodeShape(node.Value("objects"), New VectorBudget, 0)
+        pic.Objects = TryCast(root, Group2D)
+        VectorRequire(pic.Objects IsNot Nil, "objects root must be Group2D")
+        Return pic
+    End Function
+
+    Public Sub Save(file As FileSystemItem)
+        If file Is Nil Then
+            Throw New NilObjectException("VectorPicture.Save requires a file")
+        End If
+        Dim source As String = ToJSON()
+        Dim written As Result Of Integer, String = file.WriteAllText(source)
+        If written.IsErr Then
+            Throw New IOException(written.Error)
+        End If
+        VectorRequire(written.Value = String.LenBytes(source), "incomplete scene write")
+    End Sub
+
+    Public Shared Function Open(file As FileSystemItem) As VectorPicture
+        If file Is Nil Then
+            Throw New NilObjectException("VectorPicture.Open requires a file")
+        End If
+        Dim opened As Result Of BinaryStream, IOError = BinaryStream.Open(file, False)
+        If opened.IsErr Then
+            Throw New IOException(opened.Error.Message)
+        End If
+        Dim stream As BinaryStream = opened.Value
+        Try
+            VectorRequire(stream.Length <= VectorPictureMaxBytes, "file exceeds 32 MiB")
+            Dim data As Bytes = stream.Read(VectorPictureMaxBytes + 1)
+            If stream.LastError.HasValue Then
+                Throw New IOException(stream.LastError.Value.Message)
+            End If
+            VectorRequire(data.Count <= VectorPictureMaxBytes, "file exceeds 32 MiB")
+            Return VectorPicture.FromJSON(data.ToString(Text.Encodings.UTF8))
+        Finally
+            stream.Close()
+        End Try
+    End Function
+End Class
+
+' Portable retained scene factory. The return type is VectorPicture,
+' not native Picture; only the versioned buoy-vector JSON format is read.
+Public Extension Shared Function Picture.OpenVector(file As FileSystemItem) As VectorPicture
+    Return VectorPicture.Open(file)
+End Function
+
+Public Function OpenVectorPicture(file As FileSystemItem) As VectorPicture
+    Return VectorPicture.Open(file)
+End Function

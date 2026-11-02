@@ -1,0 +1,69 @@
+Import scrollview
+Class RowButton Inherits Button
+    Public Property Index As Integer
+    Public Property Owner As Weak ScrollDemo
+    Handle Action()
+        Dim win As ScrollDemo = Me.Owner
+        If win <> Nil Then win.Title = "Row " + Str(Me.Index)
+    End Handle
+End Class
+Window ScrollLayout
+    Title = "Buoy Native ScrollView"
+    Frame = (100, 100, 520, 420)
+    Control Button report
+        Caption = "Report scroll position"
+        Frame = (20, 20, 200, 32)
+    End Control
+    Control Button bottom
+        Caption = "Scroll to bottom right"
+        Frame = (240, 20, 250, 32)
+    End Control
+    Control ScrollView viewport
+        Frame = (20, 70, 470, 300)
+    End Control
+    Control Label hint
+        Text = "Native child buttons, clipping, scrollbars and wheel input."
+        Frame = (20, 380, 480, 25)
+    End Control
+End Window
+Class ScrollDemo Inherits ScrollLayout
+    Handle Opening()
+        Me.viewport.ContentWidth = 1000
+        Me.viewport.ContentHeight = 1800
+        For i As Integer = 0 To 29
+            Dim button As New RowButton()
+            button.Index = i
+            button.Owner = Me
+            button.Caption = "Native row " + Str(i)
+            button.Move(20, 20 + i * 55, 400, 35)
+            Me.viewport.Content.AddSubview(button)
+        Next
+        Dim last As New Label()
+        last.Text = "Bottom right of the content"
+        last.Move(740, 1740, 250, 35)
+        Me.viewport.Content.AddSubview(last)
+        Me.viewport.Open()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.viewport.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.viewport.Close()
+    End Handle
+    With report
+        Handle Action()
+            Me.Title = "Offset " + Str(Me.viewport.OffsetX) + "," + Str(Me.viewport.OffsetY)
+        End Handle
+    End With
+    With bottom
+        Handle Action()
+            Me.viewport.ScrollTo(100000, 100000)
+            Me.Title = "Bottom " + Str(Me.viewport.OffsetX) + "," + Str(Me.viewport.OffsetY)
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New ScrollDemo()
+    win.Show()
+    Application.Run()
+End Sub

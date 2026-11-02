@@ -1,0 +1,411 @@
+' Native separators and activity indicators. No custom painting or polling.
+#If TargetWindows Then
+Private Class IndicatorReference
+    Public Property Owner As Weak NativeIndicatorControl
+End Class
+Private Class IndicatorRegistry
+    Public Shared Property Items As Array Of IndicatorReference = []
+End Class
+#End If
+Public Enum SeparatorOrientation As Integer
+    Horizontal
+    Vertical
+End Enum
+
+' Shared host lifecycle. Construct one of the two concrete controls below.
+Public Class NativeIndicatorControl Inherits View
+    Private Property mActivity As Boolean = False
+    Private Property mWidget As Ptr = Nil
+    Private Property mHost As Ptr = Nil
+    #If TargetWindows Then
+        Private Property mActivation As Ptr = Nil
+        Private Property mID As Integer = -1
+        Private Property mHostDestroyed As Boolean = False
+    #End If
+    Protected Property mRunning As Boolean = False
+    Protected Property mDirection As SeparatorOrientation = SeparatorOrientation.Horizontal
+    Public Property LastNativeError As String = ""
+    ' Optional manifest override; the default creates and removes a private temp manifest.
+    Public Property WindowsManifestPath As String = ""
+
+    Protected Sub Constructor(activity As Boolean)
+        Super.Constructor()
+        Me.mActivity = activity
+        Me.AccessibleHidden = Not activity
+    End Sub
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mWidget <> Nil
+        End Get
+    End Property
+    ' Escape hatch for native integration and contract readback.
+    Public Property NativeControlHandle As Ptr
+        Get
+            Return Me.mWidget
+        End Get
+    End Property
+
+    ' Attach the host to a Window/View first; Windows creates HWNDs lazily.
+    Public Sub Open()
+        Dim requested As Boolean = Me.mRunning
+        Me.Close()
+        Me.mRunning = requested
+        Me.LastNativeError = ""
+        #If TargetWindows Then
+            If Me.mHostDestroyed Then Throw New InvalidArgumentException("Native parent destroyed; construct a new indicator")
+        #End If
+        Me.mHost = Me.NativeWidget
+        If Me.mHost = Nil Then Throw New InvalidArgumentException("Attach indicator before Open")
+        Try
+            #If TargetLinux Then
+                If Me.mActivity Then
+                    Me.mWidget = IndicatorGTKSpinner()
+                Else
+                    Me.mWidget = IndicatorGTKSeparator(CType(Me.mDirection, Integer))
+                End If
+                If Me.mWidget = Nil Then Throw New RuntimeException("Could not create GTK indicator")
+                IndicatorGTKRefSink(Me.mWidget)
+                IndicatorGTKPut(Me.mHost, Me.mWidget, 0, 0)
+            #ElseIf TargetWindows Then
+                Dim cls As Bytes
+                Dim style As Integer = 1342177280 ' WS_CHILD | WS_VISIBLE
+                If Me.mActivity Then
+                    Me.mActivation = IndicatorWinContext(Me.WindowsManifestPath)
+                    cls = "msctls_progress32".AsUTF16LE()
+                    style += 8 ' PBS_MARQUEE
+                Else
+                    cls = "STATIC".AsUTF16LE()
+                    If Me.mDirection = SeparatorOrientation.Horizontal Then
+                        style += 16 ' SS_ETCHEDHORZ
+                    Else
+                        style += 17 ' SS_ETCHEDVERT
+                    End If
+                End If
+                cls.Append(0)
+                cls.Append(0)
+                Dim cookie As UInt64 = 0
+                If Me.mActivity Then
+                    If IndicatorWinActivate(Me.mActivation, cookie) = 0 Then Throw New RuntimeException("Could not activate Common-Controls v6")
+                End If
+                Try
+                    If Me.mActivity Then
+                        Dim init As IndicatorCommonControls
+                        init.Size = 8
+                        init.Classes = 32 ' ICC_PROGRESS_CLASS
+                        If IndicatorWinInit(init) = 0 Then Throw New RuntimeException("Could not initialize native progress control")
+                    End If
+                    Me.mWidget = IndicatorWinCreate(0, cls.DataPtr(), Nil, style, 0, 0, 1, 1, Me.mHost, Nil, Nil, Nil)
+                Finally
+                    If cookie <> 0 Then IndicatorWinDeactivate(0, cookie)
+                End Try
+                If Me.mWidget = Nil Then Throw New RuntimeException("Could not create Win32 indicator")
+                For i As Integer = 0 To Array.LastIndex(IndicatorRegistry.Items)
+                    If IndicatorRegistry.Items(i).Owner = Nil Then
+                        Me.mID = i
+                        Exit For
+                    End If
+                Next
+                If Me.mID < 0 Then
+                    Me.mID = Array.Count(IndicatorRegistry.Items)
+                    Array.Append(IndicatorRegistry.Items, New IndicatorReference())
+                End If
+                IndicatorRegistry.Items(Me.mID).Owner = Me
+                If IndicatorWinSubclass(Me.mWidget, AddressOf IndicatorDestroyed, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not observe indicator destruction")
+                If Me.mActivity Then
+                    If IndicatorWinSend(Me.mWidget, 1034, 0, 0) = 0 Then Throw New RuntimeException("Native marquee animation requires Common-Controls v6")
+                End If
+            #ElseIf TargetMac Then
+                Dim cls As Ptr
+                If Me.mActivity Then
+                    cls = IndicatorMacClass("NSProgressIndicator")
+                Else
+                    cls = IndicatorMacClass("NSBox")
+                End If
+                Me.mWidget = IndicatorMacInit(IndicatorMacAlloc(cls))
+                If Me.mWidget = Nil Then Throw New RuntimeException("Could not create AppKit indicator")
+                If Me.mActivity Then
+                    IndicatorMacStyle(Me.mWidget, 1) ' NSProgressIndicatorStyleSpinning
+                    IndicatorMacIndeterminate(Me.mWidget, True)
+                    IndicatorMacDisplayStopped(Me.mWidget, True)
+                Else
+                    IndicatorMacBoxType(Me.mWidget, 2) ' NSBoxSeparator
+                End If
+                IndicatorMacAdd(Me.mHost, Me.mWidget)
+                IndicatorMacAutoresizing(Me.mWidget, 18) ' width + height
+            #End If
+            Me.RefreshNative()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Public Sub Close()
+        #If TargetWindows Then
+            If Me.mID >= 0 Then
+                IndicatorRegistry.Items(Me.mID).Owner = Nil
+                If Me.mWidget <> Nil Then IndicatorWinUnsubclass(Me.mWidget, AddressOf IndicatorDestroyed, Me.mID + 1)
+                Me.mID = -1
+            End If
+        #End If
+        If Me.mWidget <> Nil Then
+            If Me.mActivity Then
+                #If TargetLinux Then
+                    IndicatorGTKStop(Me.mWidget)
+                #ElseIf TargetWindows Then
+                    If IndicatorWinExists(Me.mWidget) <> 0 Then IndicatorWinSend(Me.mWidget, 1034, 0, 0)
+                #ElseIf TargetMac Then
+                    IndicatorMacStop(Me.mWidget, Nil)
+                #End If
+            End If
+            #If TargetLinux Then
+                Dim parent As Ptr = IndicatorGTKParent(Me.mWidget)
+                If parent <> Nil Then IndicatorGTKRemove(parent, Me.mWidget)
+                IndicatorGTKUnref(Me.mWidget)
+            #ElseIf TargetWindows Then
+                If IndicatorWinExists(Me.mWidget) <> 0 Then IndicatorWinDestroy(Me.mWidget)
+            #ElseIf TargetMac Then
+                IndicatorMacRemove(Me.mWidget)
+                IndicatorMacRelease(Me.mWidget)
+            #End If
+        End If
+        Me.mWidget = Nil
+        #If TargetWindows Then
+            If Me.mActivation <> Nil Then IndicatorWinReleaseContext(Me.mActivation)
+            Me.mActivation = Nil
+        #End If
+        Me.mHost = Nil
+        Me.mRunning = False
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+    ' Called only by the scoped WM_NCDESTROY observer on Windows.
+    Public Sub NativeDestroyed(widget As Ptr)
+        #If TargetWindows Then
+            If widget <> Me.mWidget Then Return
+            Me.mHostDestroyed = True
+            Me.mWidget = Nil
+            Me.mHost = Nil
+            Me.mRunning = False
+            If Me.mID >= 0 Then IndicatorRegistry.Items(Me.mID).Owner = Nil
+            Me.mID = -1
+        #End If
+    End Sub
+    ' Call after geometry or inherited Enabled changes.
+    Public Sub RefreshNative()
+        If Me.mWidget = Nil Then Return
+        Dim x As Integer = 0
+        Dim y As Integer = 0
+        Dim width As Integer = Math.Max(0, Me.Width)
+        Dim height As Integer = Math.Max(0, Me.Height)
+        If Not Me.mActivity Then
+            If Me.mDirection = SeparatorOrientation.Horizontal Then
+                y = Math.Max(0, (height - 2) \ 2)
+                height = Math.Min(2, height)
+            Else
+                x = Math.Max(0, (width - 2) \ 2)
+                width = Math.Min(2, width)
+            End If
+        End If
+        #If TargetLinux Then
+            IndicatorGTKMove(Me.mHost, Me.mWidget, x, y)
+            IndicatorGTKSize(Me.mWidget, width, height)
+            IndicatorGTKSensitive(Me.mWidget, CType(Me.Enabled, Int32))
+            If Me.mActivity Then
+                If Me.mRunning Then
+                    IndicatorGTKStart(Me.mWidget)
+                Else
+                    IndicatorGTKStop(Me.mWidget)
+                End If
+            End If
+        #ElseIf TargetWindows Then
+            If IndicatorWinExists(Me.mWidget) = 0 Then Return
+            Dim scale As Double = IndicatorWinDPI(Me.mHost) / 96.0
+            Dim pixelX As Integer = x * scale
+            Dim pixelY As Integer = y * scale
+            Dim pixelWidth As Integer = width * scale
+            Dim pixelHeight As Integer = height * scale
+            IndicatorWinMove(Me.mWidget, pixelX, pixelY, pixelWidth, pixelHeight, 1)
+            IndicatorWinEnable(Me.mWidget, CType(Me.Enabled, Int32))
+            If Me.mActivity Then IndicatorWinSend(Me.mWidget, 1034, CType(Me.mRunning, Integer), 30) ' PBM_SETMARQUEE
+        #ElseIf TargetMac Then
+            Dim frame As IndicatorRect
+            frame.X = x
+            frame.Y = y
+            frame.Width = width
+            frame.Height = height
+            IndicatorMacFrame(Me.mWidget, frame)
+            If Me.mActivity Then
+                If Me.mRunning Then
+                    IndicatorMacStart(Me.mWidget, Nil)
+                Else
+                    IndicatorMacStop(Me.mWidget, Nil)
+                End If
+            End If
+        #End If
+    End Sub
+End Class
+
+Public Class NativeSeparator Inherits NativeIndicatorControl
+    Public Sub Constructor()
+        Super.Constructor(False)
+    End Sub
+    Public Property Orientation As SeparatorOrientation
+        Get
+            Return Me.mDirection
+        End Get
+        Set
+            If value <> SeparatorOrientation.Horizontal And value <> SeparatorOrientation.Vertical Then Throw New InvalidArgumentException("Invalid separator orientation")
+            If Me.mDirection = value Then Return
+            Me.mDirection = value
+            If Me.IsOpen Then Me.Open()
+        End Set
+    End Property
+End Class
+
+Public Class ActivityIndicator Inherits NativeIndicatorControl
+    Public Sub Constructor()
+        Super.Constructor(True)
+    End Sub
+    ' Requested animation state, including Start before Open.
+    Public Property IsRunning As Boolean
+        Get
+            Return Me.mRunning
+        End Get
+    End Property
+    Public Sub Start()
+        Me.mRunning = True
+        Me.RefreshNative()
+    End Sub
+    Public Sub Stop()
+        Me.mRunning = False
+        Me.RefreshNative()
+    End Sub
+End Class
+
+#If TargetLinux Then
+Private Optional Declare Function IndicatorGTKSeparator Lib "libgtk-4.so.1" Alias "gtk_separator_new" (orientation As Int32) As Ptr
+Private Optional Declare Function IndicatorGTKSpinner Lib "libgtk-4.so.1" Alias "gtk_spinner_new" () As Ptr
+Private Optional Declare Sub IndicatorGTKStart Lib "libgtk-4.so.1" Alias "gtk_spinner_start" (widget As Ptr)
+Private Optional Declare Sub IndicatorGTKStop Lib "libgtk-4.so.1" Alias "gtk_spinner_stop" (widget As Ptr)
+Private Optional Declare Function IndicatorGTKRefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (widget As Ptr) As Ptr
+Private Optional Declare Sub IndicatorGTKUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (widget As Ptr)
+Private Optional Declare Function IndicatorGTKParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Sub IndicatorGTKPut Lib "libgtk-4.so.1" Alias "gtk_fixed_put" (host As Ptr, widget As Ptr, x As Double, y As Double)
+Private Optional Declare Sub IndicatorGTKMove Lib "libgtk-4.so.1" Alias "gtk_fixed_move" (host As Ptr, widget As Ptr, x As Double, y As Double)
+Private Optional Declare Sub IndicatorGTKRemove Lib "libgtk-4.so.1" Alias "gtk_fixed_remove" (host As Ptr, widget As Ptr)
+Private Optional Declare Sub IndicatorGTKSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Sub IndicatorGTKSensitive Lib "libgtk-4.so.1" Alias "gtk_widget_set_sensitive" (widget As Ptr, enabled As Int32)
+#ElseIf TargetWindows Then
+Sequential Structure IndicatorCommonControls
+    Size As UInt32
+    Classes As UInt32
+End Structure
+Sequential Structure IndicatorActContext
+    Size As UInt32
+    NativeFlags As UInt32
+    Source As Ptr
+    Architecture As UInt16
+    Language As UInt16
+    AssemblyDirectory As Ptr
+    Resource As Ptr
+    ApplicationName As Ptr
+    ModuleHandle As Ptr
+End Structure
+Private Optional Declare Function IndicatorWinCreateContext Lib "kernel32" Alias "CreateActCtxW" (ByRef context As IndicatorActContext) As Ptr
+Private Optional Declare Function IndicatorWinActivate Lib "kernel32" Alias "ActivateActCtx" (context As Ptr, ByRef cookie As UInt64) As Int32
+Private Optional Declare Function IndicatorWinDeactivate Lib "kernel32" Alias "DeactivateActCtx" (nativeFlags As UInt32, cookie As UInt64) As Int32
+Private Optional Declare Sub IndicatorWinReleaseContext Lib "kernel32" Alias "ReleaseActCtx" (context As Ptr)
+Private Optional Declare Function IndicatorWinTempPath Lib "kernel32" Alias "GetTempPathW" (length As UInt32, buffer As Ptr) As UInt32
+Private Optional Declare Function IndicatorWinTempName Lib "kernel32" Alias "GetTempFileNameW" (directory As Ptr, prefix As Ptr, unique As UInt32, name As Ptr) As UInt32
+Private Optional Declare Function IndicatorWinDeleteFile Lib "kernel32" Alias "DeleteFileW" (manifestPath As Ptr) As Int32
+Private Function IndicatorWinContext(manifestPath As String) As Ptr
+    Dim temporary As Bytes = Nil
+    If manifestPath = "" Then
+        Dim directory As New Bytes()
+        Dim name As New Bytes()
+        For i As Integer = 0 To 519
+            directory.Append(0)
+            name.Append(0)
+        Next
+        Dim length As Integer = IndicatorWinTempPath(260, directory.DataPtr())
+        If length <= 0 Or length > 247 Then Throw New RuntimeException("Temporary directory unavailable for native common controls")
+        Dim prefix As Bytes = "bui".AsUTF16LE()
+        prefix.Append(0)
+        prefix.Append(0)
+        If IndicatorWinTempName(directory.DataPtr(), prefix.DataPtr(), 0, name.DataPtr()) = 0 Then Throw New RuntimeException("Could not create native common-controls temp manifest")
+        temporary = name
+        Dim nativeName As New Bytes()
+        For i As Integer = 0 To 518 Step 2
+            If name.Item(i) = 0 And name.Item(i + 1) = 0 Then Exit For
+            nativeName.Append(name.Item(i))
+            nativeName.Append(name.Item(i + 1))
+        Next
+        manifestPath = String.FromUTF16LE(nativeName)
+    End If
+    Try
+        If temporary <> Nil Then
+            Dim file As New FileSystemItem(manifestPath)
+            Dim xml As String = "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\"><dependency><dependentAssembly><assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" version=\"6.0.0.0\" processorArchitecture=\"*\" publicKeyToken=\"6595b64144ccf1df\" language=\"*\"/></dependentAssembly></dependency></assembly>"
+            Dim written As Result Of Integer, String = file.WriteAllText(xml)
+            If written.IsErr Then Throw New RuntimeException("Could not write native common-controls temp manifest: " + written.Error)
+        End If
+        Dim name As Bytes = manifestPath.AsUTF16LE()
+        name.Append(0)
+        name.Append(0)
+        Dim context As IndicatorActContext
+        context.Size = 56
+        context.Source = name.DataPtr()
+        Dim handle As Ptr = IndicatorWinCreateContext(context)
+        If handle = Nil Or CType(handle, Integer) = -1 Then Throw New RuntimeException("Could not load native Common-Controls v6 manifest")
+        Return handle
+    Finally
+        If temporary <> Nil Then IndicatorWinDeleteFile(temporary.DataPtr())
+    End Try
+End Function
+Delegate Function IndicatorWinObserver(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+Private Optional Declare Function IndicatorWinSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As IndicatorWinObserver, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function IndicatorWinUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As IndicatorWinObserver, id As UInt64) As Int32
+Private Optional Declare Function IndicatorWinDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Function IndicatorDestroyed(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    If message = 130 Then ' WM_NCDESTROY
+        Dim index As Integer = id - 1
+        If index >= 0 And index < Array.Count(IndicatorRegistry.Items) Then
+            Dim owner As NativeIndicatorControl = IndicatorRegistry.Items(index).Owner
+            If owner <> Nil Then owner.NativeDestroyed(widget)
+        End If
+        IndicatorWinUnsubclass(widget, AddressOf IndicatorDestroyed, id)
+    End If
+    Return IndicatorWinDefault(widget, message, word, param)
+End Function
+Private Optional Declare Function IndicatorWinInit Lib "comctl32" Alias "InitCommonControlsEx" (ByRef init As IndicatorCommonControls) As Int32
+Private Optional Declare Function IndicatorWinCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, parameter As Ptr) As Ptr
+Private Optional Declare Function IndicatorWinExists Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function IndicatorWinDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Optional Declare Function IndicatorWinSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function IndicatorWinDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function IndicatorWinMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, repaint As Int32) As Int32
+Private Optional Declare Function IndicatorWinEnable Lib "user32" Alias "EnableWindow" (widget As Ptr, enabled As Int32) As Int32
+#ElseIf TargetMac Then
+Sequential Structure IndicatorRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Private Declare Function IndicatorMacClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function IndicatorMacAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function IndicatorMacInit Lib "AppKit" Selector "init" (widget As Ptr) As Ptr
+Private Declare Sub IndicatorMacRelease Lib "AppKit" Selector "release" (widget As Ptr)
+Private Declare Sub IndicatorMacRemove Lib "AppKit" Selector "removeFromSuperview" (widget As Ptr)
+Private Declare Sub IndicatorMacAdd Lib "AppKit" Selector "addSubview:" (host As Ptr, widget As Ptr)
+Private Declare Sub IndicatorMacAutoresizing Lib "AppKit" Selector "setAutoresizingMask:" (widget As Ptr, mask As Integer)
+Private Declare Sub IndicatorMacFrame Lib "AppKit" Selector "setFrame:" (widget As Ptr, frame As IndicatorRect)
+Private Declare Sub IndicatorMacBoxType Lib "AppKit" Selector "setBoxType:" (widget As Ptr, boxType As Integer)
+Private Declare Sub IndicatorMacStyle Lib "AppKit" Selector "setStyle:" (widget As Ptr, style As Integer)
+Private Declare Sub IndicatorMacIndeterminate Lib "AppKit" Selector "setIndeterminate:" (widget As Ptr, value As Boolean)
+Private Declare Sub IndicatorMacDisplayStopped Lib "AppKit" Selector "setDisplayedWhenStopped:" (widget As Ptr, value As Boolean)
+Private Declare Sub IndicatorMacStart Lib "AppKit" Selector "startAnimation:" (widget As Ptr, sender As Ptr)
+Private Declare Sub IndicatorMacStop Lib "AppKit" Selector "stopAnimation:" (widget As Ptr, sender As Ptr)
+#End If

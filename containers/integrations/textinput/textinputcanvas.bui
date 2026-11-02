@@ -1,0 +1,659 @@
+Import textmodel
+Import inputbridge
+Import nativewindows
+Import nativemacos
+
+Public Class TextInputRect
+    Public Property X As Integer = 0
+    Public Property Y As Integer = 0
+    Public Property Width As Integer = 1
+    Public Property Height As Integer = 20
+End Class
+
+' Subclass this control to supply your own document and drawing.
+Public Class TextInputCanvas Inherits Canvas
+    Event InsertText(text As String, range As TextRange)
+    Event SetIncompleteText(text As String, replacementRange As TextRange, relativeSelection As TextRange)
+    Event DiscardIncompleteText()
+    Event SelectedRange() As TextRange
+    Event TextForRange(range As TextRange) As String
+    Event TextLength() As Integer
+    Event CaretIndex() As Integer
+    Event RectForRange(range As TextRange) As TextInputRect
+    Event CharacterAtPoint(x As Double, y As Double) As Integer
+    Event IsEditable() As Boolean
+    Event DoCommand(command As String, extendSelection As Boolean) As Boolean
+    Event Draw(g As Graphics)
+    Event SelectionRequested(position As Integer, extendSelection As Boolean)
+    Event GotFocus()
+    Event LostFocus()
+
+    #If TargetWindows Then
+        Private Property mWindows As WindowsInput
+    #ElseIf TargetMac Then
+        Private Property mMac As MacInput
+    #End If
+    Private Property mNativeError As String = ""
+    Private Property mDragging As Boolean = False
+    Private Property mClosingInput As Boolean = False
+    Private Property mInputID As Integer = -1
+    Private Property mContext As Ptr = Nil
+    Private Property mKeyController As Ptr = Nil
+    Private Property mFocusController As Ptr = Nil
+    Private Property mInputWidget As Ptr = Nil
+    Private Property mWidgetDestroying As Boolean = False
+
+    Public Property NativeIMESupported As Boolean
+        Get
+            #If TargetLinux Then
+                Return Me.mContext <> Nil
+            #ElseIf TargetWindows Then
+                Return Me.mWindows <> Nil And Me.mWindows.Context <> Nil
+            #ElseIf TargetMac Then
+                Return Me.mMac <> Nil And Me.mMac.Widget <> Nil
+            #Else
+                Return False
+            #End If
+        End Get
+    End Property
+
+    Public Property NativeInputError As String
+        Get
+            #If TargetWindows Then
+                If Me.mWindows <> Nil Then Return Me.mWindows.LastError
+            #ElseIf TargetMac Then
+                If Me.mMac <> Nil Then Return Me.mMac.LastError
+            #End If
+            Return Me.mNativeError
+        End Get
+    End Property
+
+    Public Sub RecordNativeInputError(message As String)
+        Me.mNativeError = message
+    End Sub
+
+    Public Sub NativeInputDetached()
+        If Me.mInputID >= 0 And Me.mInputID < Array.Count(InputRegistry.Controls) Then
+            If InputRegistry.Controls(Me.mInputID).Control = Me Then InputRegistry.Controls(Me.mInputID).Control = Nil
+            InputRegistry.ClearEmptySlots()
+        End If
+        Me.mInputID = -1
+    End Sub
+
+    Public Function OwnsInputSource(source As Ptr) As Boolean
+        Return source <> Nil And (source = Me.mContext Or source = Me.mFocusController Or source = Me.mInputWidget)
+    End Function
+
+    Public Sub CommitText(text As String, range As TextRange)
+        If RaiseEvent IsEditable() Then
+            RaiseEvent InsertText(text, range)
+            Me.Invalidate()
+        End If
+    End Sub
+
+    Public Sub UpdateComposition(text As String, cursor As Integer)
+        If RaiseEvent IsEditable() Then
+            RaiseEvent SetIncompleteText(text, Nil, New TextRange(cursor, 0))
+            Me.Invalidate()
+        End If
+    End Sub
+
+    Public Sub CancelComposition()
+        #If TargetLinux Then
+            If Me.mContext <> Nil Then GTKReset(Me.mContext)
+        #ElseIf TargetWindows Then
+            If Me.mWindows <> Nil Then Me.mWindows.Cancel()
+        #ElseIf TargetMac Then
+            If Me.mMac <> Nil Then Me.mMac.Cancel()
+        #End If
+        RaiseEvent DiscardIncompleteText()
+        Me.Invalidate()
+    End Sub
+
+    Public Function PerformCommand(command As String, extendSelection As Boolean = False) As Boolean
+        Return RaiseEvent DoCommand(command, extendSelection)
+    End Function
+
+    Public Sub InputFocusChanged(focused As Boolean)
+        #If TargetLinux Then
+            If Me.mContext <> Nil Then
+                If focused Then
+                    GTKFocusIn(Me.mContext)
+                Else
+                    GTKFocusOut(Me.mContext)
+                    Me.CancelComposition()
+                End If
+            End If
+        #End If
+        If focused Then
+            RaiseEvent GotFocus()
+        Else
+            RaiseEvent LostFocus()
+        End If
+    End Sub
+
+    Public Sub SupplySurrounding()
+        #If TargetLinux Then
+            Dim selection As TextRange = RaiseEvent SelectedRange()
+            If selection = Nil Then Exit Sub
+            Dim text As String = RaiseEvent TextForRange(New TextRange(0, RaiseEvent TextLength()))
+            Dim caret As Integer = RaiseEvent CaretIndex()
+            Dim bound As Integer = selection.Location
+            If caret = selection.Location Then bound += selection.Length
+            Dim cursor As Int32 = String.LenBytes(String.Left(text, caret))
+            Dim anchor As Int32 = String.LenBytes(String.Left(text, bound))
+            GTKSurrounding(Me.mContext, text, -1, cursor, anchor)
+        #End If
+    End Sub
+
+    Public Function DeleteSurrounding(offset As Integer, count As Integer) As Boolean
+        If Not RaiseEvent IsEditable() Then Return False
+        Dim start As Integer = (RaiseEvent CaretIndex()) + offset
+        Dim length As Integer = RaiseEvent TextLength()
+        If start < 0 Or count < 0 Or start > length Or count > length - start Then Return False
+        Me.CommitText("", New TextRange(start, count))
+        Return True
+    End Function
+
+    Public Sub UpdateInputLocation()
+        #If TargetLinux Then
+            If Me.mContext = Nil Then Exit Sub
+            Dim selection As TextRange = RaiseEvent SelectedRange()
+            If selection = Nil Then Exit Sub
+            Dim rect As TextInputRect = RaiseEvent RectForRange(selection)
+            If rect = Nil Then Exit Sub
+            Dim native As GTKRectangle
+            native.X = rect.X
+            native.Y = rect.Y
+            native.Width = Math.Max(1, rect.Width)
+            native.Height = Math.Max(1, rect.Height)
+            GTKCursorRect(Me.mContext, native)
+        #ElseIf TargetWindows Then
+            If Me.mWindows <> Nil Then Me.mWindows.UpdateLocation()
+        #ElseIf TargetMac Then
+            If Me.mMac <> Nil Then Me.mMac.UpdateLocation()
+        #End If
+    End Sub
+
+    ' Call after AddSubview. Closing before window destruction is preferred; GTK also
+    ' supports late, idempotent close after its native widget has gone away.
+    Public Sub OpenInputMethod()
+        If Me.NativeIMESupported Then Exit Sub
+        If Me.NativeWidget = Nil Then Throw New RuntimeException("Add the canvas to a window before OpenInputMethod")
+        Me.NativeInputDetached()
+        Me.mNativeError = ""
+        For i As Integer = 0 To Array.LastIndex(InputRegistry.Controls)
+            If InputRegistry.Controls(i).Control = Nil Then
+                Me.mInputID = i
+                Exit For
+            End If
+        Next
+        If Me.mInputID = -1 Then
+            Me.mInputID = Array.Count(InputRegistry.Controls)
+            Dim slot As New InputRegistrySlot()
+            slot.Control = Me
+            Array.Append(InputRegistry.Controls, slot)
+        Else
+            InputRegistry.Controls(Me.mInputID).Control = Me
+        End If
+        #If TargetLinux Then
+            Try
+                Dim data As Ptr = CType(Me.mInputID + 1, Ptr)
+                Me.mInputWidget = Me.NativeWidget
+                Me.mWidgetDestroying = False
+                ConnectSimple(Me.mInputWidget, "destroy", AddressOf IMWidgetDestroy, data, Nil, 0)
+                Me.mContext = GTKContextNew()
+                If Me.mContext = Nil Then Throw New RuntimeException("Could not create GTK input context")
+                GTKClient(Me.mContext, Me.NativeWidget)
+                Me.mKeyController = GTKKeyNew()
+                If Me.mKeyController = Nil Then Throw New RuntimeException("Could not create GTK key controller")
+                GTKPhase(Me.mKeyController, 1) ' capture: IME consumes text before Canvas KeyDown
+                GTKKeyContext(Me.mKeyController, Me.mContext)
+                ConnectCommit(Me.mContext, "commit", AddressOf IMCommit, data, Nil, 0)
+                ConnectSimple(Me.mContext, "preedit-changed", AddressOf IMPreedit, data, Nil, 0)
+                ConnectRetrieve(Me.mContext, "retrieve-surrounding", AddressOf IMRetrieve, data, Nil, 0)
+                ConnectDelete(Me.mContext, "delete-surrounding", AddressOf IMDelete, data, Nil, 0)
+                ' add_controller consumes the extra reference; retain our original
+                ' until close so widget disposal cannot leave a dangling pointer.
+                GTKAddController(Me.NativeWidget, GRef(Me.mKeyController))
+                Me.mFocusController = GTKFocusNew()
+                If Me.mFocusController = Nil Then Throw New RuntimeException("Could not create GTK focus controller")
+                ConnectSimple(Me.mFocusController, "enter", AddressOf IMFocusIn, data, Nil, 0)
+                ConnectSimple(Me.mFocusController, "leave", AddressOf IMFocusOut, data, Nil, 0)
+                GTKAddController(Me.NativeWidget, GRef(Me.mFocusController))
+            Catch e As Exception
+                Me.ReleaseGTKInput()
+                Throw e
+            End Try
+        #ElseIf TargetWindows Then
+            Try
+                Me.mWindows = New WindowsInput()
+                Me.mWindows.Open(Me.NativeWidget, Me.NativeCallbacks())
+            Catch e As Exception
+                InputRegistry.Controls(Me.mInputID).Control = Nil
+                InputRegistry.ClearEmptySlots()
+                Me.mInputID = -1
+                Me.mWindows = Nil
+                Throw e
+            End Try
+        #ElseIf TargetMac Then
+            Try
+                Me.mMac = New MacInput()
+                Me.mMac.Open(Me.NativeWidget, Me.NativeCallbacks())
+            Catch e As Exception
+                InputRegistry.Controls(Me.mInputID).Control = Nil
+                InputRegistry.ClearEmptySlots()
+                Me.mInputID = -1
+                Me.mMac = Nil
+                Throw e
+            End Try
+        #End If
+    End Sub
+
+    Public Sub CloseInputMethod()
+        #If TargetLinux Then
+            If Me.mContext = Nil And Me.mInputID < 0 Then Exit Sub
+            If Me.mClosingInput Then Exit Sub
+            Me.mClosingInput = True
+            Try
+                ' A late close must not raise a host callback which may redraw a
+                ' destroyed canvas. The destroy callback clears this borrowed
+                ' widget identity before finalization.
+                If Not Me.mWidgetDestroying And Me.mInputWidget <> Nil Then
+                    RaiseEvent DiscardIncompleteText()
+                    If Not Me.mWidgetDestroying And Me.mInputWidget <> Nil Then Me.Invalidate()
+                End If
+            Finally
+                Try
+                    Me.ReleaseGTKInput()
+                Finally
+                    Me.mClosingInput = False
+                End Try
+            End Try
+        #ElseIf TargetWindows Then
+            If Me.mWindows <> Nil Then Me.mWindows.Close()
+            Me.mWindows = Nil
+        #ElseIf TargetMac Then
+            If Me.mMac <> Nil Then Me.mMac.Close()
+            Me.mMac = Nil
+        #End If
+        Me.NativeInputDetached()
+    End Sub
+
+    #If TargetLinux Then
+    Public Sub InputWidgetDestroyed(source As Ptr)
+        If source = Nil Or source <> Me.mInputWidget Then Return
+        ' GtkIMMulticontext keeps a borrowed client-widget pointer. Clear it
+        ' during destroy, before GTK finalizes the widget; late reset is too late.
+        Me.mWidgetDestroying = True
+        Me.ReleaseGTKInput()
+    End Sub
+
+    Private Sub ReleaseGTKInput()
+        Dim widgetOwner As Ptr = Me.mInputWidget
+        Dim context As Ptr = Me.mContext
+        Dim key As Ptr = Me.mKeyController
+        Dim focus As Ptr = Me.mFocusController
+        Dim data As Ptr = CType(Me.mInputID + 1, Ptr)
+        ' Invalidate callback identity before native reset/removal can dispatch signals.
+        Me.mContext = Nil
+        Me.mKeyController = Nil
+        Me.mFocusController = Nil
+        Me.mInputWidget = Nil
+        If widgetOwner <> Nil Then DisconnectData(widgetOwner, 16, 0, 0, Nil, Nil, data)
+        If context <> Nil Then DisconnectData(context, 16, 0, 0, Nil, Nil, data)
+        If focus <> Nil Then DisconnectData(focus, 16, 0, 0, Nil, Nil, data)
+        If key <> Nil Then
+            GTKKeyContext(key, Nil)
+            Dim widget As Ptr = GTKControllerWidget(key)
+            If widget <> Nil Then GTKRemoveController(widget, key)
+            GUnref(key)
+        End If
+        If focus <> Nil Then
+            Dim widget As Ptr = GTKControllerWidget(focus)
+            If widget <> Nil Then GTKRemoveController(widget, focus)
+            GUnref(focus)
+        End If
+        If context <> Nil Then
+            GTKReset(context)
+            GTKFocusOut(context)
+            GTKClient(context, Nil)
+            GUnref(context)
+        End If
+        Me.NativeInputDetached()
+    End Sub
+    #End If
+
+    Private Function NativeCallbacks() As InputCallbacks
+        Dim callbacks As New InputCallbacks()
+        callbacks.Data = Me.mInputID
+        callbacks.Commit = AddressOf BridgeCommit
+        callbacks.Preedit = AddressOf BridgePreedit
+        callbacks.Cancel = AddressOf BridgeCancel
+        callbacks.Detached = AddressOf BridgeDetached
+        callbacks.Focus = AddressOf BridgeFocus
+        callbacks.Snapshot = AddressOf BridgeSnapshot
+        callbacks.CharacterAtPoint = AddressOf BridgeHitTest
+        callbacks.Command = AddressOf BridgeCommand
+        Return callbacks
+    End Function
+
+    Public Function NativeHitTest(x As Double, y As Double) As Integer
+        Return RaiseEvent CharacterAtPoint(x, y)
+    End Function
+
+    Public Function InputState() As InputSnapshot
+        Dim state As New InputSnapshot()
+        state.Text = RaiseEvent TextForRange(New TextRange(0, RaiseEvent TextLength()))
+        state.Selection = RaiseEvent SelectedRange()
+        If state.Selection = Nil Then state.Selection = New TextRange()
+        state.Caret = RaiseEvent CaretIndex()
+        state.Editable = RaiseEvent IsEditable()
+        Dim rect As TextInputRect = RaiseEvent RectForRange(state.Selection)
+        If rect <> Nil Then
+            state.X = rect.X
+            state.Y = rect.Y
+            state.Width = rect.Width
+            state.Height = rect.Height
+        End If
+        Return state
+    End Function
+
+    Public Sub NativeComposition(value As String, location As Integer, length As Integer, cursor As Integer)
+        If Not RaiseEvent IsEditable() Then Exit Sub
+        Dim range As TextRange = Nil
+        If location >= 0 Then range = New TextRange(location, length)
+        RaiseEvent SetIncompleteText(value, range, New TextRange(cursor, 0))
+        Me.Invalidate()
+    End Sub
+
+    Public Sub DiscardNativeComposition()
+        RaiseEvent DiscardIncompleteText()
+        Me.Invalidate()
+    End Sub
+
+    Handle Paint(g As Graphics)
+        RaiseEvent Draw(g)
+        Me.UpdateInputLocation()
+    End Handle
+
+    Handle MouseDown(e As MouseEvent)
+        If e.Button <> MouseButton.Left Then Return
+        Me.CancelComposition()
+        Me.Focus()
+        Me.mDragging = True
+        RaiseEvent SelectionRequested(RaiseEvent CharacterAtPoint(e.X, e.Y), e.Modifiers.Shift)
+        e.Handled = True
+        Me.Invalidate()
+    End Handle
+
+    Handle MouseDrag(e As MouseEvent)
+        If Not Me.mDragging Then Return
+        RaiseEvent SelectionRequested(RaiseEvent CharacterAtPoint(e.X, e.Y), True)
+        Me.Invalidate()
+    End Handle
+
+    Handle MouseUp(e As MouseEvent)
+        Me.mDragging = False
+    End Handle
+
+    Handle KeyDown(e As KeyEvent)
+        Dim command As String = ""
+        If e.Modifiers.Primary Then
+            Select Case String.LCase(String.Chr(e.Character))
+            Case "a"
+                command = "selectAll"
+            Case "c"
+                command = "copy"
+            Case "x"
+                command = "cut"
+            Case "v"
+                command = "paste"
+            Case "z"
+                command = "undo"
+                If e.Modifiers.Shift Then command = "redo"
+            Case "y"
+                command = "redo"
+            End Select
+        End If
+        If command = "" Then
+            Select Case e.Key
+            Case KeyName.Left
+                command = "moveLeft"
+            Case KeyName.Right
+                command = "moveRight"
+            Case KeyName.Up
+                command = "moveUp"
+            Case KeyName.Down
+                command = "moveDown"
+            Case KeyName.Home
+                command = "moveHome"
+            Case KeyName.EndKey
+                command = "moveEnd"
+            Case KeyName.Backspace
+                command = "deleteBackward"
+            Case KeyName.Delete
+                command = "deleteForward"
+            Case KeyName.Return
+                #If TargetWindows Then
+                    If Me.NativeIMESupported Then Return
+                #End If
+                Me.CommitText("\n", Nil)
+                e.Handled = True
+            Case KeyName.Tab
+                ' Let native focus traversal handle Tab.
+            Case KeyName.Escape
+                Me.CancelComposition()
+                e.Handled = True
+            Case KeyName.Space
+                If Not e.Modifiers.Primary Then
+                    #If TargetWindows Then
+                        If Me.NativeIMESupported Then Return
+                    #End If
+                    Me.CommitText(" ", Nil)
+                    e.Handled = True
+                End If
+            Case Else
+                If e.Character >= 32 And Not e.Modifiers.Primary And Not e.Modifiers.Control Then
+                    #If TargetWindows Then
+                        If Me.NativeIMESupported Then Return
+                    #End If
+                    Me.CommitText(String.Chr(e.Character), Nil)
+                    e.Handled = True
+                End If
+            End Select
+        End If
+        If command <> "" Then
+            Me.CancelComposition()
+            e.Handled = Me.PerformCommand(command, e.Modifiers.Shift)
+        End If
+        Me.Invalidate()
+    End Handle
+End Class
+
+#If TargetLinux Then
+Sequential Structure GTKRectangle
+    X As Int32
+    Y As Int32
+    Width As Int32
+    Height As Int32
+End Structure
+Delegate Sub CommitCallback(context As Ptr, text As Ptr, data As Ptr)
+Delegate Sub SimpleCallback(context As Ptr, data As Ptr)
+Delegate Function RetrieveCallback(context As Ptr, data As Ptr) As Int32
+Delegate Function DeleteCallback(context As Ptr, offset As Int32, count As Int32, data As Ptr) As Int32
+Private Optional Declare Function GTKContextNew Lib "libgtk-4.so.1" Alias "gtk_im_multicontext_new" () As Ptr
+Private Optional Declare Function GTKKeyNew Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_new" () As Ptr
+Private Optional Declare Function GTKFocusNew Lib "libgtk-4.so.1" Alias "gtk_event_controller_focus_new" () As Ptr
+Private Optional Declare Sub GTKClient Lib "libgtk-4.so.1" Alias "gtk_im_context_set_client_widget" (context As Ptr, widget As Ptr)
+Private Optional Declare Sub GTKKeyContext Lib "libgtk-4.so.1" Alias "gtk_event_controller_key_set_im_context" (controller As Ptr, context As Ptr)
+Private Optional Declare Sub GTKPhase Lib "libgtk-4.so.1" Alias "gtk_event_controller_set_propagation_phase" (controller As Ptr, phase As Int32)
+Private Optional Declare Sub GTKAddController Lib "libgtk-4.so.1" Alias "gtk_widget_add_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Function GTKControllerWidget Lib "libgtk-4.so.1" Alias "gtk_event_controller_get_widget" (controller As Ptr) As Ptr
+Private Optional Declare Sub GTKRemoveController Lib "libgtk-4.so.1" Alias "gtk_widget_remove_controller" (widget As Ptr, controller As Ptr)
+Private Optional Declare Sub GTKReset Lib "libgtk-4.so.1" Alias "gtk_im_context_reset" (context As Ptr)
+Private Optional Declare Sub GTKFocusIn Lib "libgtk-4.so.1" Alias "gtk_im_context_focus_in" (context As Ptr)
+Private Optional Declare Sub GTKFocusOut Lib "libgtk-4.so.1" Alias "gtk_im_context_focus_out" (context As Ptr)
+Private Optional Declare Sub GTKCursorRect Lib "libgtk-4.so.1" Alias "gtk_im_context_set_cursor_location" (context As Ptr, ByRef rect As GTKRectangle)
+Private Optional Declare Sub GTKSurrounding Lib "libgtk-4.so.1" Alias "gtk_im_context_set_surrounding_with_selection" (context As Ptr, text As String, length As Int32, cursor As Int32, anchor As Int32)
+Private Optional Declare Sub GTKPreedit Lib "libgtk-4.so.1" Alias "gtk_im_context_get_preedit_string" (context As Ptr, ByRef text As Ptr, ByRef attrs As Ptr, ByRef cursor As Int32)
+Private Optional Declare Function DisconnectData Lib "libgobject-2.0.so.0" Alias "g_signal_handlers_disconnect_matched" (instance As Ptr, mask As UInt32, signalId As UInt32, detail As UInt32, signalClosure As Ptr, callback As Ptr, data As Ptr) As UInt32
+Private Optional Declare Sub GFree Lib "libglib-2.0.so.0" Alias "g_free" (p As Ptr)
+Private Optional Declare Function GRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (p As Ptr) As Ptr
+Private Optional Declare Sub GUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (p As Ptr)
+Private Optional Declare Sub AttrUnref Lib "libpango-1.0.so.0" Alias "pango_attr_list_unref" (p As Ptr)
+Private Optional Declare Function ConnectCommit Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As CommitCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Function ConnectSimple Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As SimpleCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Function ConnectRetrieve Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As RetrieveCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Optional Declare Function ConnectDelete Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As DeleteCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Function InputControl(source As Ptr, data As Ptr) As TextInputCanvas
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(InputRegistry.Controls) Then Return Nil
+    Dim control As TextInputCanvas = InputRegistry.Controls(index).Control
+    If control = Nil Then Return Nil
+    If Not control.OwnsInputSource(source) Then Return Nil
+    Return control
+End Function
+Sub IMCommit(context As Ptr, text As Ptr, data As Ptr)
+    Dim control As TextInputCanvas = InputControl(context, data)
+    If control = Nil Or text = Nil Then Exit Sub
+    Try
+        control.CommitText(CType(CType(text, CString), String), Nil)
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+    End Try
+End Sub
+Sub IMPreedit(context As Ptr, data As Ptr)
+    Dim control As TextInputCanvas = InputControl(context, data)
+    If control = Nil Then Exit Sub
+    Dim text As Ptr = Nil
+    Dim attrs As Ptr = Nil
+    Dim cursor As Int32 = 0
+    Try
+        GTKPreedit(context, text, attrs, cursor)
+        Dim copy As String = ""
+        If text <> Nil Then copy = CType(CType(text, CString), String)
+        control.UpdateComposition(copy, cursor)
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+    Finally
+        If text <> Nil Then GFree(text)
+        If attrs <> Nil Then AttrUnref(attrs)
+    End Try
+End Sub
+Sub IMWidgetDestroy(widget As Ptr, data As Ptr)
+    Dim control As TextInputCanvas = InputControl(widget, data)
+    If control = Nil Then Return
+    Try
+        control.InputWidgetDestroyed(widget)
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+    End Try
+End Sub
+Sub IMFocusIn(controller As Ptr, data As Ptr)
+    Dim control As TextInputCanvas = InputControl(controller, data)
+    If control = Nil Then Exit Sub
+    Try
+        control.InputFocusChanged(True)
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+    End Try
+End Sub
+Sub IMFocusOut(controller As Ptr, data As Ptr)
+    Dim control As TextInputCanvas = InputControl(controller, data)
+    If control = Nil Then Exit Sub
+    Try
+        control.InputFocusChanged(False)
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+    End Try
+End Sub
+Function IMDelete(context As Ptr, offset As Int32, count As Int32, data As Ptr) As Int32
+    Dim control As TextInputCanvas = InputControl(context, data)
+    If control = Nil Then Return 0
+    Try
+        If control.DeleteSurrounding(offset, count) Then Return 1
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+    End Try
+    Return 0
+End Function
+Function IMRetrieve(context As Ptr, data As Ptr) As Int32
+    Dim control As TextInputCanvas = InputControl(context, data)
+    If control = Nil Then Return 0
+    Try
+        control.SupplySurrounding()
+        Return 1
+    Catch e As Exception
+        control.RecordNativeInputError(e.Message)
+        Return 0
+    End Try
+End Function
+#End If
+
+' Store each owning reference in a property; direct class-array Nil assignment
+' leaks the displaced control on Buoy 0.72 (BUI-506).
+Class InputRegistrySlot
+    Public Property Control As TextInputCanvas
+End Class
+Class InputRegistry
+    Public Shared Property Controls As Array Of InputRegistrySlot = []
+    Public Shared Sub ClearEmptySlots()
+        For Each slot As InputRegistrySlot In InputRegistry.Controls
+            If slot.Control <> Nil Then Return
+        Next
+        Array.Clear(InputRegistry.Controls)
+    End Sub
+End Class
+
+Sub BridgeCommit(data As Integer, value As String, location As Integer, length As Integer)
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Exit Sub
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Exit Sub
+    Dim range As TextRange = Nil
+    If location >= 0 Then range = New TextRange(location, length)
+    control.CommitText(value, range)
+End Sub
+Sub BridgePreedit(data As Integer, value As String, location As Integer, length As Integer, cursor As Integer)
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Exit Sub
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Exit Sub
+    control.NativeComposition(value, location, length, cursor)
+End Sub
+Sub BridgeCancel(data As Integer)
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Exit Sub
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Exit Sub
+    control.DiscardNativeComposition()
+End Sub
+Sub BridgeFocus(data As Integer, focused As Boolean)
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Exit Sub
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Exit Sub
+    control.InputFocusChanged(focused)
+End Sub
+Function BridgeSnapshot(data As Integer) As InputSnapshot
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Return Nil
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Return Nil
+    Return control.InputState()
+End Function
+Function BridgeCommand(data As Integer, command As String, extend As Boolean) As Boolean
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Return False
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Return False
+    Return control.PerformCommand(command, extend)
+End Function
+
+Function BridgeHitTest(data As Integer, x As Double, y As Double) As Integer
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Return -1
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control = Nil Then Return -1
+    Return control.NativeHitTest(x, y)
+End Function
+
+Sub BridgeDetached(data As Integer)
+    If data < 0 Or data >= Array.Count(InputRegistry.Controls) Then Exit Sub
+    Dim control As TextInputCanvas = InputRegistry.Controls(data).Control
+    If control <> Nil Then control.NativeInputDetached()
+End Sub

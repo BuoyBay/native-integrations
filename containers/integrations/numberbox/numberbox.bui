@@ -1,0 +1,317 @@
+' Validated numeric editor built exclusively from Buoy's native controls.
+Private Class NumberBoxInput Inherits TextField
+    Public Property Owner As Weak NumberBox
+    Handle TextChanged()
+        Dim owner As NumberBox = Me.Owner
+        If owner <> Nil Then owner.InputEdited()
+    End Handle
+    Handle FocusLost()
+        Dim owner As NumberBox = Me.Owner
+        If owner <> Nil Then owner.InputFinished()
+    End Handle
+End Class
+Private Class NumberBoxStepper Inherits Stepper
+    Public Property Owner As Weak NumberBox
+    Handle ValueChanged()
+        Dim owner As NumberBox = Me.Owner
+        If owner <> Nil Then owner.StepperChanged()
+    End Handle
+End Class
+
+Public Class NumberBox Inherits View
+    Event ValueChanged(newValue As Double)
+    Event ValidationFailed(rejectedText As String)
+    Private Property mInput As NumberBoxInput
+    Private Property mStepper As NumberBoxStepper
+    Private Property mValue As Double = 0.0
+    Private Property mMinimum As Double = 0.0
+    Private Property mMaximum As Double = 100.0
+    Private Property mIncrement As Double = 1.0
+    Private Property mDecimalPlaces As Integer = 2
+    Private Property mDecimalSeparator As String = "."
+    Private Property mDirty As Boolean = False
+    Private Property mUpdating As Boolean = False
+    Private Property mClosed As Boolean = False
+    Private Property mIsReadOnly As Boolean = False
+    Public Property LastNativeError As String = ""
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.mInput = New NumberBoxInput()
+        Me.mStepper = New NumberBoxStepper()
+        Me.mInput.Owner = Me
+        Me.mStepper.Owner = Me
+        Me.mStepper.Minimum = -1.0
+        Me.mStepper.Maximum = 1.0
+        Me.mStepper.Increment = 1.0
+        Me.mStepper.Value = 0.0
+        Me.AddSubview(Me.mInput)
+        Me.AddSubview(Me.mStepper)
+        Me.SynchronizeValue()
+    End Sub
+    ' The native text field is exposed for focus, accessible naming, and styling.
+    ' Use EditText rather than writing InputControl.Text from application code.
+    Public Property InputControl As TextField
+        Get
+            Return Me.mInput
+        End Get
+    End Property
+    Public Property Value As Double
+        Get
+            Return Me.mValue
+        End Get
+        Set
+            Me.RequireFinite(value)
+            Me.mValue = Me.Clamped(value)
+            Me.SynchronizeValue()
+        End Set
+    End Property
+    Public Property Minimum As Double
+        Get
+            Return Me.mMinimum
+        End Get
+        Set
+            Me.RequireFinite(value)
+            If value > Me.mMaximum Then Throw New InvalidArgumentException("Minimum exceeds Maximum")
+            Me.mMinimum = value
+            Me.mValue = Me.Clamped(Me.mValue)
+            Me.SynchronizeValue()
+        End Set
+    End Property
+    Public Property Maximum As Double
+        Get
+            Return Me.mMaximum
+        End Get
+        Set
+            Me.RequireFinite(value)
+            If value < Me.mMinimum Then Throw New InvalidArgumentException("Maximum is below Minimum")
+            Me.mMaximum = value
+            Me.mValue = Me.Clamped(Me.mValue)
+            Me.SynchronizeValue()
+        End Set
+    End Property
+    Public Property Increment As Double
+        Get
+            Return Me.mIncrement
+        End Get
+        Set
+            Me.RequireFinite(value)
+            If value <= 0 Then Throw New InvalidArgumentException("Increment must be positive")
+            Me.mIncrement = value
+        End Set
+    End Property
+    ' Formatting precision only: unedited commits preserve the full Double value.
+    Public Property DecimalPlaces As Integer
+        Get
+            Return Me.mDecimalPlaces
+        End Get
+        Set
+            If value < 0 Or value > 12 Then Throw New InvalidArgumentException("DecimalPlaces must be 0 through 12")
+            Me.mDecimalPlaces = value
+            Me.SynchronizeValue()
+        End Set
+    End Property
+    ' Explicit policy: no grouping/currency; choose a single decimal character.
+    ' Set to Locale.Current().DecimalSeparator when localized entry is desired.
+    Public Property DecimalSeparator As String
+        Get
+            Return Me.mDecimalSeparator
+        End Get
+        Set
+            If String.Len(value) <> 1 Then Throw New InvalidArgumentException("DecimalSeparator must be one character")
+            If String.InStr("0123456789eE+- \t\r\n", value) > 0 Then Throw New InvalidArgumentException("Invalid decimal separator")
+            Me.mDecimalSeparator = value
+            Me.SynchronizeValue()
+        End Set
+    End Property
+    Public Property IsReadOnly As Boolean
+        Get
+            Return Me.mIsReadOnly
+        End Get
+        Set
+            Me.mIsReadOnly = value
+            Me.mInput.IsReadOnly = value
+            Me.mStepper.Enabled = Not value
+        End Set
+    End Property
+    ' Stages a draft without changing Value or raising events. Commit validates it.
+    Public Property EditText As String
+        Get
+            Return Me.mInput.Text
+        End Get
+        Set
+            Me.mInput.Text = value
+            Me.mDirty = True
+        End Set
+    End Property
+    Public Property HasPendingEdit As Boolean
+        Get
+            Return Me.mDirty
+        End Get
+    End Property
+    Public Sub Open()
+        Me.mClosed = False
+        Me.LastNativeError = ""
+        Me.mInput.Owner = Me
+        Me.mStepper.Owner = Me
+        Me.RefreshNative()
+    End Sub
+    Public Sub Close()
+        Me.mClosed = True
+        Me.mInput.Owner = Nil
+        Me.mStepper.Owner = Nil
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+    Public Sub RefreshNative()
+        Dim stepWidth As Integer = 28
+        If Me.Width < 56 Then stepWidth = Me.Width \ 2
+        Dim inputWidth As Integer = Math.Max(0, Me.Width - stepWidth - 4)
+        Me.mInput.Move(0, 0, inputWidth, Me.Height)
+        Me.mStepper.Move(inputWidth + 4, 0, stepWidth, Me.Height)
+        Me.mInput.IsReadOnly = Me.IsReadOnly
+        Me.mStepper.Enabled = Not Me.IsReadOnly
+    End Sub
+    Public Function Commit() As Boolean
+        If Me.mClosed Or Not Me.Enabled Or Not Me.Visible Or Me.IsReadOnly Then Return False
+        If Not Me.mDirty Then Return True
+        Dim draft As String = Me.mInput.Text
+        Dim normalized As String = String.Trim(draft)
+        If Me.DecimalSeparator <> "." And String.InStr(normalized, ".") > 0 Then
+            Me.RejectDraft(draft)
+            Return False
+        End If
+        normalized = String.Replace(normalized, Me.DecimalSeparator, ".")
+        If Not NumberBoxValidNumber(normalized) Then
+            Me.RejectDraft(draft)
+            Return False
+        End If
+        Dim parsed As Result Of Double, String = Double.Parse(normalized)
+        If parsed.IsErr Then
+            Me.RejectDraft(draft)
+            Return False
+        End If
+        Dim proposed As Double = parsed.Value
+        If Not NumberBoxIsFinite(proposed) Then
+            Me.RejectDraft(draft)
+            Return False
+        End If
+        Me.ApplyUserValue(Me.Clamped(proposed))
+        Return True
+    End Function
+    ' Native arrows and application increment/decrement commands share this path.
+    Public Sub StepBy(count As Integer)
+        If Me.mClosed Or Not Me.Enabled Or Not Me.Visible Or Me.IsReadOnly Or count = 0 Then Return
+        If Not Me.Commit() Then Return
+        Dim proposed As Double = Me.Value + count * Me.Increment
+        If Not NumberBoxIsFinite(proposed) Then
+            If count > 0 Then
+                proposed = Me.Maximum
+            Else
+                proposed = Me.Minimum
+            End If
+        End If
+        Me.ApplyUserValue(Me.Clamped(proposed))
+    End Sub
+    Public Sub Revert()
+        Me.SynchronizeValue()
+    End Sub
+    Private Function Clamped(value As Double) As Double
+        Return Math.Min(Me.Maximum, Math.Max(Me.Minimum, value))
+    End Function
+    Private Sub RequireFinite(value As Double)
+        If Not NumberBoxIsFinite(value) Then Throw New InvalidArgumentException("NumberBox requires finite values")
+    End Sub
+    Private Sub SynchronizeValue()
+        If Me.mInput = Nil Then Return
+        Me.mUpdating = True
+        Dim mask As String = "0"
+        If Me.DecimalPlaces > 0 Then
+            mask += "."
+            For i As Integer = 1 To Me.DecimalPlaces
+                mask += "0"
+            Next
+        End If
+        Dim text As String = String.Format(Me.Value, mask)
+        Me.mInput.Text = String.Replace(text, ".", Me.DecimalSeparator)
+        Me.mStepper.Value = 0.0
+        Me.mDirty = False
+        Me.mUpdating = False
+    End Sub
+    Private Sub ApplyUserValue(value As Double)
+        Dim changed As Boolean = value <> Me.mValue
+        Me.mValue = value
+        Me.SynchronizeValue()
+        If changed Then RaiseEvent ValueChanged(Me.Value)
+    End Sub
+    Private Sub RejectDraft(draft As String)
+        Me.SynchronizeValue()
+        RaiseEvent ValidationFailed(draft)
+    End Sub
+    ' Inbound native event boundaries contain application-handler exceptions.
+    Public Sub InputEdited()
+        If Me.mUpdating Or Me.mClosed Then Return
+        Me.mDirty = True
+    End Sub
+    Public Sub InputFinished()
+        If Me.mUpdating Or Me.mClosed Then Return
+        Try
+            Me.Commit()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+    Public Sub StepperChanged()
+        If Me.mUpdating Or Me.mClosed Then Return
+        Try
+            Dim direction As Double = Me.mStepper.Value
+            Me.mStepper.Value = 0.0
+            If direction > 0 Then Me.StepBy(1)
+            If direction < 0 Then Me.StepBy(-1)
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+End Class
+
+Private Function NumberBoxIsFinite(value As Double) As Boolean
+    Return value = value And Math.Abs(value) <= 1.7976931348623157e308
+End Function
+
+' Strict decimal/scientific grammar, independent of process C locale.
+Private Function NumberBoxValidNumber(text As String) As Boolean
+    Dim length As Integer = String.Len(text)
+    If length = 0 Then Return False
+    Dim position As Integer = 1
+    Dim ch As String = String.Mid(text, position, 1)
+    If ch = "+" Or ch = "-" Then position += 1
+    Dim mantissaDigits As Integer = 0
+    Dim decimalSeen As Boolean = False
+    While position <= length
+        ch = String.Mid(text, position, 1)
+        If ch >= "0" And ch <= "9" Then
+            mantissaDigits += 1
+        ElseIf ch = "." And Not decimalSeen Then
+            decimalSeen = True
+        Else
+            Exit While
+        End If
+        position += 1
+    End While
+    If mantissaDigits = 0 Then Return False
+    If position > length Then Return True
+    ch = String.Mid(text, position, 1)
+    If ch <> "e" And ch <> "E" Then Return False
+    position += 1
+    ch = String.Mid(text, position, 1)
+    If ch = "+" Or ch = "-" Then position += 1
+    Dim exponentDigits As Integer = 0
+    While position <= length
+        ch = String.Mid(text, position, 1)
+        If ch < "0" Or ch > "9" Then Return False
+        exponentDigits += 1
+        position += 1
+    End While
+    Return exponentDigits > 0
+End Function

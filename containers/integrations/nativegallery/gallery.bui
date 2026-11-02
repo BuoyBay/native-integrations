@@ -1,0 +1,363 @@
+Import "../searchfield/searchfield"
+Import "../segmentedbutton/segmentedbutton"
+Import "../scrollview/scrollview"
+Import "../treeview/treeview"
+Import "../numberbox/numberbox"
+Import "../nativeindicators/nativeindicators"
+Import "../tooltip/tooltip"
+Import "../popover/popover"
+Import "../colorpicker/colorpicker"
+Import "../fontpicker/fontpicker"
+
+Window NativeGalleryLayout
+    Title = "Buoy Native Controls"
+    Frame = (80, 80, 1000, 700)
+    Control Label heading
+        Text = "Native controls — one Buoy application"
+        Frame = (20, 15, 700, 28)
+    End Control
+    Control SearchField queryField
+        Placeholder = "Search this gallery"
+        Frame = (20, 55, 480, 38)
+    End Control
+    Control SegmentedButton selection
+        Frame = (520, 55, 460, 38)
+    End Control
+    Control NativeSeparator divider
+        Frame = (20, 110, 960, 2)
+    End Control
+    Control Label treeLabel
+        Text = "Project navigation"
+        Frame = (20, 125, 230, 25)
+    End Control
+    Control TreeView navigation
+        Frame = (20, 160, 240, 330)
+    End Control
+    Control Label scrollLabel
+        Text = "Scrollable native controls"
+        Frame = (280, 125, 410, 25)
+    End Control
+    Control ScrollView documentArea
+        Frame = (280, 160, 410, 330)
+    End Control
+    Control Label numberLabel
+        Text = "Validated number"
+        Frame = (720, 125, 260, 25)
+    End Control
+    Control NumberBox quantity
+        Frame = (720, 160, 260, 36)
+        Minimum = 0
+        Maximum = 100
+        Value = 12
+        DecimalPlaces = 0
+    End Control
+    Control Button applyNumber
+        Caption = "Commit value"
+        Frame = (720, 210, 260, 34)
+    End Control
+    Control Button scrollTop
+        Caption = "Scroll to first row"
+        Frame = (720, 260, 260, 34)
+    End Control
+    Control Button scrollBottom
+        Caption = "Scroll to last row"
+        Frame = (720, 305, 260, 34)
+    End Control
+    Control ActivityIndicator activity
+        Frame = (720, 365, 230, 28)
+    End Control
+    Control Button toggleActivity
+        Caption = "Stop activity"
+        Frame = (720, 410, 260, 34)
+    End Control
+    Control Button showPopover
+        Caption = "Open native popover"
+        Frame = (20, 515, 290, 34)
+    End Control
+    Control Button chooseColor
+        Caption = "Choose color"
+        Frame = (330, 515, 290, 34)
+    End Control
+    Control Button chooseFont
+        Caption = "Choose font"
+        Frame = (640, 515, 340, 34)
+    End Control
+    Control Label statusLabel
+        Text = "Try search, selection, scrolling, number entry, and tooltips."
+        Frame = (20, 575, 960, 32)
+    End Control
+    Control Label platformLabel
+        Text = "Platform widgets provide drawing, text editing, and interaction."
+        Frame = (20, 630, 960, 26)
+    End Control
+End Window
+
+Class GalleryRow Inherits Button
+    Public Property Owner As Weak NativeGallery
+    Public Property RowNumber As Integer
+    Handle Action()
+        Dim window As NativeGallery = Me.Owner
+        If window <> Nil Then window.Report("Row: " + Str(Me.RowNumber))
+    End Handle
+End Class
+
+Class GalleryPopover Inherits NativePopover
+    Public Sub Constructor(width As Integer, height As Integer)
+        Super.Constructor(width, height)
+    End Sub
+    Public Property Owner As Weak NativeGallery
+    Handle Dismissed()
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.Report("Popover dismissed")
+    End Handle
+End Class
+Class GalleryColors Inherits ColorPicker
+    Public Property Owner As Weak NativeGallery
+    Private Sub ApplyColor(value As Color)
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.ApplyColor(value)
+    End Sub
+    Handle Accepted(value As Color)
+        Me.ApplyColor(value)
+    End Handle
+    Handle Changed(value As Color)
+        Me.ApplyColor(value)
+    End Handle
+    Handle Cancelled()
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.Report("Color selection cancelled")
+    End Handle
+    Handle Failed(message As String)
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.Report("Color picker: " + message)
+    End Handle
+End Class
+Class GalleryFonts Inherits FontPicker
+    Public Property Owner As Weak NativeGallery
+    Handle Selected(font As FontSelection)
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.ApplyFont(font)
+    End Handle
+    Handle SelectionChanged(font As FontSelection)
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.ApplyFont(font)
+    End Handle
+    Handle Cancelled()
+        Dim win As NativeGallery = Me.Owner
+        If win <> Nil Then win.Report("Font selection cancelled")
+    End Handle
+End Class
+
+Class NativeGallery Inherits NativeGalleryLayout
+    Private Property mShutDown As Boolean = False
+    Private Property mHints As Array Of NativeTooltip = []
+    Private Property mPopover As GalleryPopover
+    Private Property mColors As GalleryColors
+    Private Property mFonts As GalleryFonts
+    Public Sub ApplyColor(value As Color)
+        Me.heading.TextColor = value
+        Me.Report("Color selected")
+    End Sub
+    Public Sub ApplyFont(font As FontSelection)
+        Me.heading.FontName = font.Family
+        Me.heading.FontSize = Math.Min(font.Size, 22.0)
+        Me.heading.Bold = font.Bold
+        Me.heading.Italic = font.Italic
+        Me.Report("Font selected: " + font.Family)
+    End Sub
+    Private Sub Hint(owner As UIControl, text As String)
+        Dim tip As New NativeTooltip()
+        tip.Attach(owner, text)
+        Array.Append(Me.mHints, tip)
+    End Sub
+    Public Sub Report(message As String)
+        Me.statusLabel.Text = message
+        Me.Title = message
+    End Sub
+    Handle Opening()
+        Me.selection.AddSegment("Day")
+        Me.selection.AddSegment("Week")
+        Me.selection.AddSegment("Month")
+        Me.selection.SelectedSegmentIndex = 0
+        Dim project As New TreeNode("Native controls")
+        project.AddChild(New TreeNode("SearchField"))
+        project.AddChild(New TreeNode("ScrollView"))
+        project.AddChild(New TreeNode("NumberBox"))
+        Me.navigation.AddRoot(project)
+        Dim settings As New TreeNode("Settings")
+        settings.AddChild(New TreeNode("Appearance"))
+        settings.AddChild(New TreeNode("Accessibility"))
+        Me.navigation.AddRoot(settings)
+        Me.documentArea.ContentWidth = 380
+        Me.documentArea.ContentHeight = 900
+        For i As Integer = 1 To 12
+            Dim row As New GalleryRow()
+            row.Owner = Me
+            row.RowNumber = i
+            row.Caption = "Native row " + Str(i)
+            row.Move(12, 12 + (i - 1) * 70, 340, 42)
+            Me.documentArea.Content.AddSubview(row)
+        Next
+        Me.queryField.Open()
+        Me.selection.Open()
+        Me.divider.Open()
+        Me.navigation.Open()
+        Me.navigation.SetExpanded(project, True)
+        Me.documentArea.Open()
+        Me.quantity.Open()
+        Me.activity.Open()
+        Me.activity.Start()
+        Me.mPopover = New GalleryPopover(300, 150)
+        Me.mPopover.Owner = Me
+        Dim popoverHeading As New Label()
+        popoverHeading.Text = "A native content popover"
+        popoverHeading.Move(16, 12, 265, 26)
+        Me.mPopover.Content.AddSubview(popoverHeading)
+        Dim includeArchived As New Checkbox()
+        includeArchived.Caption = "Include archived items"
+        includeArchived.Move(16, 55, 265, 30)
+        Me.mPopover.Content.AddSubview(includeArchived)
+        Dim popoverField As New TextField()
+        popoverField.Placeholder = "Native text input"
+        popoverField.Move(16, 100, 265, 32)
+        Me.mPopover.Content.AddSubview(popoverField)
+        Me.mColors = New GalleryColors()
+        Me.mColors.Owner = Me
+        Me.mFonts = New GalleryFonts()
+        Me.mFonts.Owner = Me
+        Me.Hint(Me.applyNumber, "Validate the typed number and apply its bounds.")
+        Me.Hint(Me.scrollBottom, "Scroll the native viewport to its last row.")
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.queryField.RefreshNative()
+        Me.selection.RefreshNative()
+        Me.divider.RefreshNative()
+        Me.navigation.RefreshNative()
+        Me.documentArea.RefreshNative()
+        Me.quantity.RefreshNative()
+        Me.activity.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.Shutdown()
+    End Handle
+    Public Sub Shutdown()
+        If Me.mShutDown Then Return
+        Me.mShutDown = True
+        If Me.mPopover <> Nil Then Me.mPopover.Close()
+        If Me.mColors <> Nil Then Me.mColors.Close()
+        If Me.mFonts <> Nil Then Me.mFonts.Close()
+        For Each tip As NativeTooltip In Me.mHints
+            tip.Close()
+        Next
+        Array.Clear(Me.mHints)
+        Me.activity.Close()
+        Me.quantity.Close()
+        Me.documentArea.Close()
+        Me.navigation.Close()
+        Me.divider.Close()
+        Me.selection.Close()
+        Me.queryField.Close()
+    End Sub
+    Public Sub VerifyReady()
+        If Not Me.queryField.IsOpen Or Not Me.documentArea.IsOpen Then Throw New Exception("Native gallery controls did not open")
+        Me.queryField.Text = "gallery"
+        If Me.queryField.Text <> "gallery" Then Throw New Exception("Search native text round trip")
+        Me.selection.Press(1)
+        If Me.selection.SelectedSegmentIndex <> 1 Then Throw New Exception("Segment selection")
+        Me.quantity.Value = 42
+        Me.quantity.StepBy(1)
+        If Me.quantity.Value <> 43 Then Throw New Exception("Number stepping")
+        If Me.navigation.RootCount <> 2 Then Throw New Exception("Tree roots")
+        Dim child As TreeNode = Me.navigation.RootAt(0).ChildAt(0)
+        Me.navigation.SelectedNode = child
+        If Me.navigation.SelectedNode IsNot child Then Throw New Exception("Tree native selection")
+        Me.activity.Stop()
+        If Me.activity.IsRunning Then Throw New Exception("Activity stop")
+        Me.Shutdown()
+        Me.Shutdown()
+    End Sub
+    With queryField
+        Handle SearchChanged(query As String)
+            Me.Report("Search: " + query)
+        End Handle
+        Handle SearchCommitted(query As String)
+            Me.Report("Search committed: " + query)
+        End Handle
+        Handle SearchCancelled()
+            Me.Report("Search cancelled")
+        End Handle
+    End With
+    With selection
+        Handle Pressed(segmentIndex As Integer)
+            Me.Report("Segment: " + Str(segmentIndex))
+        End Handle
+    End With
+    With navigation
+        Handle SelectionChanged(node As TreeNode)
+            If node <> Nil Then Me.Report("Node: " + node.Caption)
+        End Handle
+    End With
+    With quantity
+        Handle ValueChanged(newValue As Double)
+            Me.Report("Number: " + Str(newValue))
+        End Handle
+        Handle ValidationFailed(rejectedText As String)
+            Me.Report("Invalid number: " + rejectedText)
+        End Handle
+    End With
+    With applyNumber
+        Handle Action()
+            Me.quantity.Commit()
+        End Handle
+    End With
+    With scrollTop
+        Handle Action()
+            Me.documentArea.ScrollTo(0, 0)
+            Me.Report("Scrolled to first row")
+        End Handle
+    End With
+    With scrollBottom
+        Handle Action()
+            Me.documentArea.ScrollTo(0, Me.documentArea.ContentHeight)
+            Me.Report("Scrolled to last row")
+        End Handle
+    End With
+    With showPopover
+        Handle Action()
+            Me.mPopover.Show(Me.showPopover, New Rect(0, 0, Me.showPopover.Width, Me.showPopover.Height))
+            Me.Report("Popover open")
+        End Handle
+    End With
+    With chooseColor
+        Handle Action()
+            Try
+                If Not Me.mColors.IsOpen Then Me.mColors.Show(Me)
+            Catch e As Exception
+                Me.Report("Color picker: " + e.Message)
+            End Try
+        End Handle
+    End With
+    With chooseFont
+        Handle Action()
+            Try
+                If Not Me.mFonts.IsOpen Then Me.mFonts.Show(Me)
+            Catch e As Exception
+                Me.Report("Font picker: " + e.Message)
+            End Try
+        End Handle
+    End With
+    With toggleActivity
+        Handle Action()
+            If Me.activity.IsRunning Then
+                Me.activity.Stop()
+                Me.toggleActivity.Caption = "Start activity"
+                Me.Report("Activity stopped")
+            Else
+                Me.activity.Start()
+                Me.toggleActivity.Caption = "Stop activity"
+                Me.Report("Activity started")
+            End If
+        End Handle
+    End With
+End Class
+

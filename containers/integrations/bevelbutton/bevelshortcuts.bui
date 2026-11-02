@@ -1,0 +1,42 @@
+Import bevelbutton
+Import bevelkeys
+
+Private Class ShortcutButtonReference
+    Public Property Button As Weak BevelButton
+End Class
+
+' One optional router per window. Own it in a window property and Close on Closed.
+Public Class BevelButtonShortcuts Inherits BevelNativeShortcuts
+    Private Property mButtons As Array Of ShortcutButtonReference = []
+
+    Public Sub Add(button As BevelButton)
+        If button = Nil Then Throw New InvalidArgumentException("Shortcut button is Nil")
+        For Each entry As ShortcutButtonReference In Me.mButtons
+            If entry.Button Is button Then Return
+        Next
+        Dim entry As New ShortcutButtonReference()
+        entry.Button = button
+        Array.Append(Me.mButtons, entry)
+    End Sub
+
+    Public Overrides Function DispatchKey(e As KeyEvent) As Boolean
+        ' A focused button owns Return. Escape first cancels any held press.
+        If e.Key = KeyName.Return Or e.Key = KeyName.Escape Then
+            For Each entry As ShortcutButtonReference In Me.mButtons
+                Dim button As BevelButton = entry.Button
+                If button <> Nil Then
+                    If button.HasFocus() And (e.Key = KeyName.Return Or button.HasPendingPress) Then Return False
+                End If
+            Next
+        End If
+        For Each entry As ShortcutButtonReference In Me.mButtons
+            Dim button As BevelButton = entry.Button
+            If button <> Nil Then
+                If button.ParentWindow Is Me.OwnerWindow Then
+                    If button.HandleShortcut(e) Then Return True
+                End If
+            End If
+        Next
+        Return False
+    End Function
+End Class

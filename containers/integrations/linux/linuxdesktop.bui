@@ -1,0 +1,145 @@
+' X11 root-property event monitoring for 64-bit Linux.
+Public Class DesktopEvent
+    Public Property PropertyName As String
+    Public Property WindowId As UInt64
+    Public Property TimestampMilliseconds As UInt64
+    Public Property IsDeleted As Boolean
+    Public Property IsSynthetic As Boolean
+    Public Property IsActiveWindowChange As Boolean
+    Public Property IsWorkspaceChange As Boolean
+    Public Property IsWindowListChange As Boolean
+End Class
+
+#If TargetLinux Then
+Sequential Structure NativePropertyEvent
+    EventType As Int32
+    Serial As UInt64
+    SendEvent As Int32
+    DisplayHandle As Ptr
+    WindowId As UInt64
+    AtomId As UInt64
+    EventTime As UInt64
+    EventState As Int32
+End Structure
+
+Private Optional Declare Function NativeOpen Lib "libX11.so.6" Alias "XOpenDisplay" (name As Ptr) As Ptr
+Private Optional Declare Function NativeClose Lib "libX11.so.6" Alias "XCloseDisplay" (connection As Ptr) As Int32
+Private Optional Declare Function NativeRoot Lib "libX11.so.6" Alias "XDefaultRootWindow" (connection As Ptr) As UInt64
+Private Optional Declare Function NativeSelect Lib "libX11.so.6" Alias "XSelectInput" (connection As Ptr, windowId As UInt64, mask As Int64) As Int32
+Private Optional Declare Function NativeSync Lib "libX11.so.6" Alias "XSync" (connection As Ptr, discard As Int32) As Int32
+Private Optional Declare Function NativePending Lib "libX11.so.6" Alias "XPending" (connection As Ptr) As Int32
+Private Optional Declare Function NativeNext Lib "libX11.so.6" Alias "XNextEvent" (connection As Ptr, buffer As Ptr) As Int32
+Private Optional Declare Function NativeAtomName Lib "libX11.so.6" Alias "XGetAtomName" (connection As Ptr, atomId As UInt64) As Ptr
+Private Optional Declare Function NativeFree Lib "libX11.so.6" Alias "XFree" (memory As Ptr) As Int32
+Private Optional Declare Function CopyEvent Lib "c" Alias "memcpy" (ByRef value As NativePropertyEvent, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function NativeLength Lib "c" Alias "strlen" (text As Ptr) As UInt64
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Probe the default X display; this does not claim native Wayland support.
+Public Function IsAvailable() As Boolean
+#If TargetLinux Then
+    If Not System.IsLibraryAvailable("libX11.so.6") Then
+        Return False
+    End If
+    Dim connection As Ptr = NativeOpen(Nil)
+    If connection = Nil Then
+        Return False
+    End If
+    NativeClose(connection)
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Public Class DesktopMonitor
+    Private Property Connection As Ptr
+
+    Public Sub Constructor()
+#If TargetLinux Then
+        Connection = NativeOpen(Nil)
+        If Connection = Nil Then
+            Throw New RuntimeException("Unable to open the default X11 display")
+        End If
+        ' PropertyChangeMask is shared between clients; no input interception.
+        NativeSelect(Connection, NativeRoot(Connection), 4194304)
+        NativeSync(Connection, 0)
+#Else
+        Throw New UnsupportedOperationException("linuxdesktop requires Linux X11")
+#End If
+    End Sub
+
+    Public Sub Close()
+#If TargetLinux Then
+        If Connection <> Nil Then
+            NativeClose(Connection)
+            Connection = Nil
+        End If
+#End If
+    End Sub
+
+    Public Sub Destructor()
+        Close()
+    End Sub
+
+    ''' Drain at most limit queued events; never waits for a new event.
+    Public Function Drain(limit As Integer = 256) As Array Of DesktopEvent
+#If TargetLinux Then
+        If Connection = Nil Then
+            Throw New RuntimeException("Desktop monitor is closed")
+        End If
+        If limit < 1 Or limit > 4096 Then
+            Throw New InvalidArgumentException("Event limit must be between 1 and 4096")
+        End If
+        Dim results As Array Of DesktopEvent = []
+        Dim buffer As New Bytes(192)
+        For i As Integer = 1 To 192
+            buffer.Append(0)
+        Next
+        Dim processed As Integer = 0
+        While processed < limit And NativePending(Connection) > 0
+            NativeNext(Connection, buffer.DataPtr())
+            processed += 1
+            Dim native As NativePropertyEvent
+            CopyEvent(native, buffer.DataPtr(), 64)
+            If native.EventType <> 28 Then
+                Continue While
+            End If
+            Dim rawName As Ptr = NativeAtomName(Connection, native.AtomId)
+            If rawName = Nil Then
+                Throw New RuntimeException("XGetAtomName returned no property name")
+            End If
+            Dim propertyName As String
+            Try
+                Dim nameBytes As New Bytes()
+                nameBytes.Append(rawName, NativeLength(rawName))
+                ' X atom names use STRING (Latin-1), not UTF-8 text properties.
+                propertyName = nameBytes.ToString(Text.Encodings.Latin1)
+            Finally
+                NativeFree(rawName)
+            End Try
+            Dim item As New DesktopEvent
+            item.PropertyName = propertyName
+            item.WindowId = native.WindowId
+            item.TimestampMilliseconds = native.EventTime
+            item.IsDeleted = native.EventState = 1
+            item.IsSynthetic = native.SendEvent <> 0
+            item.IsActiveWindowChange = propertyName = "_NET_ACTIVE_WINDOW"
+            item.IsWorkspaceChange = propertyName = "_NET_CURRENT_DESKTOP"
+            item.IsWindowListChange = propertyName = "_NET_CLIENT_LIST" Or propertyName = "_NET_CLIENT_LIST_STACKING"
+            Array.Append(results, item)
+        End While
+        Return results
+#Else
+        Throw New UnsupportedOperationException("linuxdesktop requires Linux X11")
+#End If
+    End Function
+End Class

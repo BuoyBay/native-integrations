@@ -1,0 +1,66 @@
+Import tooltip
+
+#If TargetLinux Then
+Delegate Function TooltipQueryCallback(widget As Ptr, x As Int32, y As Int32, keyboard As Int32, nativeTooltip As Ptr, data As Ptr) As Int32
+Private Optional Declare Function QueryConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (widget As Ptr, signal As String, callback As TooltipQueryCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Class TooltipDemoReference
+    Public Property Owner As Weak TooltipDemo
+End Class
+Private Class TooltipDemoRegistry
+    Public Shared Property Reference As TooltipDemoReference = New TooltipDemoReference()
+End Class
+Private Function QueryObserved(widget As Ptr, x As Int32, y As Int32, keyboard As Int32, nativeTooltip As Ptr, data As Ptr) As Int32
+    Dim win As TooltipDemo = TooltipDemoRegistry.Reference.Owner
+    If win <> Nil Then win.Title = "Tooltip queried: " + win.SaveHelp.Text
+    Return 0 ' Keep GTK's standard tooltip handler.
+End Function
+#End If
+
+Window TooltipLayout
+    Title = "Buoy Native Tooltip"
+    Frame = (100, 100, 560, 230)
+    Control Button saveButton
+        Caption = "Save"
+        Frame = (30, 45, 150, 40)
+    End Control
+    Control TextField query
+        Placeholder = "Hover to see search help"
+        Frame = (210, 45, 310, 40)
+    End Control
+    Control Button updateButton
+        Caption = "Update tooltip"
+        Frame = (30, 115, 200, 40)
+    End Control
+    Control Label hint
+        Text = "Hover over Save or the search field. Tooltips use the OS theme."
+        Frame = (30, 175, 500, 30)
+    End Control
+End Window
+Class TooltipDemo Inherits TooltipLayout
+    Public Property SaveHelp As NativeTooltip = New NativeTooltip()
+    Private Property SearchHelp As NativeTooltip = New NativeTooltip()
+    Handle Opening()
+        Me.saveButton.AccessibleHint = "Writes the current document"
+        Me.SaveHelp.Attach(Me.saveButton, "Save the current document")
+        Me.SearchHelp.Attach(Me.query, "Filter documents by name or tag")
+        #If TargetLinux Then
+            TooltipDemoRegistry.Reference.Owner = Me
+            QueryConnect(Me.saveButton.NativeWidget, "query-tooltip", AddressOf QueryObserved, Nil, Nil, 0)
+        #End If
+    End Handle
+    With updateButton
+        Handle Action()
+            Me.SaveHelp.Text = "Updated help: café 😀"
+            Me.Title = "Tooltip updated"
+        End Handle
+    End With
+    Handle Closed()
+        Me.SaveHelp.Close()
+        Me.SearchHelp.Close()
+    End Handle
+End Class
+Sub Main()
+    Dim win As New TooltipDemo()
+    win.Show()
+    Application.Run()
+End Sub

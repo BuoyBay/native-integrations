@@ -1,0 +1,87 @@
+Import textmodel
+
+' Native APIs count UTF-16 units; the editor counts Unicode scalar values.
+Public Function UTF16Offset(value As String, codepoint As Integer) As Integer
+    Return String.Left(value, Math.Max(0, Math.Min(codepoint, String.Len(value)))).AsUTF16LE().Count \ 2
+End Function
+
+Public Function CodepointOffset(value As String, utf16 As Integer) As Integer
+    Dim used As Integer = 0
+    Dim index As Integer = 0
+    For Each character As String In String.Chars(value)
+        Dim width As Integer = character.AsUTF16LE().Count \ 2
+        If used + width > utf16 Then Exit For
+        used += width
+        index += 1
+    Next
+    Return index
+End Function
+
+Public Function PhysicalInputCoordinate(value As Integer, dpi As Integer) As Integer
+    If dpi <= 0 Then dpi = 96
+    Return Math.Round(value * (dpi / 96.0))
+End Function
+
+Public Class InputSnapshot
+    Public Property Text As String = ""
+    Public Property Selection As TextRange = New TextRange()
+    Public Property Caret As Integer = 0
+    Public Property Editable As Boolean = False
+    Public Property X As Integer = 0
+    Public Property Y As Integer = 0
+    Public Property Width As Integer = 1
+    Public Property Height As Integer = 20
+End Class
+
+Public Delegate Sub NativeCommit(data As Integer, text As String, location As Integer, length As Integer)
+Public Delegate Sub NativePreedit(data As Integer, text As String, location As Integer, length As Integer, cursor As Integer)
+Public Delegate Sub NativeCancel(data As Integer)
+Public Delegate Sub NativeFocus(data As Integer, focused As Boolean)
+Public Delegate Function NativeHitTest(data As Integer, x As Double, y As Double) As Integer
+Public Delegate Function NativeSnapshot(data As Integer) As InputSnapshot
+Public Delegate Function NativeCommand(data As Integer, command As String, extend As Boolean) As Boolean
+
+Public Class InputCallbacks
+    Public Property Data As Integer
+    Public Property Commit As NativeCommit
+    Public Property Preedit As NativePreedit
+    Public Property Detached As NativeCancel
+    Public Property Cancel As NativeCancel
+    Public Property Focus As NativeFocus
+    Public Property Snapshot As NativeSnapshot
+    Public Property CharacterAtPoint As NativeHitTest
+    Public Property Command As NativeCommand
+
+    Public Sub DeliverCommit(value As String, location As Integer, length As Integer)
+        Dim callback As NativeCommit = Me.Commit
+        callback(Me.Data, value, location, length)
+    End Sub
+    Public Sub DeliverPreedit(value As String, location As Integer, length As Integer, cursor As Integer)
+        Dim callback As NativePreedit = Me.Preedit
+        callback(Me.Data, value, location, length, cursor)
+    End Sub
+    Public Sub DeliverDetached()
+        Dim callback As NativeCancel = Me.Detached
+        If callback <> Nil Then callback(Me.Data)
+    End Sub
+    Public Sub DeliverCancel()
+        Dim callback As NativeCancel = Me.Cancel
+        callback(Me.Data)
+    End Sub
+    Public Sub DeliverFocus(focused As Boolean)
+        Dim callback As NativeFocus = Me.Focus
+        callback(Me.Data, focused)
+    End Sub
+    Public Function HitTest(x As Double, y As Double) As Integer
+        Dim callback As NativeHitTest = Me.CharacterAtPoint
+        Return callback(Me.Data, x, y)
+    End Function
+    Public Function GetSnapshot() As InputSnapshot
+        Dim callback As NativeSnapshot = Me.Snapshot
+        Return callback(Me.Data)
+    End Function
+    Public Function DeliverCommand(command As String, extend As Boolean) As Boolean
+        Dim callback As NativeCommand = Me.Command
+        Return callback(Me.Data, command, extend)
+    End Function
+End Class

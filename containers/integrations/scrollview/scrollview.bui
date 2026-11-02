@@ -1,0 +1,562 @@
+' Native scrolling viewport for an ordinary Buoy View and its child controls.
+Private Class ScrollReference
+    Public Property Owner As Weak ScrollView
+End Class
+Private Class ScrollRegistry
+    Public Shared Property Items As Array Of ScrollReference = []
+End Class
+
+Public Class ScrollView Inherits View
+    Private Property mContent As View
+    Private Property mContentWidth As Integer = 800
+    Private Property mContentHeight As Integer = 600
+    Private Property mX As Double = 0
+    Private Property mY As Double = 0
+    Private Property mHorizontal As Boolean = True
+    Private Property mVertical As Boolean = True
+    Private Property mAutoHide As Boolean = True
+    Private Property mRoot As Ptr = Nil
+    Private Property mHost As Ptr = Nil
+    Private Property mDocument As Ptr = Nil
+    Private Property mID As Integer = -1
+    Private Property mRefreshing As Boolean = False
+    Private Property mPendingScroll As Boolean = False
+    #If TargetLinux Then
+        Private Property mPendingFrameID As UInt32 = 0
+    #End If
+    Private Property mHostDestroyed As Boolean = False
+    Public Property LastNativeError As String = ""
+    #If TargetWindows Then
+        Private Property mOriginalStyle As Int64 = 0
+    #End If
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.mContent = New View()
+        Me.mContent.Move(0, 0, Me.mContentWidth, Me.mContentHeight)
+        Me.AddSubview(Me.mContent)
+    End Sub
+    Public Property Content As View
+        Get
+            Return Me.mContent
+        End Get
+    End Property
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mID >= 0
+        End Get
+    End Property
+    Public Property ContentWidth As Integer
+        Get
+            Return Me.mContentWidth
+        End Get
+        Set
+            If value < 1 Or value > 10000000 Then Throw New InvalidArgumentException("ContentWidth must be between 1 and 10000000 points")
+            Me.mContentWidth = value
+            Me.RefreshNative()
+        End Set
+    End Property
+    Public Property ContentHeight As Integer
+        Get
+            Return Me.mContentHeight
+        End Get
+        Set
+            If value < 1 Or value > 10000000 Then Throw New InvalidArgumentException("ContentHeight must be between 1 and 10000000 points")
+            Me.mContentHeight = value
+            Me.RefreshNative()
+        End Set
+    End Property
+    Public Property HorizontalScrolling As Boolean
+        Get
+            Return Me.mHorizontal
+        End Get
+        Set
+            Me.mHorizontal = value
+            If Not value Then Me.mX = 0
+            Me.RefreshNative()
+        End Set
+    End Property
+    Public Property VerticalScrolling As Boolean
+        Get
+            Return Me.mVertical
+        End Get
+        Set
+            Me.mVertical = value
+            If Not value Then Me.mY = 0
+            Me.RefreshNative()
+        End Set
+    End Property
+    Public Property AutoHideScrollbars As Boolean
+        Get
+            Return Me.mAutoHide
+        End Get
+        Set
+            Me.mAutoHide = value
+            Me.RefreshNative()
+        End Set
+    End Property
+    Public Property OffsetX As Double
+        Get
+            Me.ReadOffsets()
+            Return Me.mX
+        End Get
+    End Property
+    Public Property OffsetY As Double
+        Get
+            Me.ReadOffsets()
+            Return Me.mY
+        End Get
+    End Property
+
+    Public Sub Open()
+        If Me.mHostDestroyed Then Throw New InvalidArgumentException("The ScrollView host was destroyed; create a new control")
+        Me.Close()
+        Me.LastNativeError = ""
+        Dim requestedX As Double = Me.mX
+        Dim requestedY As Double = Me.mY
+        Me.mHost = Me.NativeWidget
+        Me.mDocument = Me.Content.NativeWidget
+        If Me.mHost = Nil Or Me.mDocument = Nil Then Throw New InvalidArgumentException("Attach ScrollView and its content to a window before Open")
+        For i As Integer = 0 To Array.LastIndex(ScrollRegistry.Items)
+            If ScrollRegistry.Items(i).Owner = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(ScrollRegistry.Items)
+            Array.Append(ScrollRegistry.Items, New ScrollReference())
+        End If
+        ScrollRegistry.Items(Me.mID).Owner = Me
+        Try
+            #If TargetLinux Then
+                ' Buoy retains the document too; this retain bridges reparenting.
+                ScrollRef(Me.mDocument)
+                ScrollFixedRemove(Me.mHost, Me.mDocument)
+                Me.mRoot = ScrollNew()
+                ScrollRefSink(Me.mRoot)
+                ScrollSetChild(Me.mRoot, Me.mDocument)
+                ScrollFixedPut(Me.mHost, Me.mRoot, 0, 0)
+                ScrollConnectMap(Me.mRoot, "map", AddressOf ScrollLinuxMapped, CType(Me.mID + 1, Ptr), Nil, 0)
+            #ElseIf TargetWindows Then
+                Me.mOriginalStyle = ScrollStyle(Me.mHost, -16)
+                ScrollSetStyle(Me.mHost, -16, Me.mOriginalStyle Or 36700160)
+                If ScrollSubclass(Me.mHost, AddressOf ScrollWindowsMessage, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind ScrollView's native viewport")
+            #ElseIf TargetMac Then
+                Me.mRoot = ScrollInit(ScrollAlloc(ScrollClass("NSScrollView")))
+                If Me.mRoot = Nil Then Throw New RuntimeException("Could not create NSScrollView")
+                ScrollRetain(Me.mDocument)
+                ScrollSetDocument(Me.mRoot, Me.mDocument)
+                ScrollAddSubview(Me.mHost, Me.mRoot)
+                ScrollAutoresizing(Me.mRoot, 18)
+            #End If
+            Me.RefreshNative()
+            Me.ScrollTo(requestedX, requestedY)
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+
+    Public Sub Close()
+        If Not Me.IsOpen Then Return
+        Me.ReadOffsets()
+        ScrollRegistry.Items(Me.mID).Owner = Nil
+        #If TargetLinux Then
+            If Me.mRoot <> Nil Then
+                If Me.mPendingFrameID <> 0 Then
+                    ScrollRemoveTick(Me.mRoot, Me.mPendingFrameID)
+                    Me.mPendingFrameID = 0
+                End If
+                ScrollSetChild(Me.mRoot, Nil)
+                ' A retained widget remains valid even if its parent window closed.
+                Dim parent As Ptr = ScrollParent(Me.mRoot)
+                If parent <> Nil Then
+                    ScrollFixedRemove(parent, Me.mRoot)
+                    ScrollFixedPut(parent, Me.mDocument, 0, 0)
+                End If
+                ScrollUnref(Me.mRoot)
+            End If
+            If Me.mDocument <> Nil Then ScrollUnref(Me.mDocument)
+        #ElseIf TargetWindows Then
+            If ScrollIsWindow(Me.mHost) <> 0 Then
+                ScrollUnsubclass(Me.mHost, AddressOf ScrollWindowsMessage, Me.mID + 1)
+                ScrollShowBar(Me.mHost, 3, 0)
+                ScrollSetStyle(Me.mHost, -16, Me.mOriginalStyle)
+                Me.Content.Move(0, 0, Me.mContentWidth, Me.mContentHeight)
+            End If
+        #ElseIf TargetMac Then
+            If Me.mRoot <> Nil Then
+                ScrollSetDocument(Me.mRoot, Nil)
+                Dim parent As Ptr = ScrollSuperview(Me.mRoot)
+                If parent <> Nil Then ScrollAddSubview(parent, Me.mDocument)
+                ScrollRelease(Me.mDocument)
+                ScrollRemove(Me.mRoot)
+                ScrollRelease(Me.mRoot)
+            End If
+        #End If
+        Me.mRoot = Nil
+        Me.mHost = Nil
+        Me.mDocument = Nil
+        Me.mPendingScroll = False
+        Me.mID = -1
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+
+    ' Call after changing the host's frame or applying layout constraints.
+    Public Sub RefreshNative()
+        If Me.mHostDestroyed Or Me.mRefreshing Then Return
+        If Not Me.IsOpen Then
+            Me.Content.Move(0, 0, Me.mContentWidth, Me.mContentHeight)
+            Return
+        End If
+        Me.ReadOffsets()
+        Me.mRefreshing = True
+        Try
+            #If TargetLinux Then
+                Dim horizontal As Int32 = 2 ' GTK_POLICY_NEVER
+                Dim vertical As Int32 = 2
+                If Me.mHorizontal Then
+                    horizontal = 1 ' GTK_POLICY_AUTOMATIC
+                    If Not Me.mAutoHide Then horizontal = 0
+                End If
+                If Me.mVertical Then
+                    vertical = 1
+                    If Not Me.mAutoHide Then vertical = 0
+                End If
+                ScrollPolicy(Me.mRoot, horizontal, vertical)
+                ScrollSize(Me.mRoot, Me.Width, Me.Height)
+                ScrollSize(Me.mDocument, Me.mContentWidth, Me.mContentHeight)
+            #ElseIf TargetWindows Then
+                Me.UpdateWindowsBars()
+            #ElseIf TargetMac Then
+                ScrollHorizontal(Me.mRoot, Me.mHorizontal)
+                ScrollVertical(Me.mRoot, Me.mVertical)
+                ScrollAutohide(Me.mRoot, Me.mAutoHide)
+                Dim frame As ScrollRect
+                frame.X = 0
+                frame.Y = 0
+                frame.Width = Me.Width
+                frame.Height = Me.Height
+                ScrollFrame(Me.mRoot, frame)
+                Me.Content.Move(0, 0, Me.mContentWidth, Me.mContentHeight)
+            #End If
+            Me.ScrollTo(Me.mX, Me.mY)
+        Finally
+            Me.mRefreshing = False
+        End Try
+    End Sub
+
+    Public Sub ScrollTo(x As Double, y As Double)
+        If x <> x Or y <> y Or Math.Abs(x) > 1000000000 Or Math.Abs(y) > 1000000000 Then Throw New InvalidArgumentException("Scroll offsets must be finite")
+        If Not Me.mHorizontal Then x = 0
+        If Not Me.mVertical Then y = 0
+        x = Math.Max(0, x)
+        y = Math.Max(0, y)
+        If Not Me.IsOpen Then
+            Me.mX = Math.Min(x, Me.mContentWidth)
+            Me.mY = Math.Min(y, Me.mContentHeight)
+            Return
+        End If
+        #If TargetLinux Then
+            If ScrollAllocatedWidth(Me.mRoot) <= 0 Or ScrollAllocatedHeight(Me.mRoot) <= 0 Then
+                Me.mX = Math.Min(x, Me.mContentWidth)
+                Me.mY = Math.Min(y, Me.mContentHeight)
+                Me.mPendingScroll = True
+                If Me.mPendingFrameID = 0 Then
+                    Me.mPendingFrameID = ScrollAddTick(Me.mRoot, AddressOf ScrollLinuxFrame, CType(Me.mID + 1, Ptr), Nil)
+                End If
+                Return
+            End If
+            Me.mPendingScroll = False
+            ScrollAdjustmentValue(ScrollHAdjustment(Me.mRoot), x)
+            ScrollAdjustmentValue(ScrollVAdjustment(Me.mRoot), y)
+            Me.ReadOffsets()
+        #ElseIf TargetWindows Then
+            Dim area As ScrollWinRect
+            ScrollClientRect(Me.mHost, CType(area, Ptr))
+            Dim scale As Double = Me.WindowsScale()
+            Me.mX = Math.Min(x, Math.Max(0, Me.mContentWidth - area.Right / scale))
+            Me.mY = Math.Min(y, Math.Max(0, Me.mContentHeight - area.Bottom / scale))
+            Dim pixelX As Integer = Me.mX * scale
+            Dim pixelY As Integer = Me.mY * scale
+            Dim pixelWidth As Integer = Me.mContentWidth * scale
+            Dim pixelHeight As Integer = Me.mContentHeight * scale
+            ScrollMove(Me.mDocument, -pixelX, -pixelY, pixelWidth, pixelHeight, 1)
+            Me.mX = pixelX / scale
+            Me.mY = pixelY / scale
+            ScrollSetPosition(Me.mHost, 0, Me.mX * scale, 1)
+            ScrollSetPosition(Me.mHost, 1, Me.mY * scale, 1)
+        #ElseIf TargetMac Then
+            Dim clip As Ptr = ScrollContentView(Me.mRoot)
+            Dim bounds As ScrollRect = ScrollBounds(clip)
+            Me.mX = Math.Min(x, Math.Max(0, Me.mContentWidth - bounds.Width))
+            Me.mY = Math.Min(y, Math.Max(0, Me.mContentHeight - bounds.Height))
+            Dim point As ScrollPoint
+            point.X = Me.mX
+            point.Y = Me.mY
+            ScrollClip(clip, point)
+            ScrollReflect(Me.mRoot, clip)
+        #End If
+    End Sub
+
+    Public Sub ApplyPendingScroll()
+        If Not Me.IsOpen Or Not Me.mPendingScroll Then Return
+        Try
+            Me.ScrollTo(Me.mX, Me.mY)
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+
+    #If TargetLinux Then
+    ' Mapping can precede allocation. Keep this native frame callback only
+    ' until the queued request is applied, and reject an old widget's callback.
+    Public Function NativePendingFrame(widget As Ptr) As Int32
+        If widget <> Me.mRoot Then Return 0
+        If Me.IsOpen And Me.mPendingScroll Then Me.ApplyPendingScroll()
+        If Me.mPendingScroll And Me.LastNativeError = "" Then Return 1
+        Me.mPendingFrameID = 0
+        Return 0
+    End Function
+    #End If
+
+    Private Sub ReadOffsets()
+        If Not Me.IsOpen Or Me.mPendingScroll Then Return
+        #If TargetLinux Then
+            If Me.mRoot <> Nil Then
+                Me.mX = ScrollAdjustmentGet(ScrollHAdjustment(Me.mRoot))
+                Me.mY = ScrollAdjustmentGet(ScrollVAdjustment(Me.mRoot))
+            End If
+        #ElseIf TargetMac Then
+            If Me.mRoot <> Nil Then
+                Dim bounds As ScrollRect = ScrollBounds(ScrollContentView(Me.mRoot))
+                Me.mX = bounds.X
+                Me.mY = bounds.Y
+            End If
+        #End If
+    End Sub
+
+    #If TargetWindows Then
+    Public Sub NativeHostDestroyed()
+        If Me.mID >= 0 Then ScrollRegistry.Items(Me.mID).Owner = Nil
+        Me.mHostDestroyed = True
+        Me.mID = -1
+        Me.mHost = Nil
+        Me.mDocument = Nil
+        Me.mRoot = Nil
+    End Sub
+    Private Function WindowsScale() As Double
+        Return ScrollDPI(Me.mHost) / 96.0
+    End Function
+    Private Sub UpdateWindowsBars()
+        Dim scale As Double = Me.WindowsScale()
+        For pass As Integer = 0 To 1
+            ' Updating one axis may change the viewport size on the other axis.
+            Dim area As ScrollWinRect
+            ScrollClientRect(Me.mHost, CType(area, Ptr))
+            Dim info As ScrollInfo
+            info.Size = 28
+            info.Mask = 3 ' SIF_RANGE | SIF_PAGE
+            If Not Me.mAutoHide Then info.Mask = info.Mask Or 8
+            info.Minimum = 0
+            info.Maximum = Me.mContentWidth * scale - 1
+            info.Page = area.Right
+            If Me.mHorizontal Then
+                ScrollSetInfo(Me.mHost, 0, CType(info, Ptr), 1)
+            Else
+                ScrollShowBar(Me.mHost, 0, 0)
+            End If
+            ScrollClientRect(Me.mHost, CType(area, Ptr))
+            info.Maximum = Me.mContentHeight * scale - 1
+            info.Page = area.Bottom
+            If Me.mVertical Then
+                ScrollSetInfo(Me.mHost, 1, CType(info, Ptr), 1)
+            Else
+                ScrollShowBar(Me.mHost, 1, 0)
+            End If
+        Next
+    End Sub
+    Public Function NativeWindowsMessage(message As UInt32, word As UInt64) As Boolean
+        If Me.mRefreshing Then Return False
+        Try
+            Dim messageWord As Integer = word
+            Dim horizontal As Boolean = message = 276 Or message = 526
+            Dim x As Double = Me.OffsetX
+            Dim y As Double = Me.OffsetY
+            Dim position As Double = y
+            If horizontal Then position = x
+            Dim area As ScrollWinRect
+            ScrollClientRect(Me.mHost, CType(area, Ptr))
+            Dim page As Double = area.Bottom / Me.WindowsScale()
+            If horizontal Then page = area.Right / Me.WindowsScale()
+            If message = 522 Or message = 526 Then
+                Dim delta As Integer = (messageWord >> 16) And 65535
+                If delta >= 32768 Then delta -= 65536
+                Dim setting As ScrollWheelSetting
+                setting.Value = 3
+                Dim action As UInt32 = 104 ' SPI_GETWHEELSCROLLLINES
+                If horizontal Then action = 108 ' SPI_GETWHEELSCROLLCHARS
+                ScrollSystemParameters(action, 0, CType(setting, Ptr), 0)
+                Dim amount As Double = setting.Value * 16.0
+                If setting.Value = 4294967295 Then amount = page
+                Dim distance As Double = delta * amount / 120.0
+                If message = 522 Then distance = -distance
+                position += distance
+            Else
+                Select Case messageWord And 65535
+                    Case 0
+                        position -= 16
+                    Case 1
+                        position += 16
+                    Case 2
+                        position -= page
+                    Case 3
+                        position += page
+                    Case 4, 5
+                        Dim info As ScrollInfo
+                        info.Size = 28
+                        info.Mask = 16 ' SIF_TRACKPOS; full 32-bit range
+                        If ScrollGetInfo(Me.mHost, CType(horizontal, Integer) Xor 1, CType(info, Ptr)) <> 0 Then position = info.TrackPosition / Me.WindowsScale()
+                    Case 6
+                        position = 0
+                    Case 7
+                        position = 100000000
+                End Select
+            End If
+            If horizontal Then
+                Me.ScrollTo(position, y)
+            Else
+                Me.ScrollTo(x, position)
+            End If
+            Return True
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+            Return True
+        End Try
+    End Function
+    #End If
+End Class
+
+#If TargetLinux Then
+Delegate Sub ScrollMapCallback(widget As Ptr, data As Ptr)
+Delegate Function ScrollFrameCallback(widget As Ptr, frameClock As Ptr, data As Ptr) As Int32
+Private Optional Declare Function ScrollConnectMap Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (widget As Ptr, signal As String, callback As ScrollMapCallback, data As Ptr, destroy As Ptr, nativeFlags As Int32) As UInt64
+Private Optional Declare Function ScrollAddTick Lib "libgtk-4.so.1" Alias "gtk_widget_add_tick_callback" (widget As Ptr, callback As ScrollFrameCallback, data As Ptr, destroy As Ptr) As UInt32
+Private Optional Declare Sub ScrollRemoveTick Lib "libgtk-4.so.1" Alias "gtk_widget_remove_tick_callback" (widget As Ptr, identifier As UInt32)
+Private Optional Declare Function ScrollAllocatedWidth Lib "libgtk-4.so.1" Alias "gtk_widget_get_width" (widget As Ptr) As Int32
+Private Optional Declare Function ScrollAllocatedHeight Lib "libgtk-4.so.1" Alias "gtk_widget_get_height" (widget As Ptr) As Int32
+Private Sub ScrollLinuxMapped(widget As Ptr, data As Ptr)
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(ScrollRegistry.Items) Then Return
+    Dim owner As ScrollView = ScrollRegistry.Items(index).Owner
+    If owner <> Nil Then owner.ApplyPendingScroll()
+End Sub
+Private Function ScrollLinuxFrame(widget As Ptr, frameClock As Ptr, data As Ptr) As Int32
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(ScrollRegistry.Items) Then Return 0
+    Dim owner As ScrollView = ScrollRegistry.Items(index).Owner
+    If owner = Nil Then Return 0
+    Return owner.NativePendingFrame(widget)
+End Function
+Private Optional Declare Function ScrollNew Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_new" () As Ptr
+Private Optional Declare Function ScrollRefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (widget As Ptr) As Ptr
+Private Optional Declare Function ScrollRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (widget As Ptr) As Ptr
+Private Optional Declare Sub ScrollUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (widget As Ptr)
+Private Optional Declare Function ScrollParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Sub ScrollSetChild Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_set_child" (widget As Ptr, child As Ptr)
+Private Optional Declare Sub ScrollFixedRemove Lib "libgtk-4.so.1" Alias "gtk_fixed_remove" (host As Ptr, widget As Ptr)
+Private Optional Declare Sub ScrollFixedPut Lib "libgtk-4.so.1" Alias "gtk_fixed_put" (host As Ptr, widget As Ptr, x As Double, y As Double)
+Private Optional Declare Sub ScrollPolicy Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_set_policy" (widget As Ptr, horizontal As Int32, vertical As Int32)
+Private Optional Declare Sub ScrollSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Function ScrollHAdjustment Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_hadjustment" (widget As Ptr) As Ptr
+Private Optional Declare Function ScrollVAdjustment Lib "libgtk-4.so.1" Alias "gtk_scrolled_window_get_vadjustment" (widget As Ptr) As Ptr
+Private Optional Declare Sub ScrollAdjustmentValue Lib "libgtk-4.so.1" Alias "gtk_adjustment_set_value" (adjustment As Ptr, value As Double)
+Private Optional Declare Function ScrollAdjustmentGet Lib "libgtk-4.so.1" Alias "gtk_adjustment_get_value" (adjustment As Ptr) As Double
+#ElseIf TargetWindows Then
+Sequential Structure ScrollWheelSetting
+    Value As UInt32
+End Structure
+Sequential Structure ScrollWinRect
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+End Structure
+Sequential Structure ScrollInfo
+    Size As UInt32
+    Mask As UInt32
+    Minimum As Int32
+    Maximum As Int32
+    Page As UInt32
+    Position As Int32
+    TrackPosition As Int32
+End Structure
+Delegate Function ScrollWindowsCallback(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+Private Optional Declare Function ScrollSystemParameters Lib "user32" Alias "SystemParametersInfoW" (action As UInt32, word As UInt32, data As Ptr, nativeFlags As UInt32) As Int32
+Private Optional Declare Function ScrollSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As ScrollWindowsCallback, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function ScrollUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As ScrollWindowsCallback, id As UInt64) As Int32
+Private Optional Declare Function ScrollDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function ScrollStyle Lib "user32" Alias "GetWindowLongPtrW" (widget As Ptr, index As Int32) As Int64
+Private Optional Declare Function ScrollSetStyle Lib "user32" Alias "SetWindowLongPtrW" (widget As Ptr, index As Int32, value As Int64) As Int64
+Private Optional Declare Function ScrollShowBar Lib "user32" Alias "ShowScrollBar" (widget As Ptr, bar As Int32, show As Int32) As Int32
+Private Optional Declare Function ScrollSetInfo Lib "user32" Alias "SetScrollInfo" (widget As Ptr, bar As Int32, info As Ptr, redraw As Int32) As Int32
+Private Optional Declare Function ScrollGetInfo Lib "user32" Alias "GetScrollInfo" (widget As Ptr, bar As Int32, info As Ptr) As Int32
+Private Optional Declare Function ScrollSetPosition Lib "user32" Alias "SetScrollPos" (widget As Ptr, bar As Int32, position As Int32, redraw As Int32) As Int32
+Private Optional Declare Function ScrollClientRect Lib "user32" Alias "GetClientRect" (widget As Ptr, bounds As Ptr) As Int32
+Private Optional Declare Function ScrollDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function ScrollMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, redraw As Int32) As Int32
+Private Optional Declare Function ScrollIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Function ScrollWindowsMessage(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    Dim index As Integer = id
+    index -= 1
+    If index >= 0 And index < Array.Count(ScrollRegistry.Items) Then
+        Dim owner As ScrollView = ScrollRegistry.Items(index).Owner
+        If owner <> Nil Then
+            Try
+                If message = 130 Then ' WM_NCDESTROY: never reuse these HWNDs.
+                    owner.NativeHostDestroyed()
+                ElseIf message = 276 Or message = 277 Or message = 522 Or message = 526 Then
+                    If owner.NativeWindowsMessage(message, word) Then Return 0
+                ElseIf message = 5 Then
+                    owner.RefreshNative()
+                End If
+            Catch e As Exception
+                owner.LastNativeError = e.Message
+            End Try
+        End If
+    End If
+    Return ScrollDefault(widget, message, word, param)
+End Function
+#ElseIf TargetMac Then
+Sequential Structure ScrollPoint
+    X As Double
+    Y As Double
+End Structure
+Sequential Structure ScrollRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Private Declare Function ScrollClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function ScrollAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function ScrollInit Lib "AppKit" Selector "init" (widget As Ptr) As Ptr
+Private Declare Function ScrollRetain Lib "AppKit" Selector "retain" (widget As Ptr) As Ptr
+Private Declare Function ScrollSuperview Lib "AppKit" Selector "superview" (widget As Ptr) As Ptr
+Private Declare Sub ScrollRelease Lib "AppKit" Selector "release" (widget As Ptr)
+Private Declare Sub ScrollRemove Lib "AppKit" Selector "removeFromSuperview" (widget As Ptr)
+Private Declare Sub ScrollAddSubview Lib "AppKit" Selector "addSubview:" (host As Ptr, widget As Ptr)
+Private Declare Sub ScrollAutoresizing Lib "AppKit" Selector "setAutoresizingMask:" (widget As Ptr, mask As Integer)
+Private Declare Sub ScrollSetDocument Lib "AppKit" Selector "setDocumentView:" (widget As Ptr, document As Ptr)
+Private Declare Sub ScrollHorizontal Lib "AppKit" Selector "setHasHorizontalScroller:" (widget As Ptr, enabled As Boolean)
+Private Declare Sub ScrollVertical Lib "AppKit" Selector "setHasVerticalScroller:" (widget As Ptr, enabled As Boolean)
+Private Declare Sub ScrollAutohide Lib "AppKit" Selector "setAutohidesScrollers:" (widget As Ptr, enabled As Boolean)
+Private Declare Sub ScrollFrame Lib "AppKit" Selector "setFrame:" (widget As Ptr, frame As ScrollRect)
+Private Declare Function ScrollContentView Lib "AppKit" Selector "contentView" (widget As Ptr) As Ptr
+Private Declare Function ScrollBounds Lib "AppKit" Selector "bounds" (widget As Ptr) As ScrollRect
+Private Declare Sub ScrollClip Lib "AppKit" Selector "scrollToPoint:" (widget As Ptr, point As ScrollPoint)
+Private Declare Sub ScrollReflect Lib "AppKit" Selector "reflectScrolledClipView:" (widget As Ptr, clip As Ptr)
+#End If

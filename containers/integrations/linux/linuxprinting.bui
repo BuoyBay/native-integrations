@@ -1,0 +1,418 @@
+' Native CUPS 2 printing for 64-bit Linux. No job is submitted implicitly.
+Import "../printing/printingtypes"
+
+Public Class LinuxPrinterInfo
+    Public Property Name As String
+    Public Property IsDefault As Boolean
+End Class
+
+#If TargetLinux Then
+Sequential Structure LinuxPrintingDestination
+    QueueName As Ptr
+    InstanceName As Ptr
+    DefaultFlag As Int32
+    OptionCount As Int32
+    Options As Ptr
+End Structure
+
+Private Optional Declare Function PrintingGetDests Lib "libcups.so.2" Alias "cupsGetDests2" (connection As Ptr, ByRef destinations As Ptr) As Int32
+Private Optional Declare Sub PrintingFreeDests Lib "libcups.so.2" Alias "cupsFreeDests" (count As Int32, destinations As Ptr)
+Private Optional Declare Function PrintingLastError Lib "libcups.so.2" Alias "cupsLastError" () As Int32
+Private Optional Declare Function PrintingLastErrorString Lib "libcups.so.2" Alias "cupsLastErrorString" () As CString
+Private Optional Declare Function PrintingAddOption Lib "libcups.so.2" Alias "cupsAddOption" (name As CString, value As CString, count As Int32, ByRef options As Ptr) As Int32
+Private Optional Declare Sub PrintingFreeOptions Lib "libcups.so.2" Alias "cupsFreeOptions" (count As Int32, options As Ptr)
+Private Optional Declare Function PrintingPrintFile Lib "libcups.so.2" Alias "cupsPrintFile" (printer As CString, fileName As CString, title As CString, count As Int32, options As Ptr) As Int32
+Private Optional Declare Function PrintingCopyDest Lib "c" Alias "memcpy" (ByRef destination As LinuxPrintingDestination, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function PrintingTempFile Lib "c" Alias "mkstemp" (fileName As Ptr) As Int32
+Private Optional Declare Function PrintingWrite Lib "c" Alias "write" (descriptor As Int32, buffer As Ptr, count As UInt64) As Int64
+Private Optional Declare Function PrintingClose Lib "c" Alias "close" (descriptor As Int32) As Int32
+Private Optional Declare Function PrintingUnlink Lib "c" Alias "unlink" (fileName As CString) As Int32
+Private Optional Declare Function PrintingErrnoAddress Lib "c" Alias "__errno_location" () As Ptr
+Private Optional Declare Function PrintingCopyError Lib "c" Alias "memcpy" (ByRef code As Int32, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function PrintingPdfSurface Lib "libcairo.so.2" Alias "cairo_pdf_surface_create" (fileName As CString, width As Double, height As Double) As Ptr
+Private Optional Declare Function PrintingSurfaceStatus Lib "libcairo.so.2" Alias "cairo_surface_status" (surface As Ptr) As Int32
+Private Optional Declare Function PrintingContext Lib "libcairo.so.2" Alias "cairo_create" (surface As Ptr) As Ptr
+Private Optional Declare Function PrintingContextStatus Lib "libcairo.so.2" Alias "cairo_status" (context As Ptr) As Int32
+Private Optional Declare Function PrintingStatusText Lib "libcairo.so.2" Alias "cairo_status_to_string" (status As Int32) As CString
+Private Optional Declare Sub PrintingMoveTo Lib "libcairo.so.2" Alias "cairo_move_to" (context As Ptr, x As Double, y As Double)
+Private Optional Declare Function PrintingLayout Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_create_layout" (context As Ptr) As Ptr
+Private Optional Declare Sub PrintingShowLayout Lib "libpangocairo-1.0.so.0" Alias "pango_cairo_show_layout" (context As Ptr, layout As Ptr)
+Private Optional Declare Function PrintingDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_new" () As Ptr
+Private Optional Declare Sub PrintingFamily Lib "libpango-1.0.so.0" Alias "pango_font_description_set_family" (description As Ptr, family As String)
+Private Optional Declare Sub PrintingSize Lib "libpango-1.0.so.0" Alias "pango_font_description_set_absolute_size" (description As Ptr, size As Double)
+Private Optional Declare Sub PrintingSetDescription Lib "libpango-1.0.so.0" Alias "pango_layout_set_font_description" (layout As Ptr, description As Ptr)
+Private Optional Declare Sub PrintingSetText Lib "libpango-1.0.so.0" Alias "pango_layout_set_text" (layout As Ptr, content As String, length As Int32)
+Private Optional Declare Function PrintingBaseline Lib "libpango-1.0.so.0" Alias "pango_layout_get_baseline" (layout As Ptr) As Int32
+Private Optional Declare Sub PrintingFreeDescription Lib "libpango-1.0.so.0" Alias "pango_font_description_free" (description As Ptr)
+Private Optional Declare Sub PrintingUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+Private Optional Declare Sub PrintingShowPage Lib "libcairo.so.2" Alias "cairo_show_page" (context As Ptr)
+Private Optional Declare Sub PrintingDestroyContext Lib "libcairo.so.2" Alias "cairo_destroy" (context As Ptr)
+Private Optional Declare Sub PrintingFinishSurface Lib "libcairo.so.2" Alias "cairo_surface_finish" (surface As Ptr)
+Private Optional Declare Sub PrintingDestroySurface Lib "libcairo.so.2" Alias "cairo_surface_destroy" (surface As Ptr)
+
+Private Function PrintingErrorNumber(address As Ptr) As Integer
+    Dim code As Int32 = 0
+    PrintingCopyError(code, address, 4)
+    Return code
+End Function
+
+Private Sub PrintingCupsFailure(operation As String)
+    Dim code As Integer = PrintingLastError()
+    Dim message As CString = PrintingLastErrorString()
+    If message = Nil Then
+        Throw New RuntimeException(operation + " failed", code)
+    End If
+    Throw New RuntimeException(operation + ": " + CType(message, String), code)
+End Sub
+
+Private Sub PrintingCheckCairo(status As Integer)
+    If status <> 0 Then
+        Throw New RuntimeException("Cairo PDF rendering failed: " + CType(PrintingStatusText(status), String), status)
+    End If
+End Sub
+#End If
+
+Private Sub PrintingRequireLinux()
+#If Not TargetLinux Then
+    Throw New UnsupportedOperationException("linuxprinting requires Linux")
+#End If
+End Sub
+
+Private Sub PrintingValidate(value As String, allowEmpty As Boolean)
+    If Not allowEmpty And value = "" Then
+        Throw New InvalidArgumentException("Printer name and job title must be nonempty")
+    End If
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    If encoded.Count > 16777216 Then
+        Throw New InvalidArgumentException("Printing text exceeds this module's 16 MiB limit")
+    End If
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Printing text cannot contain NUL")
+        End If
+    Next
+End Sub
+
+Private Function PrintingUtf8(value As String) As Bytes
+    Return Bytes.FromString(value, Text.Encodings.UTF8)
+End Function
+
+Private Sub PrintingValidatePages(document As BuoyPrintDocument)
+    If document = Nil Then
+        Throw New InvalidArgumentException("Print document cannot be Nil")
+    End If
+    If Not (document.PageWidth >= 1.0 And document.PageWidth <= 14400.0 And document.PageHeight >= 1.0 And document.PageHeight <= 14400.0) Then
+        Throw New InvalidArgumentException("Print page dimensions must be finite within 1..14400 points")
+    End If
+    Dim pageCount As Integer = Array.Count(document.Pages)
+    If pageCount < 1 Or pageCount > 1000 Then
+        Throw New InvalidArgumentException("Print document must contain 1..1000 pages")
+    End If
+    Dim runCount As Integer = 0
+    Dim byteCount As Integer = 0
+    For Each page In document.Pages
+        If page = Nil Then
+            Throw New InvalidArgumentException("Print document contains a Nil page")
+        End If
+        runCount += Array.Count(page.Items)
+        If runCount > 100000 Then
+            Throw New InvalidArgumentException("Print document exceeds 100000 text runs")
+        End If
+        For Each item In page.Items
+            If item = Nil Then
+                Throw New InvalidArgumentException("Print page contains a Nil text run")
+            End If
+            PrintingValidate(item.Content, True)
+            PrintingValidate(item.FontName, False)
+            If String.Contains(item.Content, "\n") Or String.Contains(item.Content, "\r") Or String.Contains(item.Content, "\t") Or String.Contains(item.Content, String.Chr(8232)) Or String.Contains(item.Content, String.Chr(8233)) Then
+                Throw New InvalidArgumentException("DrawText content must be a single line without tabs")
+            End If
+            Dim fontUnits As Integer = item.FontName.AsUTF16LE().Count \ 2
+            If fontUnits > 31 Then
+                Throw New InvalidArgumentException("Font family exceeds 31 UTF-16 code units")
+            End If
+            If Not (item.FontSize >= 1.0 And item.FontSize <= 1000.0) Then
+                Throw New InvalidArgumentException("Font size must be finite within 1..1000 points")
+            End If
+            If String.Len(item.Content) * item.FontSize > 262144.0 Then
+                Throw New InvalidArgumentException("Text run exceeds the safe Pango extent budget; split it into positioned runs")
+            End If
+            If Not (item.X >= 0.0 And item.X <= document.PageWidth And item.Y >= 0.0 And item.Y <= document.PageHeight) Then
+                Throw New InvalidArgumentException("Text coordinates must be finite and within the print page")
+            End If
+            byteCount += PrintingUtf8(item.Content).Count
+            If byteCount > 16777216 Then
+                Throw New InvalidArgumentException("Print document exceeds 16 MiB of text")
+            End If
+        Next
+    Next
+End Sub
+
+''' Export the same shaped PDF used by PrintPages without contacting CUPS.
+''' The explicit destination is overwritten; invalid documents are rejected first.
+Public Sub ExportPDF(fileName As String, document As BuoyPrintDocument)
+    PrintingRequireLinux()
+    PrintingValidate(fileName, False)
+    PrintingValidatePages(document)
+#If TargetLinux Then
+    If Not System.IsLibraryAvailable("libcairo.so.2") Or Not System.IsLibraryAvailable("libpangocairo-1.0.so.0") Or Not System.IsLibraryAvailable("libpango-1.0.so.0") Or Not System.IsLibraryAvailable("libgobject-2.0.so.0") Then
+        Throw New LibraryUnavailableException("Cairo/Pango PDF rendering libraries are unavailable")
+    End If
+    Dim surface As Ptr = Nil
+    Dim context As Ptr = Nil
+    Try
+        surface = PrintingPdfSurface(CType(fileName, CString), document.PageWidth, document.PageHeight)
+        PrintingCheckCairo(PrintingSurfaceStatus(surface))
+        context = PrintingContext(surface)
+        PrintingCheckCairo(PrintingContextStatus(context))
+        For Each page In document.Pages
+            For Each item In page.Items
+                Dim layout As Ptr = Nil
+                Dim description As Ptr = Nil
+                Try
+                    layout = PrintingLayout(context)
+                    description = PrintingDescription()
+                    If layout = Nil Or description = Nil Then Throw New RuntimeException("Unable to allocate Pango layout")
+                    Dim family As String = item.FontName
+                    If String.LCase(family) = "system" Or String.LCase(family) = "smallsystem" Then family = "sans-serif"
+                    PrintingFamily(description, family)
+                    ' Cairo PDF user units are points; avoid an implicit 96/72 scale.
+                    PrintingSize(description, item.FontSize * 1024.0)
+                    PrintingSetDescription(layout, description)
+                    PrintingSetText(layout, item.Content, -1)
+                    Dim baseline As Double = PrintingBaseline(layout) / 1024.0
+                    PrintingMoveTo(context, item.X, item.Y - baseline)
+                    PrintingShowLayout(context, layout)
+                    PrintingCheckCairo(PrintingContextStatus(context))
+                Finally
+                    If description <> Nil Then PrintingFreeDescription(description)
+                    If layout <> Nil Then PrintingUnref(layout)
+                End Try
+            Next
+            PrintingShowPage(context)
+            PrintingCheckCairo(PrintingContextStatus(context))
+        Next
+        PrintingDestroyContext(context)
+        context = Nil
+        PrintingFinishSurface(surface)
+        PrintingCheckCairo(PrintingSurfaceStatus(surface))
+    Finally
+        If context <> Nil Then PrintingDestroyContext(context)
+        If surface <> Nil Then PrintingDestroySurface(surface)
+    End Try
+#End If
+End Sub
+
+''' Render explicit point-coordinate text pages to PDF and submit the accepted job.
+Public Function PrintPages(printerName As String, title As String, document As BuoyPrintDocument) As Integer
+    PrintingRequireLinux()
+    PrintingValidate(printerName, False)
+    PrintingValidate(title, False)
+    PrintingValidatePages(document)
+#If TargetLinux Then
+    If Not IsAvailable() Then
+        Throw New LibraryUnavailableException("CUPS 2 runtime library is unavailable")
+    End If
+    If Not System.IsLibraryAvailable("libcairo.so.2") Then
+        Throw New LibraryUnavailableException("Cairo PDF runtime library is unavailable")
+    End If
+    Dim errnoAddress As Ptr = PrintingErrnoAddress()
+    PrintingErrorNumber(errnoAddress)
+    Dim options As Ptr = Nil
+    Dim optionCount As Integer = PrintingAddOption(CType("document-format", CString), CType("application/pdf", CString), 0, options)
+    If optionCount <> 1 Then
+        If options <> Nil Then
+            PrintingFreeOptions(optionCount, options)
+        End If
+        Throw New RuntimeException("Unable to allocate CUPS PDF option")
+    End If
+    Dim fileName As String = ""
+    Dim descriptor As Integer = -1
+    Try
+        Dim template As Bytes = PrintingUtf8("/tmp/buoy-print-XXXXXX")
+        template.Append(0)
+        descriptor = PrintingTempFile(template.DataPtr())
+        If descriptor < 0 Then
+            Dim code As Integer = PrintingErrorNumber(errnoAddress)
+            Throw New RuntimeException("mkstemp failed", code)
+        End If
+        fileName = CType(CType(template.DataPtr(), CString), String)
+        Dim toClose As Integer = descriptor
+        descriptor = -1
+        If PrintingClose(toClose) <> 0 Then
+            Dim code As Integer = PrintingErrorNumber(errnoAddress)
+            Throw New RuntimeException("Closing temporary PDF failed", code)
+        End If
+        ExportPDF(fileName, document)
+        Dim jobId As Integer = PrintingPrintFile(CType(printerName, CString), CType(fileName, CString), CType(title, CString), optionCount, options)
+        If jobId <= 0 Then
+            PrintingCupsFailure("cupsPrintFile(PDF)")
+        End If
+        Return jobId
+    Finally
+        If descriptor >= 0 Then
+            PrintingClose(descriptor)
+        End If
+        If fileName <> "" Then
+            PrintingUnlink(CType(fileName, CString))
+        End If
+        PrintingFreeOptions(optionCount, options)
+    End Try
+#Else
+    Return 0
+#End If
+End Function
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Library capability only: does not contact the server or promise a printer exists.
+Public Function IsAvailable() As Boolean
+#If TargetLinux Then
+    Return System.IsLibraryAvailable("libcups.so.2")
+#Else
+    Return False
+#End If
+End Function
+
+''' Owned base queue names. Named option instances collapse into the same queue.
+Public Function Printers() As Array Of LinuxPrinterInfo
+    PrintingRequireLinux()
+#If TargetLinux Then
+    ' Resolve error functions before enumeration; preserve its CUPS status.
+    PrintingLastError()
+    PrintingLastErrorString()
+    Dim destinations As Ptr = Nil
+    Dim count As Integer = PrintingGetDests(Nil, destinations)
+    Try
+        Dim status As Integer = PrintingLastError()
+        ' CUPS uses IPP client-error-not-found (0x0406) for a healthy empty server.
+        If count < 0 Or (count = 0 And status >= 1024 And status <> 1030) Then
+            PrintingCupsFailure("cupsGetDests2")
+        End If
+        If count > 0 And destinations = Nil Then
+            Throw New RuntimeException("CUPS returned destinations without storage")
+        End If
+        Dim printers As Array Of LinuxPrinterInfo = []
+        For i As Integer = 0 To count - 1
+            Dim native As LinuxPrintingDestination
+            PrintingCopyDest(native, CType(CType(destinations, Integer) + i * 32, Ptr), 32)
+            If native.QueueName = Nil Then
+                Throw New RuntimeException("CUPS returned an unnamed queue")
+            End If
+            Dim queueName As String = CType(CType(native.QueueName, CString), String)
+            Dim existing As LinuxPrinterInfo = Nil
+            For Each printer In printers
+                If printer.Name = queueName Then
+                    existing = printer
+                    Exit For
+                End If
+            Next
+            If existing = Nil Then
+                existing = New LinuxPrinterInfo
+                existing.Name = queueName
+                Array.Append(printers, existing)
+            End If
+            If native.DefaultFlag <> 0 Then
+                existing.IsDefault = True
+            End If
+        Next
+        Return printers
+    Finally
+        If destinations <> Nil Then
+            PrintingFreeDests(count, destinations)
+        End If
+    End Try
+#Else
+    Return []
+#End If
+End Function
+
+Public Function DefaultPrinter() As Optional Of String
+    PrintingRequireLinux()
+    For Each printer In Printers()
+        If printer.IsDefault Then
+            Return Some(printer.Name)
+        End If
+    Next
+    Return None
+End Function
+
+''' Submit UTF-8 text/plain to an explicit CUPS queue; returns its accepted job ID.
+Public Function PrintText(printerName As String, title As String, text As String) As Integer
+    PrintingRequireLinux()
+    PrintingValidate(printerName, False)
+    PrintingValidate(title, False)
+    PrintingValidate(text, True)
+#If TargetLinux Then
+    ' Validate and resolve the backend before creating a temporary file.
+    If Not IsAvailable() Then
+        Throw New LibraryUnavailableException("CUPS 2 runtime library is unavailable")
+    End If
+    Dim errnoAddress As Ptr = PrintingErrnoAddress()
+    PrintingErrorNumber(errnoAddress)
+    Dim options As Ptr = Nil
+    Dim optionCount As Integer = PrintingAddOption(CType("document-format", CString), CType("text/plain", CString), 0, options)
+    If optionCount <> 1 Then
+        If options <> Nil Then
+            PrintingFreeOptions(optionCount, options)
+        End If
+        Throw New RuntimeException("Unable to allocate CUPS text/plain option")
+    End If
+    Dim descriptor As Integer = -1
+    Dim fileName As String = ""
+    Try
+        Dim template As Bytes = PrintingUtf8("/tmp/buoy-print-XXXXXX")
+        template.Append(0)
+        descriptor = PrintingTempFile(template.DataPtr())
+        If descriptor < 0 Then
+            Dim code As Integer = PrintingErrorNumber(errnoAddress)
+            Throw New RuntimeException("mkstemp failed", code)
+        End If
+        fileName = CType(CType(template.DataPtr(), CString), String)
+        Dim payload As Bytes = PrintingUtf8(text)
+        Dim offset As Integer = 0
+        While offset < payload.Count
+            Dim written As Integer = PrintingWrite(descriptor, CType(CType(payload.DataPtr(), Integer) + offset, Ptr), payload.Count - offset)
+            If written < 0 Then
+                Dim code As Integer = PrintingErrorNumber(errnoAddress)
+                If code = 4 Then
+                    Continue While
+                End If
+                Throw New RuntimeException("Writing temporary print text failed", code)
+            ElseIf written = 0 Then
+                Throw New RuntimeException("Writing temporary print text made no progress")
+            End If
+            offset += written
+        End While
+        ' Linux close may release the descriptor even when returning an error.
+        Dim toClose As Integer = descriptor
+        descriptor = -1
+        If PrintingClose(toClose) <> 0 Then
+            Dim code As Integer = PrintingErrorNumber(errnoAddress)
+            Throw New RuntimeException("Closing temporary print text failed", code)
+        End If
+        Dim jobId As Integer = PrintingPrintFile(CType(printerName, CString), CType(fileName, CString), CType(title, CString), optionCount, options)
+        If jobId <= 0 Then
+            PrintingCupsFailure("cupsPrintFile")
+        End If
+        Return jobId
+    Finally
+        If descriptor >= 0 Then
+            PrintingClose(descriptor)
+        End If
+        If fileName <> "" Then
+            ' Never report an accepted print job as failed due to unlink cleanup.
+            PrintingUnlink(CType(fileName, CString))
+        End If
+        PrintingFreeOptions(optionCount, options)
+    End Try
+#Else
+    Return 0
+#End If
+End Function

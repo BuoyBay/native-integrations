@@ -1,0 +1,147 @@
+' Linux/glibc native integrations for Buoy 0.72.0 (64-bit targets).
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+#If TargetLinux Then
+Private Optional Declare Function CGetPid Lib "c" Alias "getpid" () As Int32
+Private Optional Declare Function CGetParentPid Lib "c" Alias "getppid" () As Int32
+Private Optional Declare Function CGetUid Lib "c" Alias "getuid" () As UInt32
+Private Optional Declare Function CGetEffectiveUid Lib "c" Alias "geteuid" () As UInt32
+Private Optional Declare Function CGetGid Lib "c" Alias "getgid" () As UInt32
+Private Optional Declare Function CGetEnv Lib "c" Alias "getenv" (name As CString) As CString
+Private Optional Declare Function CCalloc Lib "c" Alias "calloc" (count As UInt64, size As UInt64) As Ptr
+Private Optional Declare Sub CFree Lib "c" Alias "free" (buffer As Ptr)
+Private Optional Declare Function CGetHostname Lib "c" Alias "gethostname" (buffer As Ptr, size As UInt64) As Int32
+
+Sequential Structure NativeTimespec
+    Seconds As Int64
+    Nanoseconds As Int64
+End Structure
+
+Private Optional Declare Function CClockGetTime Lib "c" Alias "clock_gettime" (clockId As Int32, ByRef value As NativeTimespec) As Int32
+
+Public Function ProcessId() As Integer
+    Return CGetPid()
+End Function
+
+Public Function ParentProcessId() As Integer
+    Return CGetParentPid()
+End Function
+
+Public Function UserId() As Integer
+    Return CGetUid()
+End Function
+
+Public Function EffectiveUserId() As Integer
+    Return CGetEffectiveUid()
+End Function
+
+Public Function GroupId() As Integer
+    Return CGetGid()
+End Function
+
+''' Return an owned UTF-8 copy; None means unset, Some("") means explicitly empty.
+Public Function EnvironmentValue(name As String) As Optional Of String
+    If name = "" Or String.Contains(name, "=") Then
+        Throw New InvalidArgumentException("Environment variable name must be nonempty and not contain =")
+    End If
+    Dim value As CString = CGetEnv(CType(name, CString))
+    If value = Nil Then
+        Return None
+    End If
+    Return Some(CType(value, String))
+End Function
+
+''' Return the kernel hostname in the current UTS namespace.
+Public Function HostName() As String
+    ' Linux limits the hostname to 64 bytes; extra zeroed space ensures termination.
+    Dim buffer As Ptr = CCalloc(256, 1)
+    If buffer = Nil Then
+        Throw New RuntimeException("Unable to allocate hostname buffer")
+    End If
+    Try
+        If CGetHostname(buffer, 256) <> 0 Then
+            Throw New RuntimeException("gethostname failed")
+        End If
+        Return CType(CType(buffer, CString), String)
+    Finally
+        CFree(buffer)
+    End Try
+End Function
+
+''' CLOCK_MONOTONIC is suitable for durations; its origin is unspecified and it excludes suspend.
+Public Function MonotonicNanoseconds() As Integer
+    Dim value As NativeTimespec
+    If CClockGetTime(1, value) <> 0 Then
+        Throw New RuntimeException("clock_gettime(CLOCK_MONOTONIC) failed")
+    End If
+    Return value.Seconds * 1000000000 + value.Nanoseconds
+End Function
+
+''' CLOCK_BOOTTIME is Linux uptime including suspended time.
+Public Function UptimeSeconds() As Double
+    Dim value As NativeTimespec
+    If CClockGetTime(7, value) <> 0 Then
+        Throw New RuntimeException("clock_gettime(CLOCK_BOOTTIME) failed")
+    End If
+    Dim nanos As Double = value.Nanoseconds
+    Return value.Seconds + nanos / 1000000000.0
+End Function
+
+Private Function AbsoluteEnvironmentPath(name As String) As Optional Of String
+    Dim value As Optional Of String = EnvironmentValue(name)
+    If value.HasValue Then
+        If String.StartsWith(value.Value, "/") Then
+            Return value
+        End If
+    End If
+    Return None
+End Function
+
+''' HOME must be absolute. No password-database lookup or implicit current-directory fallback.
+Public Function HomeDirectory() As String
+    Dim homePath As Optional Of String = AbsoluteEnvironmentPath("HOME")
+    If Not homePath.HasValue Then
+        Throw New RuntimeException("HOME is unset, empty, or relative")
+    End If
+    Return homePath.Value
+End Function
+
+Private Function BaseDirectory(variableName As String, suffix As String) As String
+    Dim configured As Optional Of String = AbsoluteEnvironmentPath(variableName)
+    If configured.HasValue Then
+        Return configured.Value
+    End If
+    Dim homePath As String = HomeDirectory()
+    If String.EndsWith(homePath, "/") Then
+        Return homePath + suffix
+    End If
+    Return homePath + "/" + suffix
+End Function
+
+Public Function ConfigDirectory() As String
+    Return BaseDirectory("XDG_CONFIG_HOME", ".config")
+End Function
+
+Public Function DataDirectory() As String
+    Return BaseDirectory("XDG_DATA_HOME", ".local/share")
+End Function
+
+Public Function CacheDirectory() As String
+    Return BaseDirectory("XDG_CACHE_HOME", ".cache")
+End Function
+
+Public Function StateDirectory() As String
+    Return BaseDirectory("XDG_STATE_HOME", ".local/state")
+End Function
+
+''' No fallback: XDG_RUNTIME_DIR must come from the session; existence/ownership are not checked.
+Public Function RuntimeDirectory() As Optional Of String
+    Return AbsoluteEnvironmentPath("XDG_RUNTIME_DIR")
+End Function
+#End If

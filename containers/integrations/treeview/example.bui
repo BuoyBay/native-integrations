@@ -1,0 +1,55 @@
+Import treeview
+
+Window TreeLayout
+    Title = "Buoy Native TreeView"
+    Frame = (100, 100, 580, 420)
+    Control Label heading
+        Text = "Native project tree — expand with arrows or the disclosure control"
+        Frame = (20, 15, 540, 25)
+    End Control
+    Control TreeView projectTree
+        Frame = (20, 50, 540, 300)
+    End Control
+    Control Label selected
+        Text = "Select a project item"
+        Frame = (20, 365, 540, 25)
+    End Control
+End Window
+Class TreeDemo Inherits TreeLayout
+    Handle Opening()
+        Dim project As New TreeNode("Buoy Project")
+        Dim source As New TreeNode("Source")
+        source.AddChild(New TreeNode("main.bui"))
+        source.AddChild(New TreeNode("models.bui"))
+        Dim tests As New TreeNode("Tests")
+        tests.AddChild(New TreeNode("model_test.bui"))
+        tests.AddChild(New TreeNode("native_test.bui"))
+        project.AddChild(source)
+        project.AddChild(tests)
+        project.AddChild(New TreeNode("README.md"))
+        project.Expanded = True
+        source.Expanded = True
+        Me.projectTree.AddRoot(project)
+        Me.projectTree.AddRoot(New TreeNode("Dependencies"))
+        Me.projectTree.Open()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.projectTree.RefreshNative()
+    End Handle
+    Handle Closed()
+        Me.projectTree.Close()
+    End Handle
+    With projectTree
+        Handle SelectionChanged(node As TreeNode)
+            Dim caption As String = "None"
+            If node <> Nil Then caption = node.Caption
+            Me.selected.Text = "Selected: " + caption
+            Me.Title = "TreeView: " + caption
+        End Handle
+    End With
+End Class
+Sub Main()
+    Dim win As New TreeDemo()
+    win.Show()
+    Application.Run()
+End Sub

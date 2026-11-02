@@ -1,0 +1,23 @@
+Import printing As PrintInterop
+
+Sub Main(args As Array Of String)
+    If Not Array.Contains(args, "--print") Then
+        Print "Pass --print to submit this example to the default printer."
+        Exit Sub
+    End If
+    Dim setup As New PrinterSetup
+    setup.JobName = "Buoy native printing example"
+    Dim page As PrinterGraphics = PrinterSetup.OpenPrinter(setup)
+    Try
+        page.FontName = "System"
+        page.FontSize = 14.0
+        page.DrawText("Hello from Buoy", 72.0, 72.0)
+        page.NextPage()
+        page.DrawText("Second page", 72.0, 72.0)
+        Dim job As Integer = page.Close()
+        Print "Submitted print job " + Str(job)
+    Catch e As Exception
+        page.Cancel()
+        Throw e
+    End Try
+End Sub

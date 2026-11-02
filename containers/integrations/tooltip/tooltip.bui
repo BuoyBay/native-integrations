@@ -1,0 +1,309 @@
+' One native tooltip per owner within this integration. UI thread only.
+Private Class TooltipReference
+    Public Property Tooltip As Weak NativeTooltip
+    Public Property Widget As Ptr = Nil
+End Class
+Private Class TooltipRegistry
+    Public Shared Property Items As Array Of TooltipReference = []
+End Class
+
+Public Class NativeTooltip
+    Private Property mOwner As Weak UIControl
+    Private Property mWidget As Ptr = Nil
+    Private Property mText As String = ""
+    Private Property mPreviousText As String = ""
+    Private Property mAppliedText As String = ""
+    Private Property mID As Integer = -1
+    Public Property LastNativeError As String = ""
+    #If TargetWindows Then
+        Private Property mTooltip As Ptr = Nil
+        Private Property mBuffer As Bytes
+        Private Property mRegistered As Boolean = False
+    #End If
+
+    Public Property Owner As UIControl
+        Get
+            Return Me.mOwner
+        End Get
+    End Property
+    Public Property IsAttached As Boolean
+        Get
+            Return Me.mWidget <> Nil And Me.Owner <> Nil
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return Me.mText
+        End Get
+        Set
+            Me.CheckText(value)
+            Me.mText = TooltipSnapshot(value)
+            Me.Refresh()
+        End Set
+    End Property
+    Private Sub CheckText(value As String)
+        Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+        For i As Integer = 0 To encoded.Count - 1
+            If encoded.Item(i) = 0 Then Throw New InvalidArgumentException("Tooltip text cannot contain NUL")
+        Next
+    End Sub
+
+    Public Sub Attach(owner As UIControl, text As String)
+        If owner = Nil Then Throw New InvalidArgumentException("Tooltip needs an owner")
+        Me.CheckText(text)
+        Dim widget As Ptr = owner.NativeWidget
+        If widget = Nil Then Throw New InvalidArgumentException("Attach the owner to a window before attaching its tooltip")
+        For Each reference As TooltipReference In TooltipRegistry.Items
+            Dim current As NativeTooltip = reference.Tooltip
+            If current <> Nil And current IsNot Me And reference.Widget = widget Then Throw New InvalidArgumentException("Owner already has a NativeTooltip")
+        Next
+        Me.Close()
+        Me.LastNativeError = ""
+        Me.mOwner = owner
+        Me.mText = TooltipSnapshot(text)
+        Me.mWidget = widget
+        For i As Integer = 0 To Array.LastIndex(TooltipRegistry.Items)
+            If TooltipRegistry.Items(i).Tooltip = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(TooltipRegistry.Items)
+            Array.Append(TooltipRegistry.Items, New TooltipReference())
+        End If
+        TooltipRegistry.Items(Me.mID).Tooltip = Me
+        TooltipRegistry.Items(Me.mID).Widget = widget
+        Try
+            #If TargetLinux Then
+                TooltipRef(widget)
+                Me.mPreviousText = TooltipSnapshot(TooltipGetText(widget))
+            #ElseIf TargetMac Then
+                TooltipRetain(widget)
+                Me.mPreviousText = TooltipSnapshot(TooltipMacText(widget))
+            #ElseIf TargetWindows Then
+                If TooltipIsWindow(widget) = 0 Then Throw New InvalidArgumentException("Owner has no live native window")
+                If TooltipSubclass(widget, AddressOf TooltipWindowsMessage, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not observe tooltip owner lifetime")
+            #End If
+            Me.Apply()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+
+    ' Reattach when a control rebuilds its native widget (e.g. multiline changes).
+    Public Sub Refresh()
+        Dim owner As UIControl = Me.Owner
+        If owner = Nil Then
+            Me.Close()
+            Return
+        End If
+        If owner.NativeWidget <> Me.mWidget Then
+            Me.Attach(owner, Me.mText)
+            Return
+        End If
+        If Me.mWidget = Nil Then Return
+        Try
+            Me.Apply()
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+            Throw e
+        End Try
+    End Sub
+
+    Private Sub Apply()
+        If Me.mWidget = Nil Then Return
+        #If TargetLinux Then
+            If Me.mText = "" Then
+                TooltipClearText(Me.mWidget, Nil)
+            Else
+                TooltipSetText(Me.mWidget, Me.mText)
+            End If
+        #ElseIf TargetMac Then
+            Dim nativeText As Ptr = Nil
+            If Me.mText <> "" Then nativeText = TooltipNSString(TooltipClass("NSString"), Me.mText)
+            TooltipSetMacText(Me.mWidget, nativeText)
+        #ElseIf TargetWindows Then
+            If TooltipIsWindow(Me.mWidget) = 0 Then
+                Me.OwnerDestroyed()
+                Return
+            End If
+            If Me.mTooltip = Nil And Me.mText <> "" Then
+                Dim cls As Bytes = TooltipUTF16("tooltips_class32")
+                ' WS_EX_TOPMOST; WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX
+                Me.mTooltip = TooltipCreate(8, cls.DataPtr(), Nil, 2147483651, 0, 0, 0, 0, Me.mWidget, Nil, Nil, Nil)
+                If Me.mTooltip = Nil Then Throw New RuntimeException("Could not create native tooltip")
+                TooltipSend(Me.mTooltip, 1048, 0, 420) ' TTM_SETMAXTIPWIDTH: wrap long text.
+            End If
+            If Me.mTooltip <> Nil Then
+                Dim info As TooltipToolInfo
+                info.Size = 72
+                info.NativeFlags = 17 ' TTF_IDISHWND | TTF_SUBCLASS
+                info.Window = Me.mWidget
+                info.ID = CType(Me.mWidget, Integer)
+                If Me.mText = "" Then
+                    If Me.mRegistered Then TooltipSend(Me.mTooltip, 1075, 0, CType(CType(info, Ptr), Integer)) ' TTM_DELTOOLW
+                    Me.mRegistered = False
+                    Me.mBuffer = Nil
+                Else
+                    Dim buffer As Bytes = TooltipUTF16(Me.mText)
+                    info.Text = buffer.DataPtr()
+                    If Me.mRegistered Then
+                        TooltipSend(Me.mTooltip, 1081, 0, CType(CType(info, Ptr), Integer)) ' TTM_UPDATETIPTEXTW
+                    Else
+                        If TooltipSend(Me.mTooltip, 1074, 0, CType(CType(info, Ptr), Integer)) = 0 Then Throw New RuntimeException("Could not register native tooltip")
+                        Me.mRegistered = True
+                    End If
+                    ' Keep the previous buffer alive until native code has its replacement.
+                    Me.mBuffer = buffer
+                End If
+            End If
+        #End If
+        Me.mAppliedText = Me.mText
+    End Sub
+
+    Public Sub Close()
+        Dim widget As Ptr = Me.mWidget
+        If widget = Nil And Me.mID < 0 Then Return
+        If Me.mID >= 0 Then
+            TooltipRegistry.Items(Me.mID).Tooltip = Nil
+            TooltipRegistry.Items(Me.mID).Widget = Nil
+        End If
+        #If TargetLinux Then
+            If widget <> Nil Then
+                ' Restore a previous tooltip only if no other code replaced ours.
+                If String.Compare(TooltipGetText(widget), Me.mAppliedText, True) = 0 Then
+                    If Me.mPreviousText = "" Then
+                        TooltipClearText(widget, Nil)
+                    Else
+                        TooltipSetText(widget, Me.mPreviousText)
+                    End If
+                End If
+                TooltipUnref(widget)
+            End If
+        #ElseIf TargetMac Then
+            If widget <> Nil Then
+                If String.Compare(TooltipMacText(widget), Me.mAppliedText, True) = 0 Then
+                    Dim previous As Ptr = Nil
+                    If Me.mPreviousText <> "" Then previous = TooltipNSString(TooltipClass("NSString"), Me.mPreviousText)
+                    TooltipSetMacText(widget, previous)
+                End If
+                TooltipRelease(widget)
+            End If
+        #ElseIf TargetWindows Then
+            If widget <> Nil Then
+                If TooltipIsWindow(widget) <> 0 Then TooltipUnsubclass(widget, AddressOf TooltipWindowsMessage, Me.mID + 1)
+            End If
+            If Me.mTooltip <> Nil Then
+                If TooltipIsWindow(Me.mTooltip) <> 0 Then TooltipDestroy(Me.mTooltip)
+            End If
+            Me.mTooltip = Nil
+            Me.mBuffer = Nil
+            Me.mRegistered = False
+        #End If
+        Me.mOwner = Nil
+        Me.mWidget = Nil
+        Me.mPreviousText = ""
+        Me.mAppliedText = ""
+        Me.mID = -1
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+
+    ' Called only by WM_NCDESTROY; no stale HWND can later be mistaken for ours.
+    Public Sub OwnerDestroyed()
+        Me.mWidget = Nil
+        ' Refresh must not reattach through the retained wrapper's stale HWND.
+        Me.mOwner = Nil
+        #If TargetWindows Then
+            If Me.mTooltip <> Nil Then
+                If TooltipIsWindow(Me.mTooltip) <> 0 Then TooltipDestroy(Me.mTooltip)
+            End If
+            Me.mTooltip = Nil
+            Me.mBuffer = Nil
+            Me.mRegistered = False
+        #End If
+        If Me.mID >= 0 Then TooltipRegistry.Items(Me.mID).Widget = Nil
+    End Sub
+End Class
+
+Private Function TooltipSnapshot(value As String) As String
+    Dim bytes As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    Return bytes.ToString(Text.Encodings.UTF8)
+End Function
+
+#If TargetLinux Then
+Private Optional Declare Function TooltipRef Lib "libgobject-2.0.so.0" Alias "g_object_ref" (widget As Ptr) As Ptr
+Private Optional Declare Sub TooltipUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (widget As Ptr)
+Private Optional Declare Sub TooltipSetText Lib "libgtk-4.so.1" Alias "gtk_widget_set_tooltip_text" (widget As Ptr, text As String)
+Private Optional Declare Sub TooltipClearText Lib "libgtk-4.so.1" Alias "gtk_widget_set_tooltip_text" (widget As Ptr, text As Ptr)
+Private Optional Declare Function TooltipGetTextPointer Lib "libgtk-4.so.1" Alias "gtk_widget_get_tooltip_text" (widget As Ptr) As Ptr
+Private Function TooltipGetText(widget As Ptr) As String
+    Dim value As Ptr = TooltipGetTextPointer(widget)
+    If value = Nil Then Return ""
+    Return CType(value, String)
+End Function
+#ElseIf TargetMac Then
+Private Declare Function TooltipRetain Lib "Foundation" Selector "retain" (widget As Ptr) As Ptr
+Private Declare Sub TooltipRelease Lib "Foundation" Selector "release" (widget As Ptr)
+Private Declare Function TooltipGetMacText Lib "AppKit" Selector "toolTip" (widget As Ptr) As Ptr
+Private Declare Sub TooltipSetMacText Lib "AppKit" Selector "setToolTip:" (widget As Ptr, text As Ptr)
+Private Declare Function TooltipNSString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function TooltipUTF8 Lib "Foundation" Selector "UTF8String" (text As Ptr) As String
+Private Declare Function TooltipClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Function TooltipMacText(widget As Ptr) As String
+    Dim value As Ptr = TooltipGetMacText(widget)
+    If value = Nil Then Return ""
+    Return TooltipUTF8(value)
+End Function
+#ElseIf TargetWindows Then
+Sequential Structure TooltipToolInfo
+    Size As UInt32
+    NativeFlags As UInt32
+    Window As Ptr
+    ID As UInt64
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+    Instance As Ptr
+    Text As Ptr
+    Data As Int64
+    Reserved As Ptr
+End Structure
+Delegate Function TooltipWindowsCallback(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+Private Optional Declare Function TooltipSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As TooltipWindowsCallback, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function TooltipUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As TooltipWindowsCallback, id As UInt64) As Int32
+Private Optional Declare Function TooltipDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function TooltipIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function TooltipCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, parameter As Ptr) As Ptr
+Private Optional Declare Function TooltipSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function TooltipDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Function TooltipUTF16(value As String) As Bytes
+    Dim bytes As Bytes = value.AsUTF16LE()
+    bytes.Append(0)
+    bytes.Append(0)
+    Return bytes
+End Function
+Private Function TooltipWindowsMessage(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    If message = 130 Then ' WM_NCDESTROY
+        Dim index As Integer = id
+        index -= 1
+        If index >= 0 And index <= Array.LastIndex(TooltipRegistry.Items) Then
+            Dim tooltip As NativeTooltip = TooltipRegistry.Items(index).Tooltip
+            If tooltip <> Nil Then
+                Try
+                    TooltipUnsubclass(widget, AddressOf TooltipWindowsMessage, id)
+                    tooltip.OwnerDestroyed()
+                Catch e As Exception
+                    tooltip.LastNativeError = e.Message
+                End Try
+            End If
+        End If
+    End If
+    Return TooltipDefault(widget, message, word, param)
+End Function
+#End If

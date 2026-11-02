@@ -1,0 +1,301 @@
+Import textmodel
+Import textinputcanvas
+Import editorwheel
+
+' Small plain-text editor demonstrating the input contract. Drawing is replaceable.
+Public Class TextEditor Inherits TextInputCanvas Implements EditorWheelHost
+    Public Property Document As TextDocument = New TextDocument()
+    Public Property FontName As String = "monospace"
+    Public Property FontSize As Double = 18.0
+    Public Property LineHeight As Integer = 28
+    Private Property mXs As Array Of Double = []
+    Private Property mYs As Array Of Double = []
+    Private Property mInputX As Double = 0.0
+    Private Property mInputY As Double = 0.0
+    Private Property mScrollX As Double = 0.0
+    Private Property mScrollY As Double = 0.0
+    Private Property mWheel As EditorWheel = New EditorWheel()
+    Private Property mRevealCaret As Boolean = True
+    Private Property mLastDrawnText As String = ""
+    Private Property mLastDrawnCaret As Integer = -1
+    Private Property mContentWidth As Double = 0.0
+    Private Property mContentHeight As Double = 0.0
+
+    Public Property ScrollX As Double
+        Get
+            Return Me.mScrollX
+        End Get
+    End Property
+    Public Property ScrollY As Double
+        Get
+            Return Me.mScrollY
+        End Get
+    End Property
+    Public Property WheelError As String
+        Get
+            Return Me.mWheel.LastWheelError
+        End Get
+    End Property
+
+    Public Overrides Sub OpenInputMethod()
+        Super.OpenInputMethod()
+        Me.mWheel.OpenWheel(Me, Me)
+    End Sub
+
+    Public Overrides Sub CloseInputMethod()
+        Me.mWheel.CloseWheel()
+        Super.CloseInputMethod()
+    End Sub
+
+    Public Function NativeWheel(dx As Double, dy As Double, pixels As Boolean) As Boolean
+        Dim scaleX As Double = Me.FontSize * 3.0
+        Dim scaleY As Double = Me.LineHeight * 3.0
+        If pixels Then
+            scaleX = 1.0
+            scaleY = 1.0
+        End If
+        Return Me.ScrollBy(dx * scaleX, dy * scaleY)
+    End Function
+
+    ''' Scroll without moving the caret; precise deltas retain fractional points.
+    Public Function ScrollBy(dx As Double, dy As Double) As Boolean
+        Dim x As Double = Me.mScrollX
+        Dim y As Double = Me.mScrollY
+        Me.mScrollX = Math.Max(0.0, Math.Min(x + dx, Math.Max(0.0, Me.mContentWidth - Me.Width)))
+        Me.mScrollY = Math.Max(0.0, Math.Min(y + dy, Math.Max(0.0, Me.mContentHeight - Me.Height)))
+        If x = Me.mScrollX And y = Me.mScrollY Then Return False
+        Me.mRevealCaret = False
+        Me.Invalidate()
+        Me.UpdateInputLocation()
+        Return True
+    End Function
+
+    Event TextChanged()
+    Event CompositionChanged()
+
+    Handle IsEditable() As Boolean
+        Return Not Me.Document.IsReadOnly
+    End Handle
+
+    Handle InsertText(text As String, range As TextRange)
+        Me.Document.ReplaceText(text, range)
+        Me.mRevealCaret = True
+        RaiseEvent TextChanged()
+    End Handle
+
+    Handle SetIncompleteText(text As String, replacementRange As TextRange, relativeSelection As TextRange)
+        Me.mRevealCaret = True
+        If replacementRange = Nil Then
+            Me.Document.SetComposition(text, relativeSelection.Location)
+        Else
+            Me.Document.SetComposition(text, relativeSelection.Location, replacementRange.Location, replacementRange.Length)
+        End If
+        RaiseEvent CompositionChanged()
+    End Handle
+
+    Handle DiscardIncompleteText()
+        Me.Document.DiscardComposition()
+        RaiseEvent CompositionChanged()
+    End Handle
+
+    Handle SelectedRange() As TextRange
+        Return Me.Document.Selection()
+    End Handle
+
+    Handle CaretIndex() As Integer
+        Return Me.Document.Caret
+    End Handle
+
+    Handle TextLength() As Integer
+        Return String.Len(Me.Document.Text)
+    End Handle
+
+    Handle TextForRange(range As TextRange) As String
+        Return Me.Document.TextForRange(range)
+    End Handle
+
+    Handle SelectionRequested(position As Integer, extendSelection As Boolean)
+        Me.Document.MoveCaret(position, extendSelection)
+        Me.mRevealCaret = True
+    End Handle
+
+    Public Function HitTest(x As Double, y As Double) As Integer
+        If Array.Count(Me.mXs) = 0 Then Return 0
+        Dim best As Integer = 0
+        Dim distance As Double = 1.0e30
+        For i As Integer = 0 To Array.LastIndex(Me.mXs)
+            Dim dy As Double = Math.Abs(y + Me.mScrollY - (Me.mYs(i) + Me.LineHeight / 2.0))
+            Dim dx As Double = Math.Abs(x + Me.mScrollX - Me.mXs(i))
+            Dim score As Double = dy * 100000.0 + dx
+            If score < distance Then
+                best = i
+                distance = score
+            End If
+        Next
+        Return best
+    End Function
+
+    Handle CharacterAtPoint(x As Double, y As Double) As Integer
+        Return Me.HitTest(x, y)
+    End Handle
+
+    Handle RectForRange(range As TextRange) As TextInputRect
+        Dim rect As New TextInputRect()
+        If Array.Count(Me.mXs) = 0 Then Return rect
+        Dim index As Integer = Math.Min(Me.Document.Caret, Array.LastIndex(Me.mXs))
+        rect.X = Me.mXs(index) - Me.mScrollX
+        rect.Y = Me.mYs(index) - Me.mScrollY
+        If String.Len(Me.Document.IncompleteText) > 0 Then
+            rect.X = Me.mInputX
+            rect.Y = Me.mInputY
+        End If
+        rect.Height = Me.LineHeight
+        Return rect
+    End Handle
+
+    Private Function LineStart(position As Integer) As Integer
+        Dim text As String = Me.Document.Text
+        Dim index As Integer = position
+        While index > 0
+            If String.Substring(text, index - 1, 1) = "\n" Then Exit While
+            index -= 1
+        End While
+        Return index
+    End Function
+
+    Private Function LineEnd(position As Integer) As Integer
+        Dim text As String = Me.Document.Text
+        Dim index As Integer = position
+        While index < String.Len(text)
+            If String.Substring(text, index, 1) = "\n" Then Exit While
+            index += 1
+        End While
+        Return index
+    End Function
+
+    Handle DoCommand(command As String, extendSelection As Boolean) As Boolean
+        Dim before As String = Me.Document.Text
+        Dim caret As Integer = Me.Document.Caret
+        Dim selection As TextRange = Me.Document.Selection()
+        Select Case command
+        Case "selectAll"
+            Me.Document.SelectRange(0, String.Len(before))
+        Case "copy", "cut"
+            If selection.Length > 0 Then
+                Dim clip As New Clipboard()
+                clip.Text = Me.Document.TextForRange(selection)
+                clip.Close()
+                If command = "cut" Then Me.Document.ReplaceText("", selection)
+            End If
+        Case "paste"
+            Dim clip As New Clipboard()
+            If clip.HasText Then Me.Document.Insert(clip.Text)
+        Case "undo"
+            Me.Document.Undo()
+        Case "redo"
+            Me.Document.Redo()
+        Case "deleteBackward"
+            Me.Document.DeleteBackward()
+        Case "deleteForward"
+            Me.Document.DeleteForward()
+        Case "moveLeft"
+            If Not extendSelection And selection.Length > 0 Then
+                caret = selection.Location
+            Else
+                caret -= 1
+            End If
+            Me.Document.MoveCaret(caret, extendSelection)
+        Case "moveRight"
+            If Not extendSelection And selection.Length > 0 Then
+                caret = selection.Location + selection.Length
+            Else
+                caret += 1
+            End If
+            Me.Document.MoveCaret(caret, extendSelection)
+        Case "moveHome", "moveLineStart"
+            Me.Document.MoveCaret(Me.LineStart(caret), extendSelection)
+        Case "moveEnd", "moveLineEnd"
+            Me.Document.MoveCaret(Me.LineEnd(caret), extendSelection)
+        Case "moveDocumentStart"
+            Me.Document.MoveCaret(0, extendSelection)
+        Case "moveDocumentEnd"
+            Me.Document.MoveCaret(String.Len(before), extendSelection)
+        Case "moveUp", "moveDown"
+            If Array.Count(Me.mXs) > caret Then
+                Dim offset As Integer = Me.LineHeight
+                If command = "moveUp" Then offset = -offset
+                Dim position As Integer = Me.HitTest(Me.mXs(caret) - Me.mScrollX, Me.mYs(caret) - Me.mScrollY + Me.LineHeight / 2.0 + offset)
+                Me.Document.MoveCaret(position, extendSelection)
+            End If
+        Case Else
+            Return False
+        End Select
+        Me.mRevealCaret = True
+        If String.Compare(before, Me.Document.Text, True) <> 0 Then RaiseEvent TextChanged()
+        Me.Invalidate()
+        Return True
+    End Handle
+
+    Handle Draw(g As Graphics)
+        Dim text As String = Me.Document.Text
+        Dim lines As Array Of String = String.Split(text, "\n", True)
+        Array.Clear(Me.mXs)
+        Array.Clear(Me.mYs)
+        Dim y As Double = 12.0
+        Me.mContentWidth = 24.0
+        For Each line As String In lines
+            Me.mContentWidth = Math.Max(Me.mContentWidth, 24.0 + g.MeasureStringWidth(line, Me.FontName, Me.FontSize))
+            For column As Integer = 0 To String.Len(line)
+                Array.Append(Me.mXs, 12.0 + g.MeasureStringWidth(String.Left(line, column), Me.FontName, Me.FontSize))
+                Array.Append(Me.mYs, y)
+            Next
+            y += Me.LineHeight
+        Next
+        Dim caret As Integer = Me.Document.Caret
+        Dim cx As Double = Me.mXs(caret)
+        Dim cy As Double = Me.mYs(caret)
+        Me.mContentHeight = y + 12.0
+        If Me.mRevealCaret Or Me.mLastDrawnCaret <> caret Or String.Compare(Me.mLastDrawnText, text, True) <> 0 Then
+            If cx - Me.mScrollX > Me.Width - 20 Then Me.mScrollX = cx - Me.Width + 20
+            If cx - Me.mScrollX < 12 Then Me.mScrollX = Math.Max(0.0, cx - 12.0)
+            If cy - Me.mScrollY > Me.Height - Me.LineHeight - 12 Then Me.mScrollY = cy - Me.Height + Me.LineHeight + 12
+            If cy - Me.mScrollY < 12 Then Me.mScrollY = Math.Max(0.0, cy - 12.0)
+        End If
+        Me.mScrollX = Math.Max(0.0, Math.Min(Me.mScrollX, Math.Max(0.0, Me.mContentWidth - Me.Width)))
+        Me.mScrollY = Math.Max(0.0, Math.Min(Me.mScrollY, Math.Max(0.0, Me.mContentHeight - Me.Height)))
+        Me.mRevealCaret = False
+        Me.mLastDrawnText = text
+        Me.mLastDrawnCaret = caret
+        g.FillRect(0, 0, Me.Width, Me.Height, Color.White)
+        Dim selection As TextRange = Me.Document.Selection()
+        For i As Integer = selection.Location To selection.Location + selection.Length - 1
+            Dim width As Double = 8.0
+            If i + 1 < Array.Count(Me.mXs) Then
+                If Me.mYs(i) = Me.mYs(i + 1) Then width = Me.mXs(i + 1) - Me.mXs(i)
+            End If
+            g.FillRect(Me.mXs(i) - Me.mScrollX, Me.mYs(i) - Me.mScrollY, width, Me.LineHeight, Color.RGB(0.72, 0.84, 0.98))
+        Next
+        y = 12.0 - Me.mScrollY
+        For Each line As String In lines
+            g.DrawString(line, 12.0 - Me.mScrollX, y + Me.FontSize, Me.FontName, Me.FontSize, Color.Black)
+            y += Me.LineHeight
+        Next
+        cx -= Me.mScrollX
+        cy -= Me.mScrollY
+        Dim incomplete As String = Me.Document.IncompleteText
+        If String.Len(incomplete) > 0 Then
+            Dim origin As Integer = Me.Document.CompositionRange().Location
+            cx = Me.mXs(origin) - Me.mScrollX
+            cy = Me.mYs(origin) - Me.mScrollY
+            Dim width As Double = g.MeasureStringWidth(incomplete, Me.FontName, Me.FontSize)
+            g.FillRect(cx, cy, width + 4, Me.LineHeight, Color.White)
+            g.DrawString(incomplete, cx, cy + Me.FontSize, Me.FontName, Me.FontSize, Color.Black)
+            g.DrawLine(cx, cy + Me.FontSize + 3, cx + width, cy + Me.FontSize + 3, 1, Color.Blue)
+            cx += g.MeasureStringWidth(String.Left(incomplete, Me.Document.IncompleteCursor), Me.FontName, Me.FontSize)
+        End If
+        Me.mInputX = cx
+        Me.mInputY = cy
+        g.DrawLine(cx, cy, cx, cy + Me.LineHeight - 3, 1, Color.Black)
+        g.StrokeRect(0, 0, Me.Width, Me.Height, 1, Color.Gray)
+    End Handle
+End Class

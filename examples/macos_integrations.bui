@@ -1,0 +1,428 @@
+Import macos_integrations_more
+Import desktopmenus
+Import dock
+Import statusbar
+Import notifications
+Import workspace
+Import quicklook
+Import bookmarks
+Import sharing
+Import clipboardkit
+Import appearance
+Import poweractivity
+Import loginitems
+
+Class GalleryContext
+    Public Shared Property Window As IntegrationsWindow = Nil
+End Class
+
+Sub ShowGallery(tag As String, doubleClick As Boolean)
+    If GalleryContext.Window <> Nil Then
+        GalleryContext.Window.Show()
+        GalleryContext.Window.Focus()
+    End If
+End Sub
+
+Sub StatusMenuSelected(item As MenuItem)
+    If item.Tag = "show-gallery" Then ShowGallery("gallery", False)
+End Sub
+
+Function IntegrationMenuBar() As MenuBar
+    Dim bar As MenuBar = StandardDesktopMenuBar()
+    Dim help As New Menu()
+    AddMenuCommand(help, "Using This Gallery", "gallery-help")
+    bar.AddMenu(help, "Help")
+    Return bar
+End Function
+
+Window IntegrationsLayout
+    Title = "Buoy macOS Integrations"
+    Frame = (100, 80, 1180, 780)
+    Control Label heading
+        Text = "Native macOS integrations"
+        FontSize = 26.0
+        Bold = True
+        Frame = (24, 20, 1100, 36)
+    End Control
+    Control Label subtitle
+        Text = "Twelve reusable packages · system changes happen only when you choose an action"
+        Frame = (24, 62, 1100, 24)
+    End Control
+    Control Button inspectButton
+        Caption = "Appearance and platform status"
+        Frame = (24, 104, 350, 32)
+    End Control
+    Control Button dockButton
+        Caption = "Toggle Dock badge"
+        Frame = (24, 148, 350, 32)
+    End Control
+    Control Button statusButton
+        Caption = "Toggle menu-bar extra"
+        Frame = (24, 192, 350, 32)
+    End Control
+    Control Button notificationButton
+        Caption = "Read notification authorization"
+        Frame = (24, 236, 350, 32)
+    End Control
+    Control Button chooseButton
+        Caption = "Choose file for Quick Look…"
+        Frame = (24, 280, 350, 32)
+    End Control
+    Control Button revealButton
+        Caption = "Reveal selected file in Finder"
+        Frame = (24, 324, 350, 32)
+    End Control
+    Control Button shareButton
+        Caption = "Share selected file…"
+        Frame = (24, 368, 350, 32)
+    End Control
+    Control Button bookmarkButton
+        Caption = "Create and resolve file bookmark"
+        Frame = (24, 412, 350, 32)
+    End Control
+    Control Button copyButton
+        Caption = "Copy sample text and JSON"
+        Frame = (24, 456, 350, 32)
+    End Control
+    Control Button powerButton
+        Caption = "Toggle background activity"
+        Frame = (24, 500, 350, 32)
+    End Control
+    Control Button workspaceButton
+        Caption = "Open Apple Developer in browser"
+        Frame = (24, 544, 350, 32)
+    End Control
+    Control Button loginButton
+        Caption = "Read login-item status"
+        Frame = (24, 588, 350, 32)
+    End Control
+    Control Button moreButton
+        Caption = "More integrations…"
+        Frame = (24, 632, 350, 32)
+    End Control
+    Control Label fileLabel
+        Text = "Quick Look · choose a file"
+        Bold = True
+        Frame = (408, 104, 744, 24)
+    End Control
+    Control TextArea report
+        IsReadOnly = True
+        Frame = (408, 668, 744, 88)
+    End Control
+End Window
+
+Class GalleryPoller Inherits Timer
+    Public Property Owner As IntegrationsWindow
+    Public Overrides Sub NotifyTick()
+        If Me.Owner <> Nil Then Me.Owner.Poll()
+    End Sub
+End Class
+
+Public Class IntegrationsWindow Inherits IntegrationsLayout
+    Public Property MoreWindow As MoreIntegrationsWindow = Nil
+    Public Property Preview As QuickLookView = Nil
+    Public Property SelectedFile As FileSystemItem = Nil
+    Public Property Picker As SharingPicker = Nil
+    Public Property Extra As StatusBarController = Nil
+    Public Property Activity As PowerActivity = Nil
+    Public Property Notification As NotificationRequest = Nil
+    Public Property Poller As GalleryPoller
+    Public Property OriginalBadge As String
+    Public Property ChangedBadge As Boolean = False
+    Public Property SmokeTest As Boolean = False
+    Public Property SmokePassed As Boolean = False
+    Public Property StartedAt As Integer
+
+    Public Sub Constructor()
+        Super.Constructor()
+        Me.SetMinSize(1000.0, 760.0)
+        Me.MenuBar = IntegrationMenuBar()
+        Me.Preview = New QuickLookView()
+        Me.AddSubview(Me.Preview)
+        Me.Reflow(Me.Width, Me.Height)
+        Me.OriginalBadge = DockBadge()
+        Me.Extra = New StatusBarController("gallery", AddressOf ShowGallery)
+        Dim menu As New Menu()
+        AddMenuCommand(menu, "Show Integrations", "show-gallery")
+        menu.SetOnSelected(AddressOf StatusMenuSelected)
+        Dim icon As New Picture(36, 36, 2.0)
+        Dim drawing As Graphics = icon.Graphics
+        drawing.FillRoundedRect(4.0, 6.0, 8.0, 24.0, 3.0, Color.Black)
+        drawing.FillRoundedRect(15.0, 12.0, 8.0, 18.0, 3.0, Color.Black)
+        drawing.FillOval(26.0, 21.0, 7.0, 7.0, Color.Black)
+        Me.Extra.Configure("Buoy integrations", icon, Some(menu))
+        Me.Poller = New GalleryPoller()
+        Me.Poller.Owner = Me
+        Me.Poller.Period = 100
+        Me.Poller.Start()
+        Dim sample As FileSystemItem = FileSystemItem.AppResource("integration-sample.txt")
+        If sample <> Nil Then Me.SelectFile(sample)
+        Me.Inspect()
+    End Sub
+
+    Public Sub Inspect()
+        Dim theme As New AppearanceSnapshot()
+        Dim login As New MainAppLoginItem()
+        Me.report.Text = "Appearance: " + theme.ColorScheme() + " · reduce motion: " + Str(theme.ReduceMotion) + " · increase contrast: " + Str(theme.IncreaseContrast) + "\nLogin status: " + Str(login.Status().RawValue) + " (read only) · notification API available: " + Str(NotificationsSupported()) + "\nMenus and shortcuts use the desktopmenus package. Login registration and notification permission are never requested by this gallery."
+    End Sub
+
+    Public Sub SelectFile(file As FileSystemItem)
+        Me.Preview.Load(file)
+        Me.SelectedFile = file
+        Me.fileLabel.Text = "Quick Look · " + file.Name()
+    End Sub
+
+    Public Sub Poll()
+        If Me.Notification <> Nil Then
+            If Me.Notification.IsComplete Then
+                Me.report.Text = "Notification authorization status: " + Str(Me.Notification.AuthorizationStatus) + " · outcome: " + Str(Me.Notification.Outcome.RawValue)
+                If Me.Notification.ErrorMessage <> "" Then Me.report.Text += "\n" + Me.Notification.ErrorMessage
+                If Me.SmokeTest Then
+                    Me.SmokePassed = Me.Notification.Outcome = NotificationOutcome.Succeeded
+                    If Me.SmokePassed Then Print "INTEGRATIONS SMOKE PASSED: twenty-four sealed imports, native preview/bookmark/payload lifecycle, appearance/login reads and asynchronous notification status"
+                    Application.Quit()
+                End If
+                Me.Notification = Nil
+            End If
+        End If
+        If Me.SmokeTest And System.Microseconds() - Me.StartedAt > 15000000 Then
+            Print "INTEGRATIONS SMOKE FAILED: notification status timeout"
+            Application.Quit()
+        End If
+    End Sub
+
+    Public Sub RunSmoke()
+        Me.SmokeTest = True
+        Me.StartedAt = System.Microseconds()
+        If Me.MenuBar.FindMenuByTag("copy") = Nil Then Throw New Exception("Standard edit menu missing")
+        If Me.SelectedFile = Nil Then Throw New Exception("Sample resource missing")
+        Dim saved As Bytes = CreateBookmark(Me.SelectedFile)
+        Dim resolved As New ResolvedBookmark(saved)
+        If Not resolved.File.Exists() Then Throw New Exception("Bookmark did not resolve")
+        resolved.Close()
+        Dim payload As New ClipboardPayload()
+        payload.SetText("Buoy integrations fixture")
+        payload.SetJSON("application/vnd.buoy.integrations+json", Json.Parse("{\"fixture\":true}"))
+        If payload.IsCommitted Then Throw New Exception("Clipboard staging must be inert")
+        Dim picker As New SharingPicker()
+        picker.AddFile(Me.SelectedFile)
+        picker.Close()
+        If Me.Extra.IsVisible Then Throw New Exception("Status item construction must be inert")
+        Me.MoreWindow = New MoreIntegrationsWindow()
+        Me.MoreWindow.RunSmoke()
+        Me.MoreWindow.ReleaseResources()
+        Me.MoreWindow.ReleaseResources()
+        Me.MoreWindow.Close()
+        Me.Notification = NotificationRequest.ReadAuthorization()
+    End Sub
+
+    With moreButton
+        Handle Action()
+            Try
+                If Me.MoreWindow = Nil Then
+                    Me.MoreWindow = New MoreIntegrationsWindow()
+                ElseIf Me.MoreWindow.ResourcesClosed Then
+                    Me.MoreWindow = New MoreIntegrationsWindow()
+                End If
+                Me.MoreWindow.Show()
+                Me.MoreWindow.Focus()
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With inspectButton
+        Handle Action()
+            Me.Inspect()
+        End Handle
+    End With
+    With dockButton
+        Handle Action()
+            Me.ChangedBadge = Not Me.ChangedBadge
+            If Me.ChangedBadge Then
+                SetDockBadgeCount(3)
+            Else
+                SetDockBadge(Me.OriginalBadge)
+            End If
+        End Handle
+    End With
+    With statusButton
+        Handle Action()
+            Try
+                If Me.Extra.IsVisible Then
+                    Me.Extra.Hide()
+                Else
+                    Me.Extra.Show()
+                End If
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With notificationButton
+        Handle Action()
+            Try
+                If Me.Notification = Nil Then Me.Notification = NotificationRequest.ReadAuthorization()
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With chooseButton
+        Handle Action()
+            Try
+                Dim dialog As New OpenFileDialog()
+                If dialog.Show(Me) Then Me.SelectFile(dialog.SelectedItem)
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With revealButton
+        Handle Action()
+            Try
+                If Me.SelectedFile <> Nil Then RevealFiles([Me.SelectedFile])
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With shareButton
+        Handle Action()
+            Try
+                If Me.SelectedFile = Nil Then Return
+                If Me.Picker <> Nil Then Me.Picker.Close()
+                Me.Picker = New SharingPicker()
+                Me.Picker.AddFile(Me.SelectedFile)
+                Me.Picker.Show(Me.shareButton)
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With bookmarkButton
+        Handle Action()
+            Try
+                If Me.SelectedFile = Nil Then Return
+                Dim data As Bytes = CreateBookmark(Me.SelectedFile)
+                Dim resolved As New ResolvedBookmark(data)
+                Me.report.Text = "Bookmark: " + Str(data.Count) + " bytes · stale: " + Str(resolved.IsStale) + "\nResolved: " + resolved.File.NativePath
+                resolved.Close()
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With copyButton
+        Handle Action()
+            Try
+                Dim payload As New ClipboardPayload()
+                payload.SetText("Hello from Buoy's reusable macOS packages")
+                payload.SetJSON("application/vnd.buoy.integrations+json", Json.Parse("{\"source\":\"Buoy integrations\"}"))
+                payload.Commit()
+                Me.report.Text = "Copied sample text and JSON together."
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With powerButton
+        Handle Action()
+            Try
+                If Me.Activity = Nil Then
+                    Me.Activity = New PowerActivity("User-selected integration demo")
+                    Me.report.Text = "Background activity active; idle sleep is still allowed. Click again to end."
+                Else
+                    Me.Activity.Close()
+                    Me.Activity = Nil
+                    Me.report.Text = "Background activity ended."
+                End If
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With workspaceButton
+        Handle Action()
+            Try
+                If Not OpenExternalURL("https://developer.apple.com/") Then Me.report.Text = "The browser could not open the URL."
+            Catch e As Exception
+                Me.report.Text = e.Message
+            End Try
+        End Handle
+    End With
+    With loginButton
+        Handle Action()
+            Dim login As New MainAppLoginItem()
+            Me.report.Text = "Login item status: " + Str(login.Status().RawValue) + " · this gallery does not register or unregister login items."
+        End Handle
+    End With
+    Handle MenuSelected(item As MenuItem) As Boolean
+        If item.Tag = "show-gallery" Then
+            Me.Show()
+            Me.Focus()
+            Return True
+        End If
+        If item.Tag = "gallery-help" Then
+            Me.report.Text = "Choose an action on the left. Quick Look previews the selected local file.\nNotification and login buttons only read status. Sharing presents a picker; you choose whether to send.\nSee libraries/README.md and the individual package READMEs for APIs and limitations."
+            Return True
+        End If
+        Return PerformDesktopCommand(Me, item.Tag)
+    End Handle
+    Handle MenuNeedsUpdate(menu As Menu)
+        RegisterSystemMenus()
+        UpdateNativeEditingCommands(Me)
+    End Handle
+    Handle Activated()
+        RegisterSystemMenus()
+    End Handle
+    Handle Resized(width As Double, height As Double, finished As Boolean)
+        Me.Reflow(width, height)
+    End Handle
+    Public Sub Reflow(width As Integer, height As Integer)
+        If Me.Preview <> Nil Then Me.Preview.Move(408, 140, width - 432, height - 264)
+        Me.fileLabel.Move(408, 104, width - 432, 24)
+        Me.report.Move(408, height - 112, width - 432, 88)
+    End Sub
+    Handle Closed()
+        If Me.MoreWindow <> Nil Then
+            Me.MoreWindow.ReleaseResources()
+            Me.MoreWindow.Close()
+        End If
+        Me.Poller.Stop()
+        Me.Poller.Owner = Nil
+        If Me.Picker <> Nil Then Me.Picker.Close()
+        If Me.Activity <> Nil Then Me.Activity.Close()
+        Me.Extra.Close()
+        Me.Preview.Close()
+        If Me.ChangedBadge Then SetDockBadge(Me.OriginalBadge)
+        GalleryContext.Window = Nil
+    End Handle
+End Class
+
+Class GalleryApplication Inherits Application
+    Handle MenuSelected(item As MenuItem) As Boolean
+        If item.Tag = "show-gallery" Then
+            ShowGallery("gallery", False)
+            Return True
+        End If
+        Return False
+    End Handle
+End Class
+
+Sub Main(args As Array Of String)
+    #If TargetMac Then
+        Dim app As New GalleryApplication()
+        app.MenuBar = IntegrationMenuBar()
+        Dim window As New IntegrationsWindow()
+        GalleryContext.Window = window
+        window.Show()
+        If Array.Count(args) > 1 Then
+            If args(1) = "--self-test" Then window.RunSmoke()
+        End If
+        Application.Run()
+        If window.SmokeTest And Not window.SmokePassed Then Throw New Exception("Integration smoke test failed")
+    #Else
+        Print "The interactive macOS integration gallery requires macOS."
+    #End If
+End Sub

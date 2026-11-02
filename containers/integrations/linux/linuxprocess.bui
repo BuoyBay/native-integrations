@@ -1,0 +1,207 @@
+' Read-only Linux /proc inspection. All returned text and records are owned.
+Public Class ProcessInfo
+    Public Property ProcessId As Integer
+    Public Property Name As String
+    Public Property State As String
+    Public Property ParentProcessId As Integer
+    Public Property ThreadCount As Integer
+    Public Property StartTimeTicks As Integer
+    Public Property ExecutablePath As Optional Of String
+    Public Property ExecutableError As Integer
+End Class
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Private Sub RequireLinux()
+#If Not TargetLinux Then
+    Throw New UnsupportedOperationException("linuxprocess requires Linux")
+#End If
+End Sub
+
+Private Function DecimalValue(text As String) As Integer
+    If text = "" Then
+        Throw New InvalidArgumentException("Expected a nonnegative decimal integer")
+    End If
+    Dim value As Integer = 0
+    For i As Integer = 1 To String.Len(text)
+        Dim digit As Integer = String.Asc(text, i) - 48
+        If digit < 0 Or digit > 9 Then
+            Throw New InvalidArgumentException("Expected a nonnegative decimal integer")
+        End If
+        If value > (9223372036854775807 - digit) \ 10 Then
+            Throw New InvalidArgumentException("Decimal integer overflow")
+        End If
+        value = value * 10 + digit
+    Next
+    Return value
+End Function
+
+''' Parse through stat field 22; comm may contain spaces, parentheses and newlines.
+Public Function ParseStat(text As String) As ProcessInfo
+    RequireLinux()
+    Dim opening As Integer = String.IndexOf(text, "(")
+    Dim closing As Integer = String.LastIndexOf(text, ")")
+    If opening < 2 Or closing < opening Or String.Mid(text, opening, 1) <> " " Then
+        Throw New InvalidArgumentException("Malformed /proc stat record")
+    End If
+    Dim tail As String = String.Trim(String.Substring(text, closing + 1))
+    tail = String.Replace(String.Replace(tail, "\t", " "), "\n", " ")
+    Dim tokens As Array Of String = []
+    For Each token As String In String.Split(tail, " ")
+        If token <> "" Then
+            Array.Append(tokens, token)
+        End If
+    Next
+    If Array.Count(tokens) < 20 Or String.Len(tokens(0)) <> 1 Then
+        Throw New InvalidArgumentException("Incomplete /proc stat record")
+    End If
+    Dim info As New ProcessInfo
+    info.ProcessId = DecimalValue(String.Trim(String.Left(text, opening)))
+    If info.ProcessId < 1 Or info.ProcessId > 2147483647 Then
+        Throw New InvalidArgumentException("Invalid process ID in stat record")
+    End If
+    info.Name = String.Substring(text, opening + 1, closing - opening - 1)
+    info.State = tokens(0)
+    info.ParentProcessId = DecimalValue(tokens(1))
+    info.ThreadCount = DecimalValue(tokens(17))
+    info.StartTimeTicks = DecimalValue(tokens(19))
+    Return info
+End Function
+
+#If TargetLinux Then
+Private Optional Declare Function COpen Lib "c" Alias "fopen" (procPath As CString, mode As CString) As Ptr
+Private Optional Declare Function CRead Lib "c" Alias "fread" (buffer As Ptr, size As UInt64, count As UInt64, stream As Ptr) As UInt64
+Private Optional Declare Function CError Lib "c" Alias "ferror" (stream As Ptr) As Int32
+Private Optional Declare Function CClose Lib "c" Alias "fclose" (stream As Ptr) As Int32
+Private Optional Declare Function CAllocate Lib "c" Alias "calloc" (count As UInt64, size As UInt64) As Ptr
+Private Optional Declare Sub CFree Lib "c" Alias "free" (buffer As Ptr)
+Private Optional Declare Function CReadLink Lib "c" Alias "readlink" (procPath As CString, buffer As Ptr, capacity As UInt64) As Int64
+Private Optional Declare Function COpenDirectory Lib "c" Alias "opendir" (procPath As CString) As Ptr
+Private Optional Declare Function CReadDirectory Lib "c" Alias "readdir" (directory As Ptr) As Ptr
+Private Optional Declare Function CCloseDirectory Lib "c" Alias "closedir" (directory As Ptr) As Int32
+Private Optional Declare Function CErrnoAddress Lib "c" Alias "__errno_location" () As Ptr
+Private Optional Declare Function CCopyOut Lib "c" Alias "memcpy" (ByRef value As Int32, source As Ptr, size As UInt64) As Ptr
+Private Optional Declare Function CCopyIn Lib "c" Alias "memcpy" (destination As Ptr, ByRef value As Int32, size As UInt64) As Ptr
+
+Private Function NativeError() As Integer
+    Dim code As Int32 = 0
+    CCopyOut(code, CErrnoAddress(), 4)
+    Return code
+End Function
+
+Private Sub ClearError()
+    Dim code As Int32 = 0
+    CCopyIn(CErrnoAddress(), code, 4)
+End Sub
+
+Private Sub Fail(operation As String)
+    Dim code As Integer = NativeError()
+    Throw New RuntimeException(operation + " failed (errno " + Str(code) + ")", code)
+End Sub
+
+Private Function ReadStatFile(procPath As String) As String
+    Dim stream As Ptr = COpen(CType(procPath, CString), CType("rb", CString))
+    If stream = Nil Then
+        Fail("fopen " + procPath)
+    End If
+    Try
+        Dim buffer As Ptr = CAllocate(65537, 1)
+        If buffer = Nil Then
+            Throw New RuntimeException("Unable to allocate stat buffer")
+        End If
+        Try
+            Dim count As UInt64 = CRead(buffer, 1, 65536, stream)
+            If CError(stream) <> 0 Then
+                Fail("fread " + procPath)
+            End If
+            If count = 65536 Then
+                Throw New RuntimeException("/proc stat record exceeded 65535 bytes")
+            End If
+            Return CType(CType(buffer, CString), String)
+        Finally
+            CFree(buffer)
+        End Try
+    Finally
+        CClose(stream)
+    End Try
+End Function
+#End If
+
+''' Unsorted PID snapshot from this mount/PID namespace; entries can disappear immediately.
+Public Function ProcessIds() As Array Of Integer
+    RequireLinux()
+    Dim ids As Array Of Integer = []
+#If TargetLinux Then
+    Dim directory As Ptr = COpenDirectory(CType("/proc", CString))
+    If directory = Nil Then
+        Fail("opendir /proc")
+    End If
+    Try
+        While True
+            ClearError()
+            Dim entry As Ptr = CReadDirectory(directory)
+            If entry = Nil Then
+                If NativeError() <> 0 Then
+                    Fail("readdir /proc")
+                End If
+                Exit While
+            End If
+            ' glibc 64-bit Linux struct dirent: d_name follows 8+8+2+1 bytes.
+            Dim nameAddress As Ptr = CType(CType(entry, Integer) + 19, Ptr)
+            Dim name As String = CType(CType(nameAddress, CString), String)
+            If name <> "" Then
+                Dim first As Integer = String.Asc(name)
+                If first >= 48 And first <= 57 Then
+                    Dim pid As Integer = DecimalValue(name)
+                    If pid > 0 And pid <= 2147483647 Then
+                        Array.Append(ids, pid)
+                    End If
+                End If
+            End If
+        End While
+    Finally
+        CCloseDirectory(directory)
+    End Try
+#End If
+    Return ids
+End Function
+
+''' Read stat then exe. ExecutableError preserves readlink errno without losing stat data.
+Public Function ReadProcess(pid As Integer) As ProcessInfo
+    RequireLinux()
+    If pid < 1 Or pid > 2147483647 Then
+        Throw New InvalidArgumentException("PID must be between 1 and 2147483647")
+    End If
+#If TargetLinux Then
+    Dim basePath As String = "/proc/" + Str(pid)
+    Dim info As ProcessInfo = ParseStat(ReadStatFile(basePath + "/stat"))
+    If info.ProcessId <> pid Then
+        Throw New RuntimeException("/proc stat PID did not match request")
+    End If
+    Dim buffer As Ptr = CAllocate(65537, 1)
+    If buffer = Nil Then
+        Throw New RuntimeException("Unable to allocate executable path buffer")
+    End If
+    Try
+        Dim count As Int64 = CReadLink(CType(basePath + "/exe", CString), buffer, 65536)
+        If count < 0 Then
+            info.ExecutableError = NativeError()
+        ElseIf count = 65536 Then
+            Throw New RuntimeException("Executable path exceeded 65535 bytes")
+        Else
+            info.ExecutablePath = Some(CType(CType(buffer, CString), String))
+        End If
+    Finally
+        CFree(buffer)
+    End Try
+    Return info
+#Else
+    Return Nil
+#End If
+End Function

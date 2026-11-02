@@ -1,0 +1,46 @@
+Import texteditor
+
+Class DemoEditor Inherits TextEditor
+    Public Property HostWindow As Window
+    Private Sub RefreshTitle()
+        If Me.HostWindow = Nil Then Exit Sub
+        Dim prefix As String = "Buoy TextInputCanvas: "
+        If String.Len(Me.Document.IncompleteText) > 0 Then prefix = "Buoy TextInputCanvas (composing): "
+        Me.HostWindow.Title = prefix + Me.Document.Text
+    End Sub
+    Handle TextChanged()
+        Me.RefreshTitle()
+        Print "TEXT: " + Me.Document.Text
+    End Handle
+    Handle CompositionChanged()
+        Me.RefreshTitle()
+    End Handle
+End Class
+
+Class DemoWindow Inherits Window
+    Public Property Editor As DemoEditor
+    Handle Closed()
+        Application.Quit()
+    End Handle
+    Handle Closing() As Boolean
+        Me.Editor.CloseInputMethod()
+        Return False
+    End Handle
+End Class
+
+Sub Main()
+    Dim window As New DemoWindow()
+    window.Title = "Buoy TextInputCanvas"
+    window.Move(100, 100, 760, 420)
+    Dim editor As New DemoEditor()
+    editor.HostWindow = window
+    window.Editor = editor
+    editor.Move(20, 20, 720, 340)
+    editor.Document.Text = "Custom text input for Buoy.\nSelect, type, compose, copy and paste."
+    window.AddSubview(editor)
+    editor.OpenInputMethod()
+    window.Show()
+    editor.Focus()
+    Application.Run()
+    editor.CloseInputMethod()
+End Sub

@@ -1,0 +1,218 @@
+' Native Windows integrations for Buoy 0.72.0 (x64 and ARM64).
+' No native handles escape this module; all returned text is owned UTF-8.
+
+Sequential Structure MemoryStatus
+    Size As UInt32
+    LoadPercent As UInt32
+    TotalPhysicalBytes As UInt64
+    AvailablePhysicalBytes As UInt64
+    CommitLimitBytes As UInt64
+    AvailableCommitBytes As UInt64
+    TotalVirtualBytes As UInt64
+    AvailableVirtualBytes As UInt64
+    Reserved As UInt64
+End Structure
+
+#If TargetWindows Then
+Private Declare Function NativeProcessId Lib "kernel32" Alias "GetCurrentProcessId" () As UInt32
+Private Declare Function NativeUptime Lib "kernel32" Alias "GetTickCount64" () As UInt64
+Private Declare Function NativeCounter Lib "kernel32" Alias "QueryPerformanceCounter" (ByRef ticks As Int64) As Int32
+Private Declare Function NativeFrequency Lib "kernel32" Alias "QueryPerformanceFrequency" (ByRef ticks As Int64) As Int32
+Private Optional Declare Function NativeMemory Lib "kernel32" Alias "GlobalMemoryStatusEx" (ByRef status As MemoryStatus) As Int32
+Private Optional Declare Function NativeSystemDirectory Lib "kernel32" Alias "GetSystemDirectoryW" (buffer As Ptr, capacity As UInt32) As UInt32
+Private Declare Function NativeTempDirectory Lib "kernel32" Alias "GetTempPathW" (capacity As UInt32, buffer As Ptr) As UInt32
+Private Declare Function NativeGetEnvironment Lib "kernel32" Alias "GetEnvironmentVariableW" (name As Ptr, buffer As Ptr, capacity As UInt32) As UInt32
+Private Declare Function NativeSetEnvironment Lib "kernel32" Alias "SetEnvironmentVariableW" (name As Ptr, value As Ptr) As Int32
+Private Declare Function NativeLastError Lib "kernel32" Alias "GetLastError" () As UInt32
+Private Declare Sub NativeSetLastError Lib "kernel32" Alias "SetLastError" (code As UInt32)
+
+Private Sub FailNative(operation As String)
+    Dim code As Integer = NativeLastError()
+    Throw New RuntimeException(operation + " failed (Win32 error " + Str(code) + ")", code)
+End Sub
+#End If
+
+Private Sub RequireWindows()
+    #If Not TargetWindows Then
+        Throw New UnsupportedOperationException("WinSystem requires Windows")
+    #End If
+End Sub
+
+Private Function WideInput(value As String) As Bytes
+    Dim utf8 As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To utf8.Count - 1
+        If utf8.Item(i) = 0 Then
+            Throw New InvalidArgumentException("Windows text cannot contain NUL")
+        End If
+    Next
+    Dim encoded As Bytes = value.AsUTF16LE()
+    encoded.Append(0)
+    encoded.Append(0)
+    Return encoded
+End Function
+
+Private Function WideBuffer() As Bytes
+    ' Full documented environment-variable capacity, including NUL.
+    Dim encoded As New Bytes(65536)
+    For i As Integer = 1 To 65536
+        encoded.Append(0)
+    Next
+    Return encoded
+End Function
+
+Private Function WideOutput(buffer As Bytes, units As Integer) As String
+    If units < 0 Or units >= 32768 Then
+        Throw New RuntimeException("Windows output exceeded 32767 UTF-16 code units")
+    End If
+    Dim exact As New Bytes(units * 2)
+    exact.Append(buffer.DataPtr(), units * 2)
+    Return String.FromUTF16LE(exact)
+End Function
+
+Public Function IsSupported() As Boolean
+    #If TargetWindows Then
+        Return True
+    #Else
+        Return False
+    #End If
+End Function
+
+Public Function ProcessId() As Integer
+    RequireWindows()
+    #If TargetWindows Then
+        Return NativeProcessId()
+    #Else
+        Return 0
+    #End If
+End Function
+
+Public Function UptimeMilliseconds() As UInt64
+    RequireWindows()
+    #If TargetWindows Then
+        Return NativeUptime()
+    #Else
+        Return 0
+    #End If
+End Function
+
+Public Function PerformanceTicks() As Integer
+    RequireWindows()
+    #If TargetWindows Then
+        Dim ticks As Int64 = 0
+        If NativeCounter(ticks) = 0 Then
+            FailNative("QueryPerformanceCounter")
+        End If
+        Return ticks
+    #Else
+        Return 0
+    #End If
+End Function
+
+Public Function PerformanceFrequency() As Integer
+    RequireWindows()
+    #If TargetWindows Then
+        Dim ticks As Int64 = 0
+        If NativeFrequency(ticks) = 0 Then
+            FailNative("QueryPerformanceFrequency")
+        End If
+        Return ticks
+    #Else
+        Return 0
+    #End If
+End Function
+
+Public Function ReadMemoryStatus() As MemoryStatus
+    RequireWindows()
+    Dim status As MemoryStatus
+    #If TargetWindows Then
+        ' Two DWORDs followed by seven DWORDLONGs: 64 bytes on x64/ARM64.
+        status.Size = 64
+        If NativeMemory(status) = 0 Then
+            FailNative("GlobalMemoryStatusEx")
+        End If
+    #End If
+    Return status
+End Function
+
+Public Function SystemDirectory() As String
+    RequireWindows()
+    #If TargetWindows Then
+        Dim buffer As Bytes = WideBuffer()
+        Dim count As Integer = NativeSystemDirectory(buffer.DataPtr(), 32768)
+        If count = 0 Then
+            FailNative("GetSystemDirectoryW")
+        End If
+        Return WideOutput(buffer, count)
+    #Else
+        Return ""
+    #End If
+End Function
+
+Public Function TemporaryDirectory() As String
+    RequireWindows()
+    #If TargetWindows Then
+        Dim buffer As Bytes = WideBuffer()
+        Dim count As Integer = NativeTempDirectory(32768, buffer.DataPtr())
+        If count = 0 Then
+            FailNative("GetTempPathW")
+        End If
+        Return WideOutput(buffer, count)
+    #Else
+        Return ""
+    #End If
+End Function
+
+Private Sub ValidateEnvironmentName(name As String)
+    If name = "" Or String.Contains(name, "=") Then
+        Throw New InvalidArgumentException("Environment name must be nonempty and contain no equals sign")
+    End If
+End Sub
+
+Public Function EnvironmentValue(name As String) As Optional Of String
+    RequireWindows()
+    ValidateEnvironmentName(name)
+    #If TargetWindows Then
+        Dim wideName As Bytes = WideInput(name)
+        Dim buffer As Bytes = WideBuffer()
+        ' Distinguish an empty value (success) from a missing variable (203).
+        NativeSetLastError(0)
+        Dim count As Integer = NativeGetEnvironment(wideName.DataPtr(), buffer.DataPtr(), 32768)
+        If count = 0 Then
+            Dim code As Integer = NativeLastError()
+            If code = 203 Then
+                Return None
+            ElseIf code <> 0 Then
+                Throw New RuntimeException("GetEnvironmentVariableW failed", code)
+            End If
+        End If
+        Return Some(WideOutput(buffer, count))
+    #Else
+        Return None
+    #End If
+End Function
+
+Public Sub SetEnvironmentValue(name As String, value As String)
+    RequireWindows()
+    ValidateEnvironmentName(name)
+    #If TargetWindows Then
+        Dim wideName As Bytes = WideInput(name)
+        Dim wideValue As Bytes = WideInput(value)
+        If wideValue.Count > 65536 Then
+            Throw New InvalidArgumentException("Environment value exceeds 32767 UTF-16 code units")
+        End If
+        If NativeSetEnvironment(wideName.DataPtr(), wideValue.DataPtr()) = 0 Then
+            FailNative("SetEnvironmentVariableW")
+        End If
+    #End If
+End Sub
+
+Public Sub RemoveEnvironmentValue(name As String)
+    RequireWindows()
+    ValidateEnvironmentName(name)
+    #If TargetWindows Then
+        Dim wideName As Bytes = WideInput(name)
+        If NativeSetEnvironment(wideName.DataPtr(), Nil) = 0 Then
+            FailNative("SetEnvironmentVariableW(delete)")
+        End If
+    #End If
+End Sub

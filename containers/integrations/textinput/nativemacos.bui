@@ -1,0 +1,553 @@
+Import textmodel
+Import inputbridge
+
+#If TargetMac Then
+Sequential Structure MacRange
+    Location As Integer
+    Length As Integer
+End Structure
+Sequential Structure MacPoint
+    X As Double
+    Y As Double
+End Structure
+Sequential Structure MacSize
+    Width As Double
+    Height As Double
+End Structure
+Sequential Structure MacRect
+    Origin As MacPoint
+    Size As MacSize
+End Structure
+Delegate Sub MacKeyAction(receiver As Ptr, methodSelector As Ptr, keyEvent As Ptr)
+Delegate Sub MacInsertAction(receiver As Ptr, methodSelector As Ptr, value As Ptr, replacement As MacRange)
+Delegate Sub MacMarkedAction(receiver As Ptr, methodSelector As Ptr, value As Ptr, selection As MacRange, replacement As MacRange)
+Delegate Sub MacVoidAction(receiver As Ptr, methodSelector As Ptr)
+Delegate Sub MacCommandAction(receiver As Ptr, methodSelector As Ptr, command As Ptr)
+Delegate Function MacBoolAction(receiver As Ptr, methodSelector As Ptr) As UInt8
+Delegate Function MacRangeAction(receiver As Ptr, methodSelector As Ptr) As MacRange
+Delegate Function MacObjectAction(receiver As Ptr, methodSelector As Ptr) As Ptr
+Delegate Function MacSubstringAction(receiver As Ptr, methodSelector As Ptr, range As MacRange, actual As Ptr) As Ptr
+Delegate Function MacRectAction(receiver As Ptr, methodSelector As Ptr, range As MacRange, actual As Ptr) As MacRect
+Delegate Function MacIndexAction(receiver As Ptr, methodSelector As Ptr, point As MacPoint) As Integer
+
+Private Declare Function ObjClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function ObjectClass Lib "objc" Alias "object_getClass" (instance As Ptr) As Ptr
+Private Declare Function SetClass Lib "objc" Alias "object_setClass" (instance As Ptr, cls As Ptr) As Ptr
+Private Declare Function AllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Sub DisposeClass Lib "objc" Alias "objc_disposeClassPair" (cls As Ptr)
+Private Declare Sub RegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function RegisterSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function SelectorName Lib "objc" Alias "sel_getName" (methodSelector As Ptr) As String
+Private Declare Function AddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, implementation As Ptr, encoding As String) As UInt8
+Private Declare Function GetMethod Lib "objc" Alias "class_getMethodImplementation" (cls As Ptr, methodSelector As Ptr) As Ptr
+Private Declare Function GetProtocol Lib "objc" Alias "objc_getProtocol" (name As String) As Ptr
+Private Declare Function AddProtocol Lib "objc" Alias "class_addProtocol" (cls As Ptr, protocol As Ptr) As UInt8
+Private Declare Function NativeString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function UTF8String Lib "Foundation" Selector "UTF8String" (value As Ptr) As String
+Private Declare Function PlainString Lib "Foundation" Selector "string" (value As Ptr) As Ptr
+Private Declare Function Responds Lib "Foundation" Selector "respondsToSelector:" (value As Ptr, methodSelector As Ptr) As Boolean
+Private Declare Function Allocate Lib "Foundation" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function InitAttributed Lib "Foundation" Selector "initWithString:" (instance As Ptr, value As Ptr) As Ptr
+Private Declare Function Autorelease Lib "Foundation" Selector "autorelease" (instance As Ptr) As Ptr
+Private Declare Function EmptyArray Lib "Foundation" Selector "array" (cls As Ptr) As Ptr
+Private Declare Function SingleArray Lib "Foundation" Selector "arrayWithObject:" (cls As Ptr, instance As Ptr) As Ptr
+Private Declare Sub Interpret Lib "AppKit" Selector "interpretKeyEvents:" (view As Ptr, events As Ptr)
+Private Declare Function EventCharacters Lib "AppKit" Selector "characters" (keyEvent As Ptr) As Ptr
+Private Declare Function EventFlags Lib "AppKit" Selector "modifierFlags" (keyEvent As Ptr) As Integer
+Private Declare Function InputContext Lib "AppKit" Selector "inputContext" (view As Ptr) As Ptr
+Private Declare Sub DiscardMarked Lib "AppKit" Selector "discardMarkedText" (context As Ptr)
+Private Declare Sub InvalidateCoordinates Lib "AppKit" Selector "invalidateCharacterCoordinates" (context As Ptr)
+Private Declare Function ViewWindow Lib "AppKit" Selector "window" (view As Ptr) As Ptr
+Private Declare Function IsFlipped Lib "AppKit" Selector "isFlipped" (view As Ptr) As Boolean
+Private Declare Function ViewBounds Lib "AppKit" Selector "bounds" (view As Ptr) As MacRect
+Private Declare Function RectToWindow Lib "AppKit" Selector "convertRect:toView:" (view As Ptr, rect As MacRect, other As Ptr) As MacRect
+Private Declare Function RectToScreen Lib "AppKit" Selector "convertRectToScreen:" (window As Ptr, rect As MacRect) As MacRect
+Private Declare Function PointFromScreen Lib "AppKit" Selector "convertPointFromScreen:" (window As Ptr, point As MacPoint) As MacPoint
+Private Declare Function PointFromWindow Lib "AppKit" Selector "convertPoint:fromView:" (view As Ptr, point As MacPoint, other As Ptr) As MacPoint
+Private Declare Sub CopyMemory Lib "c" Alias "memcpy" (destination As Ptr, source As Ptr, count As Integer)
+
+Class MacInputs
+    Public Shared Property Items As Array Of MacInput = []
+End Class
+
+Public Class MacInput
+    Public Property Widget As Ptr = Nil
+    Public Property Callbacks As InputCallbacks
+    Public Property OriginalClass As Ptr = Nil
+    Public Property Marked As String = ""
+    Public Property Replacement As TextRange
+    Public Property MarkedCursor As Integer = 0
+    Public Property LastError As String = ""
+    Private Property mID As Integer = -1
+
+    Public Sub Open(widget As Ptr, callbacks As InputCallbacks)
+        If Me.Widget <> Nil Then Exit Sub
+        If widget = Nil Then Throw New InvalidArgumentException("macOS input requires a native NSView")
+        Me.OriginalClass = ObjectClass(widget)
+        Dim name As String = "BuoyTextInputClient_" + Str(CType(Me.OriginalClass, Integer))
+        Dim cls As Ptr = ObjClass(name)
+        If cls = Nil Then
+            cls = AllocateClass(Me.OriginalClass, name, 0)
+            If cls = Nil Then Throw New RuntimeException("objc_allocateClassPair failed")
+            Try
+                MacInstallMethods(cls)
+                RegisterClass(cls)
+            Catch e As Exception
+                DisposeClass(cls)
+                Throw e
+            End Try
+        End If
+        Me.Widget = widget
+        Me.Callbacks = callbacks
+        Me.mID = -1
+        For i As Integer = 0 To Array.LastIndex(MacInputs.Items)
+            If MacInputs.Items(i) = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID = -1 Then
+            Me.mID = Array.Count(MacInputs.Items)
+            Array.Append(MacInputs.Items, Me)
+        Else
+            MacInputs.Items(Me.mID) = Me
+        End If
+        SetClass(widget, cls)
+    End Sub
+
+    Private Sub ClearMark()
+        Me.Marked = ""
+        Me.Replacement = Nil
+        Me.MarkedCursor = 0
+        Me.Callbacks.DeliverCancel()
+    End Sub
+
+    Public Sub Cancel()
+        If Me.Widget = Nil Then Exit Sub
+        Me.ClearMark()
+        DiscardMarked(InputContext(Me.Widget))
+    End Sub
+
+    Public Sub Close()
+        If Me.Widget = Nil Then Exit Sub
+        Me.Cancel()
+        SetClass(Me.Widget, Me.OriginalClass)
+        Me.Widget = Nil
+        MacInputs.Items(Me.mID) = Nil
+        Me.mID = -1
+    End Sub
+
+    Public Sub UpdateLocation()
+        If Me.Widget <> Nil Then InvalidateCoordinates(InputContext(Me.Widget))
+    End Sub
+
+    Public Function VirtualText() As String
+        Dim state As InputSnapshot = Me.Callbacks.GetSnapshot()
+        If Me.Replacement = Nil Then Return state.Text
+        Return String.Left(state.Text, Me.Replacement.Location) + Me.Marked + String.Substring(state.Text, Me.Replacement.Location + Me.Replacement.Length)
+    End Function
+
+    Private Function MapPosition(position As Integer, endPoint As Boolean) As Integer
+        If Me.Replacement = Nil Then Return position
+        If position <= Me.Replacement.Location Then Return position
+        Dim markedEnd As Integer = Me.Replacement.Location + String.Len(Me.Marked)
+        If position >= markedEnd Then Return position - String.Len(Me.Marked) + Me.Replacement.Length
+        If endPoint Then Return Me.Replacement.Location + Me.Replacement.Length
+        Return Me.Replacement.Location
+    End Function
+
+    Public Function DocumentRange(range As MacRange) As TextRange
+        Dim state As InputSnapshot = Me.Callbacks.GetSnapshot()
+        If range.Location = 9223372036854775807 Or range.Location < 0 Then
+            If Me.Replacement <> Nil Then Return New TextRange(Me.Replacement.Location, Me.Replacement.Length)
+            Return New TextRange(state.Selection.Location, state.Selection.Length)
+        End If
+        Dim value As String = Me.VirtualText()
+        Dim total As Integer = UTF16Offset(value, String.Len(value))
+        Dim start As Integer = Math.Min(range.Location, total)
+        Dim count As Integer = Math.Max(0, Math.Min(range.Length, total - start))
+        Dim first As Integer = Me.MapPosition(CodepointOffset(value, start), False)
+        Dim last As Integer = Me.MapPosition(CodepointOffset(value, start + count), True)
+        Return New TextRange(first, Math.Max(0, last - first))
+    End Function
+
+    Public Sub Insert(value As String, range As MacRange)
+        ' Preserve NSTextInputClient's distinction: NSNotFound without marked text
+        ' means ordinary typing at the selection, not an explicit replacement.
+        Dim implicitSelection As Boolean = range.Location = 9223372036854775807 And Me.Replacement = Nil
+        Dim replacement As TextRange = Me.DocumentRange(range)
+        Me.Marked = ""
+        Me.Replacement = Nil
+        Me.MarkedCursor = 0
+        If implicitSelection Then
+            Me.Callbacks.DeliverCommit(value, -1, 0)
+        Else
+            Me.Callbacks.DeliverCommit(value, replacement.Location, replacement.Length)
+        End If
+    End Sub
+
+    Public Sub SetMarked(value As String, selection As MacRange, range As MacRange)
+        If String.Len(value) = 0 Then
+            Me.ClearMark()
+            Exit Sub
+        End If
+        Dim state As InputSnapshot = Me.Callbacks.GetSnapshot()
+        If Not state.Editable Then
+            Me.Cancel()
+            Exit Sub
+        End If
+        Me.Replacement = Me.DocumentRange(range)
+        Me.Marked = value
+        Me.MarkedCursor = CodepointOffset(value, Math.Max(0, selection.Location))
+        Me.Callbacks.DeliverPreedit(value, Me.Replacement.Location, Me.Replacement.Length, Me.MarkedCursor)
+    End Sub
+End Class
+
+Private Function MacFind(receiver As Ptr) As MacInput
+    For Each input As MacInput In MacInputs.Items
+        If input <> Nil Then
+            If input.Widget = receiver Then Return input
+        End If
+    Next
+    Return Nil
+End Function
+
+Private Function MacText(value As Ptr) As String
+    If Responds(value, RegisterSelector("string")) Then value = PlainString(value)
+    Return UTF8String(value)
+End Function
+
+Private Sub MacActual(destination As Ptr, range As MacRange)
+    If destination <> Nil Then CopyMemory(destination, CType(range, Ptr), 16)
+End Sub
+
+Private Sub MacAddMethod(cls As Ptr, methodSelector As Ptr, implementation As Ptr, encoding As String)
+    If AddMethod(cls, methodSelector, implementation, encoding) = 0 Then
+        Throw New RuntimeException("Could not install NSTextInputClient method " + SelectorName(methodSelector))
+    End If
+End Sub
+
+Private Sub MacInstallMethods(cls As Ptr)
+    Dim key As MacKeyAction = AddressOf MacKey
+    Dim insert As MacInsertAction = AddressOf MacInsert
+    Dim marked As MacMarkedAction = AddressOf MacSetMarked
+    Dim unmark As MacVoidAction = AddressOf MacUnmark
+    Dim hasMarked As MacBoolAction = AddressOf MacHasMarked
+    Dim markedRange As MacRangeAction = AddressOf MacMarkedRange
+    Dim selectedRange As MacRangeAction = AddressOf MacSelectedRange
+    Dim attributes As MacObjectAction = AddressOf MacAttributes
+    Dim substring As MacSubstringAction = AddressOf MacSubstring
+    Dim rect As MacRectAction = AddressOf MacFirstRect
+    Dim index As MacIndexAction = AddressOf MacCharacterIndex
+    Dim command As MacCommandAction = AddressOf MacDoCommand
+    Dim gained As MacBoolAction = AddressOf MacBecomeFirst
+    Dim lost As MacBoolAction = AddressOf MacResignFirst
+    MacAddMethod(cls, RegisterSelector("keyDown:"), CType(key, Ptr), "v@:@")
+    MacAddMethod(cls, RegisterSelector("insertText:replacementRange:"), CType(insert, Ptr), "v@:@{_NSRange=QQ}")
+    MacAddMethod(cls, RegisterSelector("setMarkedText:selectedRange:replacementRange:"), CType(marked, Ptr), "v@:@{_NSRange=QQ}{_NSRange=QQ}")
+    MacAddMethod(cls, RegisterSelector("unmarkText"), CType(unmark, Ptr), "v@:")
+    MacAddMethod(cls, RegisterSelector("hasMarkedText"), CType(hasMarked, Ptr), "C@:")
+    MacAddMethod(cls, RegisterSelector("markedRange"), CType(markedRange, Ptr), "{_NSRange=QQ}@:")
+    MacAddMethod(cls, RegisterSelector("selectedRange"), CType(selectedRange, Ptr), "{_NSRange=QQ}@:")
+    MacAddMethod(cls, RegisterSelector("validAttributesForMarkedText"), CType(attributes, Ptr), "@@:")
+    MacAddMethod(cls, RegisterSelector("attributedSubstringForProposedRange:actualRange:"), CType(substring, Ptr), "@@:{_NSRange=QQ}^{_NSRange=QQ}")
+    MacAddMethod(cls, RegisterSelector("firstRectForCharacterRange:actualRange:"), CType(rect, Ptr), "{CGRect={CGPoint=dd}{CGSize=dd}}@:{_NSRange=QQ}^{_NSRange=QQ}")
+    MacAddMethod(cls, RegisterSelector("characterIndexForPoint:"), CType(index, Ptr), "Q@:{CGPoint=dd}")
+    MacAddMethod(cls, RegisterSelector("doCommandBySelector:"), CType(command, Ptr), "v@::")
+    MacAddMethod(cls, RegisterSelector("becomeFirstResponder"), CType(gained, Ptr), "C@:")
+    MacAddMethod(cls, RegisterSelector("resignFirstResponder"), CType(lost, Ptr), "C@:")
+    Dim protocol As Ptr = GetProtocol("NSTextInputClient")
+    If protocol = Nil Then Throw New RuntimeException("NSTextInputClient protocol is unavailable")
+    AddProtocol(cls, protocol)
+End Sub
+
+Private Sub MacKey(receiver As Ptr, methodSelector As Ptr, keyEvent As Ptr)
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Exit Sub
+    Try
+        ' Command events expose the shortcut's Roman character even when the
+        ' input layout's unmodified character is Hangul (for example z versus ㅋ).
+        Dim shortcut As String = String.LCase(MacText(EventCharacters(keyEvent)))
+        Dim editingShortcut As Boolean = shortcut = "a" Or shortcut = "c" Or shortcut = "x" Or shortcut = "v" Or shortcut = "z" Or shortcut = "y"
+        ' Keep editor shortcuts in Buoy; let AppKit interpret Command+Arrow navigation.
+        If (EventFlags(keyEvent) And 1048576) <> 0 And editingShortcut Then
+            Dim original As MacKeyAction = CType(GetMethod(input.OriginalClass, methodSelector), MacKeyAction)
+            original(receiver, methodSelector, keyEvent)
+        Else
+            Interpret(receiver, SingleArray(ObjClass("NSArray"), keyEvent))
+        End If
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+End Sub
+
+Private Sub MacInsert(receiver As Ptr, methodSelector As Ptr, value As Ptr, replacement As MacRange)
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Exit Sub
+    Try
+        input.Insert(MacText(value), replacement)
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+End Sub
+
+Private Sub MacSetMarked(receiver As Ptr, methodSelector As Ptr, value As Ptr, selection As MacRange, replacement As MacRange)
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Exit Sub
+    Try
+        input.SetMarked(MacText(value), selection, replacement)
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+End Sub
+
+Private Sub MacUnmark(receiver As Ptr, methodSelector As Ptr)
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Exit Sub
+    Try
+        If input.Replacement <> Nil Then
+            Dim range As MacRange = { Location: 9223372036854775807, Length: 0 }
+            input.Insert(input.Marked, range)
+        End If
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+End Sub
+
+Private Function MacHasMarked(receiver As Ptr, methodSelector As Ptr) As UInt8
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return 0
+    If input.Replacement <> Nil And String.Len(input.Marked) > 0 Then Return 1
+    Return 0
+End Function
+
+Private Function MacMarkedRange(receiver As Ptr, methodSelector As Ptr) As MacRange
+    Dim range As MacRange = { Location: 9223372036854775807, Length: 0 }
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return range
+    Try
+        If input.Replacement <> Nil Then
+            Dim state As InputSnapshot = input.Callbacks.GetSnapshot()
+            range.Location = UTF16Offset(state.Text, input.Replacement.Location)
+            range.Length = UTF16Offset(input.Marked, String.Len(input.Marked))
+        End If
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+    Return range
+End Function
+
+Private Function MacSelectedRange(receiver As Ptr, methodSelector As Ptr) As MacRange
+    Dim range As MacRange
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return range
+    Try
+        Dim state As InputSnapshot = input.Callbacks.GetSnapshot()
+        If input.Replacement <> Nil Then
+            range.Location = UTF16Offset(state.Text, input.Replacement.Location) + UTF16Offset(input.Marked, input.MarkedCursor)
+        Else
+            range.Location = UTF16Offset(state.Text, state.Selection.Location)
+            range.Length = UTF16Offset(state.Text, state.Selection.Location + state.Selection.Length) - range.Location
+        End If
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+    Return range
+End Function
+
+Private Function MacAttributes(receiver As Ptr, methodSelector As Ptr) As Ptr
+    Return EmptyArray(ObjClass("NSArray"))
+End Function
+
+Private Function MacSubstring(receiver As Ptr, methodSelector As Ptr, range As MacRange, actual As Ptr) As Ptr
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return Nil
+    Try
+        Dim value As String = input.VirtualText()
+        Dim total As Integer = UTF16Offset(value, String.Len(value))
+        If range.Location < 0 Or range.Location > total Then Return Nil
+        Dim first As Integer = CodepointOffset(value, range.Location)
+        Dim last As Integer = CodepointOffset(value, range.Location + Math.Max(0, Math.Min(range.Length, total - range.Location)))
+        Dim exact As MacRange
+        exact.Location = UTF16Offset(value, first)
+        exact.Length = UTF16Offset(value, last) - exact.Location
+        MacActual(actual, exact)
+        Dim nsValue As Ptr = NativeString(ObjClass("NSString"), String.Substring(value, first, last - first))
+        Return Autorelease(InitAttributed(Allocate(ObjClass("NSAttributedString")), nsValue))
+    Catch e As Exception
+        input.LastError = e.Message
+        Return Nil
+    End Try
+End Function
+
+Private Function MacFirstRect(receiver As Ptr, methodSelector As Ptr, range As MacRange, actual As Ptr) As MacRect
+    Dim rect As MacRect
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return rect
+    Try
+        Dim state As InputSnapshot = input.Callbacks.GetSnapshot()
+        rect.Origin.X = state.X
+        rect.Origin.Y = state.Y
+        rect.Size.Width = Math.Max(1, state.Width)
+        rect.Size.Height = Math.Max(1, state.Height)
+        If Not IsFlipped(receiver) Then rect.Origin.Y = ViewBounds(receiver).Size.Height - state.Y - state.Height
+        Dim exact As MacRange = MacSelectedRange(receiver, methodSelector)
+        exact.Length = 0
+        MacActual(actual, exact)
+        rect = RectToScreen(ViewWindow(receiver), RectToWindow(receiver, rect, Nil))
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+    Return rect
+End Function
+
+Private Function MacCharacterIndex(receiver As Ptr, methodSelector As Ptr, point As MacPoint) As Integer
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return 9223372036854775807
+    Try
+        point = PointFromWindow(receiver, PointFromScreen(ViewWindow(receiver), point), Nil)
+        If Not IsFlipped(receiver) Then point.Y = ViewBounds(receiver).Size.Height - point.Y
+        Dim position As Integer = input.Callbacks.HitTest(point.X, point.Y)
+        Dim state As InputSnapshot = input.Callbacks.GetSnapshot()
+        Return UTF16Offset(state.Text, position)
+    Catch e As Exception
+        input.LastError = e.Message
+        Return 9223372036854775807
+    End Try
+End Function
+
+Private Sub MacDoCommand(receiver As Ptr, methodSelector As Ptr, nativeCommand As Ptr)
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Exit Sub
+    Try
+        Dim name As String = SelectorName(nativeCommand)
+        Dim extend As Boolean = String.Contains(name, "AndModifySelection", True)
+        name = String.Replace(name, "AndModifySelection", "", True)
+        Select Case name
+        Case "insertNewline:"
+            input.Callbacks.DeliverCommit("\n", -1, 0)
+            Exit Sub
+        Case "cancelOperation:", "complete:"
+            input.Cancel()
+            Exit Sub
+        End Select
+        Dim command As String = MacSelectorCommand(name)
+        If command = "" Then Exit Sub ' noop: and selectors without a Buoy command
+        input.Cancel()
+        If input.Callbacks.DeliverCommand(command, extend) Then Exit Sub
+        If command = "insertTab" Or command = "insertBacktab" Then
+            ' The control does not use Tab: keep AppKit focus traversal.
+            Dim original As MacCommandAction = CType(GetMethod(input.OriginalClass, methodSelector), MacCommandAction)
+            original(receiver, methodSelector, nativeCommand)
+        End If
+    Catch e As Exception
+        input.LastError = e.Message
+    End Try
+End Sub
+
+Private Function MacBecomeFirst(receiver As Ptr, methodSelector As Ptr) As UInt8
+    Return MacResponder(receiver, methodSelector, True)
+End Function
+Private Function MacResignFirst(receiver As Ptr, methodSelector As Ptr) As UInt8
+    Return MacResponder(receiver, methodSelector, False)
+End Function
+Private Function MacResponder(receiver As Ptr, methodSelector As Ptr, focused As Boolean) As UInt8
+    Dim input As MacInput = MacFind(receiver)
+    If input = Nil Then Return 0
+    Try
+        Dim original As MacBoolAction = CType(GetMethod(input.OriginalClass, methodSelector), MacBoolAction)
+        Dim accepted As UInt8 = original(receiver, methodSelector)
+        If accepted <> 0 Then
+            If Not focused Then input.Cancel()
+            input.Callbacks.DeliverFocus(focused)
+        End If
+        Return accepted
+    Catch e As Exception
+        input.LastError = e.Message
+        Return 0
+    End Try
+End Function
+#End If
+
+''' Maps an AppKit text-system action selector (from the user's key bindings,
+''' StandardKeyBinding.dict / DefaultKeyBinding.dict) to a TextInputCanvas command.
+''' The caller removes the "AndModifySelection" suffix first. "" = not a command.
+Public Function MacSelectorCommand(selectorName As String) As String
+    Select Case selectorName
+    Case "moveLeft:", "moveBackward:"
+        Return "moveLeft"
+    Case "moveRight:", "moveForward:"
+        Return "moveRight"
+    Case "moveUp:"
+        Return "moveUp"
+    Case "moveDown:"
+        Return "moveDown"
+    Case "moveWordLeft:", "moveWordBackward:"
+        Return "moveWordLeft"
+    Case "moveWordRight:", "moveWordForward:"
+        Return "moveWordRight"
+    Case "moveToBeginningOfLine:", "moveToLeftEndOfLine:"
+        Return "moveHome"
+    Case "moveToEndOfLine:", "moveToRightEndOfLine:"
+        Return "moveEnd"
+    Case "moveToBeginningOfParagraph:"
+        Return "moveLineStart"
+    Case "moveToEndOfParagraph:"
+        Return "moveLineEnd"
+    Case "moveParagraphBackward:"
+        Return "moveParagraphBackward"
+    Case "moveParagraphForward:"
+        Return "moveParagraphForward"
+    Case "moveToBeginningOfDocument:"
+        Return "moveDocumentStart"
+    Case "moveToEndOfDocument:"
+        Return "moveDocumentEnd"
+    Case "pageUp:"
+        Return "pageUp"
+    Case "pageDown:"
+        Return "pageDown"
+    Case "scrollPageUp:"
+        Return "scrollPageUp"
+    Case "scrollPageDown:"
+        Return "scrollPageDown"
+    Case "scrollLineUp:"
+        Return "scrollLineUp"
+    Case "scrollLineDown:"
+        Return "scrollLineDown"
+    Case "scrollToBeginningOfDocument:"
+        Return "scrollDocumentStart"
+    Case "scrollToEndOfDocument:"
+        Return "scrollDocumentEnd"
+    Case "centerSelectionInVisibleArea:"
+        Return "centerSelection"
+    Case "deleteBackward:", "deleteBackwardByDecomposingPreviousCharacter:"
+        Return "deleteBackward"
+    Case "deleteForward:"
+        Return "deleteForward"
+    Case "deleteWordBackward:"
+        Return "deleteWordBackward"
+    Case "deleteWordForward:"
+        Return "deleteWordForward"
+    Case "deleteToBeginningOfLine:", "deleteToBeginningOfParagraph:"
+        Return "deleteToLineStart"
+    Case "deleteToEndOfLine:", "deleteToEndOfParagraph:"
+        Return "deleteToLineEnd"
+    Case "transpose:"
+        Return "transpose"
+    Case "yank:"
+        Return "yank"
+    Case "insertNewlineIgnoringFieldEditor:", "insertLineBreak:", "insertParagraphSeparator:"
+        Return "insertLineBreak"
+    Case "insertTab:", "insertTabIgnoringFieldEditor:"
+        Return "insertTab"
+    Case "insertBacktab:"
+        Return "insertBacktab"
+    Case "selectAll:"
+        Return "selectAll"
+    Case "selectLine:", "selectParagraph:"
+        Return "selectLine"
+    Case "selectWord:"
+        Return "selectWord"
+    End Select
+    Return ""
+End Function

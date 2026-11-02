@@ -1,0 +1,367 @@
+' GTK4 contextual menus. Call all methods on the GUI thread.
+Public Class PopupItem
+    Public Property Caption As String = ""
+    Public Property Tag As String = ""
+    Public Property Enabled As Boolean = True
+    Public Property Checked As Boolean = False
+    Public Property Checkable As Boolean = False
+    Public Property IconName As String = ""
+    Public Property IconFile As String = ""
+    Private Property mSeparator As Boolean = False
+    Private Property mChildren As Array Of PopupItem
+    Private Property mAttached As Boolean = False
+
+    Public Sub Constructor(caption As String = "", tag As String = "")
+        Me.Caption = caption
+        Me.Tag = tag
+    End Sub
+
+    Public Property IsSeparator As Boolean
+        Get
+            Return Me.mSeparator
+        End Get
+    End Property
+
+    Public Function Count() As Integer
+        Return Array.Count(Me.mChildren)
+    End Function
+
+    Public Function Item(index As Integer) As PopupItem
+        Return Me.mChildren(index)
+    End Function
+
+    Public Sub AddItem(child As PopupItem)
+        If child = Nil Then Throw New InvalidArgumentException("Menu item is Nil")
+        If Me.mSeparator Or child.mAttached Then Throw New InvalidArgumentException("Menu item already parented or separator used as container")
+        If child.Contains(Me) Then Throw New InvalidArgumentException("Menu cycle")
+        child.mAttached = True
+        Array.Append(Me.mChildren, child)
+    End Sub
+
+    Private Function Contains(candidate As PopupItem) As Boolean
+        If Me Is candidate Then Return True
+        For Each child As PopupItem In Me.mChildren
+            If child.Contains(candidate) Then Return True
+        Next
+        Return False
+    End Function
+
+    Public Sub AddSeparator()
+        Dim separator As New PopupItem()
+        separator.mSeparator = True
+        Me.AddItem(separator)
+    End Sub
+End Class
+
+Public Class GTKContextMenu
+    Event Selected(item As PopupItem)
+    Event Dismissed(restoreFocus As Boolean)
+    Public Property LastError As String = ""
+    Private Property mPopover As Ptr = Nil
+    Private Property mGroup As Ptr = Nil
+    Private Property mOwner As UIControl
+    Private Property mActions As Array Of Ptr
+    Private Property mSignals As Array Of UInt64
+    Private Property mItems As Array Of PopupItem
+    Private Property mClosedSignal As UInt64 = 0
+    Private Property mIconWidgets As Array Of Ptr
+    Private Property mIconIDs As Array Of String
+
+    Public Property IsOpen As Boolean
+        Get
+            Return Me.mPopover <> Nil
+        End Get
+    End Property
+
+    Public Sub Show(owner As UIControl, location As Point, root As PopupItem)
+        Me.Close()
+        Me.LastError = ""
+        If owner = Nil Or root = Nil Then Throw New InvalidArgumentException("Menu needs an owner and root")
+        If root.IsSeparator Then Throw New InvalidArgumentException("Menu root cannot be a separator")
+        If root.Count() = 0 Then Return
+        #If TargetLinux Then
+            If owner.NativeWidget = Nil Then Throw New InvalidArgumentException("Owner has no native widget")
+            Me.mOwner = owner
+            Me.mGroup = ActionGroupNew()
+            Dim model As Ptr = Nil
+            Try
+                model = Me.BuildModel(root)
+                Me.mPopover = PopoverNew(model, 1) ' GTK_POPOVER_MENU_NESTED, present since GTK 4.0
+                Unref(model)
+                model = Nil
+                RefSink(Me.mPopover)
+                For i As Integer = 0 To Array.Count(Me.mIconWidgets) - 1
+                    AddCustomChild(Me.mPopover, Me.mIconWidgets(i), Me.mIconIDs(i))
+                Next
+                SetParent(Me.mPopover, owner.NativeWidget)
+                InsertGroup(Me.mPopover, "buoypopup", Me.mGroup)
+                SetArrow(Me.mPopover, 0)
+                Dim rect As PopupRectangle
+                Dim anchorX As Integer = Math.Round(location.X)
+                Dim anchorY As Integer = Math.Round(location.Y)
+                rect.X = anchorX
+                rect.Y = anchorY
+                rect.Width = 1
+                rect.Height = 1
+                PointTo(Me.mPopover, rect)
+                Array.Append(PopupRegistry.Active, Me)
+                Me.mClosedSignal = ConnectClosed(Me.mPopover, "closed", AddressOf PopupClosed, Nil, Nil, 0)
+                Popup(Me.mPopover)
+            Catch e As Exception
+                If model <> Nil Then Unref(model)
+                Me.Close()
+                Throw e
+            End Try
+        #Else
+            Throw New Exception("GTKContextMenu requires Linux and GTK4")
+        #End If
+    End Sub
+
+    Public Sub Close()
+        #If TargetLinux Then
+            Dim popover As Ptr = Me.mPopover
+            Dim restoreFocus As Boolean = False
+            If popover <> Nil Then
+                Dim root As Ptr = PopupFocusRoot(popover)
+                If root <> Nil Then
+                    Dim focus As Ptr = PopupWindowFocus(root)
+                    restoreFocus = focus = Nil Or focus = popover
+                    If focus <> Nil Then
+                        If PopupFocusAncestor(focus, popover) <> 0 Then restoreFocus = True
+                    End If
+                End If
+            End If
+            Me.mPopover = Nil
+            If popover <> Nil And Me.mClosedSignal <> 0 Then Disconnect(popover, Me.mClosedSignal)
+            Me.mClosedSignal = 0
+            For i As Integer = 0 To Array.Count(Me.mActions) - 1
+                Disconnect(Me.mActions(i), Me.mSignals(i))
+            Next
+            Me.mActions = []
+            Me.mSignals = []
+            Me.mItems = []
+            If popover <> Nil Then
+                Popdown(popover)
+                Unparent(popover)
+                Unref(popover)
+            End If
+            For Each widget As Ptr In Me.mIconWidgets
+                Unref(widget)
+            Next
+            Me.mIconWidgets = []
+            Me.mIconIDs = []
+            If Me.mGroup <> Nil Then Unref(Me.mGroup)
+            Me.mGroup = Nil
+            Me.mOwner = Nil
+            For i As Integer = Array.Count(PopupRegistry.Active) - 1 To 0 Step -1
+                If PopupRegistry.Active(i) Is Me Then Array.RemoveAt(PopupRegistry.Active, i)
+            Next
+            If popover <> Nil Then RaiseEvent Dismissed(restoreFocus)
+        #End If
+    End Sub
+
+    #If TargetLinux Then
+    Private Function BuildModel(root As PopupItem) As Ptr
+        Dim model As Ptr = MenuNew()
+        Dim section As Ptr = MenuNew()
+        Try
+            For i As Integer = 0 To root.Count() - 1
+                Dim item As PopupItem = root.Item(i)
+                If item.IsSeparator Then
+                    If MenuCount(section) > 0 Then AppendSection(model, Nil, section)
+                    Unref(section)
+                    section = MenuNew()
+                    Continue For
+                End If
+                Dim name As String = "item" + Str(Array.Count(Me.mActions))
+                Dim action As Ptr
+                If item.Checkable Or item.Checked Then
+                    action = StatefulActionNew(name, Nil, BooleanVariant(CType(item.Checked, Int32)))
+                Else
+                    action = ActionNew(name, Nil)
+                End If
+                SetEnabled(action, CType(item.Enabled, Int32))
+                AddAction(Me.mGroup, action)
+                Array.Append(Me.mActions, action)
+                Array.Append(Me.mItems, item)
+                Array.Append(Me.mSignals, ConnectAction(action, "activate", AddressOf PopupActivated, Nil, Nil, 0))
+                Unref(action) ' the group owns it
+                Dim nativeItem As Ptr = MenuItemNew(item.Caption, "buoypopup." + name)
+                Try
+                    If item.Count() > 0 Then
+                        Dim submenu As Ptr = Me.BuildModel(item)
+                        SetSubmenu(nativeItem, submenu)
+                        Unref(submenu)
+                    End If
+                    Dim icon As Ptr = Nil
+                    If item.IconFile <> "" Then
+                        Dim file As Ptr = FileNew(item.IconFile)
+                        icon = FileIconNew(file)
+                        Unref(file)
+                    ElseIf item.IconName <> "" Then
+                        icon = ThemedIconNew(item.IconName)
+                    End If
+                    If icon <> Nil Then
+                        SetIcon(nativeItem, icon)
+                        Unref(icon)
+                        ' Ordinary GTK menu rows need custom content to reliably
+                        ' display an icon beside text, rather than an iconic row.
+                        If item.Count() = 0 And Not item.Checkable And Not item.Checked Then
+                            SetAttribute(nativeItem, "custom", StringVariant(name))
+                            Dim button As Ptr = ButtonNew()
+                            RefSink(button)
+                            Dim box As Ptr = BoxNew(0, 8)
+                            Dim image As Ptr
+                            If item.IconFile <> "" Then
+                                image = ImageFromFile(item.IconFile)
+                            Else
+                                image = ImageFromName(item.IconName)
+                            End If
+                            BoxAppend(box, image)
+                            BoxAppend(box, LabelNew(item.Caption))
+                            ButtonChild(button, box)
+                            ActionName(button, "buoypopup." + name)
+                            CSSClass(button, "flat")
+                            Array.Append(Me.mIconWidgets, button)
+                            Array.Append(Me.mIconIDs, name)
+                        End If
+                    End If
+                    AppendItem(section, nativeItem)
+                Finally
+                    Unref(nativeItem)
+                End Try
+            Next
+            If MenuCount(section) > 0 Then AppendSection(model, Nil, section)
+            Return model
+        Catch e As Exception
+            Unref(model)
+            Throw e
+        Finally
+            Unref(section)
+        End Try
+    End Function
+
+    Public Function OwnsAction(action As Ptr) As Boolean
+        For Each candidate As Ptr In Me.mActions
+            If candidate = action Then Return True
+        Next
+        Return False
+    End Function
+
+    Public Function OwnsPopover(popover As Ptr) As Boolean
+        Return Me.mPopover = popover
+    End Function
+
+    Public Sub Dispatch(action As Ptr)
+        For i As Integer = 0 To Array.Count(Me.mActions) - 1
+            If Me.mActions(i) = action Then
+                Dim item As PopupItem = Me.mItems(i)
+                Me.Close()
+                RaiseEvent Selected(item)
+                Return
+            End If
+        Next
+    End Sub
+    #End If
+End Class
+
+#If TargetLinux Then
+Private Class PopupRegistry
+    Public Shared Property Active As Array Of GTKContextMenu
+End Class
+Sequential Structure PopupRectangle
+    X As Int32
+    Y As Int32
+    Width As Int32
+    Height As Int32
+End Structure
+Delegate Sub ActionCallback(action As Ptr, parameter As Ptr, data As Ptr)
+Delegate Sub ClosedCallback(popover As Ptr, data As Ptr)
+Delegate Function IdleCallback(data As Ptr) As Int32
+Delegate Sub DestroyCallback(data As Ptr)
+
+Private Sub PopupActivated(action As Ptr, parameter As Ptr, data As Ptr)
+    For Each menu As GTKContextMenu In PopupRegistry.Active
+        If menu.OwnsAction(action) Then
+            Try
+                menu.Dispatch(action)
+            Catch e As Exception
+                menu.LastError = e.Message
+            End Try
+            Return
+        End If
+    Next
+End Sub
+
+Private Sub PopupClosed(popover As Ptr, data As Ptr)
+    ' GTK can emit closed before activating the selected action. Defer cleanup
+    ' until the current event finishes so that activation still finds its owner.
+    Ref(popover)
+    AddIdle(200, AddressOf CleanupPopup, popover, AddressOf ReleasePopup)
+End Sub
+
+Private Sub ReleasePopup(popover As Ptr)
+    Unref(popover)
+End Sub
+
+Private Function CleanupPopup(popover As Ptr) As Int32
+    For Each menu As GTKContextMenu In PopupRegistry.Active
+        If menu.OwnsPopover(popover) Then
+            Try
+                menu.Close()
+            Catch e As Exception
+                menu.LastError = e.Message
+            End Try
+            Return 0
+        End If
+    Next
+    Return 0
+End Function
+
+Private Optional Declare Function PopupFocusRoot Lib "libgtk-4.so.1" Alias "gtk_widget_get_root" (widget As Ptr) As Ptr
+Private Optional Declare Function PopupWindowFocus Lib "libgtk-4.so.1" Alias "gtk_window_get_focus" (window As Ptr) As Ptr
+Private Optional Declare Function PopupFocusAncestor Lib "libgtk-4.so.1" Alias "gtk_widget_is_ancestor" (widget As Ptr, ancestor As Ptr) As Int32
+Private Optional Declare Function MenuNew Lib "libgio-2.0.so.0" Alias "g_menu_new" () As Ptr
+Private Optional Declare Function MenuCount Lib "libgio-2.0.so.0" Alias "g_menu_model_get_n_items" (menu As Ptr) As Int32
+Private Optional Declare Function MenuItemNew Lib "libgio-2.0.so.0" Alias "g_menu_item_new" (caption As String, action As String) As Ptr
+Private Optional Declare Sub AppendItem Lib "libgio-2.0.so.0" Alias "g_menu_append_item" (menu As Ptr, item As Ptr)
+Private Optional Declare Sub AppendSection Lib "libgio-2.0.so.0" Alias "g_menu_append_section" (menu As Ptr, label As Ptr, section As Ptr)
+Private Optional Declare Sub SetSubmenu Lib "libgio-2.0.so.0" Alias "g_menu_item_set_submenu" (item As Ptr, submenu As Ptr)
+Private Optional Declare Sub SetIcon Lib "libgio-2.0.so.0" Alias "g_menu_item_set_icon" (item As Ptr, icon As Ptr)
+Private Optional Declare Sub SetAttribute Lib "libgio-2.0.so.0" Alias "g_menu_item_set_attribute_value" (item As Ptr, name As String, value As Ptr)
+Private Optional Declare Function StringVariant Lib "libglib-2.0.so.0" Alias "g_variant_new_string" (value As String) As Ptr
+Private Optional Declare Function ThemedIconNew Lib "libgio-2.0.so.0" Alias "g_themed_icon_new" (name As String) As Ptr
+Private Optional Declare Function FileNew Lib "libgio-2.0.so.0" Alias "g_file_new_for_path" (filePath As String) As Ptr
+Private Optional Declare Function FileIconNew Lib "libgio-2.0.so.0" Alias "g_file_icon_new" (file As Ptr) As Ptr
+Private Optional Declare Function ActionGroupNew Lib "libgio-2.0.so.0" Alias "g_simple_action_group_new" () As Ptr
+Private Optional Declare Function ActionNew Lib "libgio-2.0.so.0" Alias "g_simple_action_new" (name As String, parameter As Ptr) As Ptr
+Private Optional Declare Function StatefulActionNew Lib "libgio-2.0.so.0" Alias "g_simple_action_new_stateful" (name As String, parameter As Ptr, state As Ptr) As Ptr
+Private Optional Declare Function BooleanVariant Lib "libglib-2.0.so.0" Alias "g_variant_new_boolean" (value As Int32) As Ptr
+Private Optional Declare Sub AddAction Lib "libgio-2.0.so.0" Alias "g_action_map_add_action" (group As Ptr, action As Ptr)
+Private Optional Declare Sub SetEnabled Lib "libgio-2.0.so.0" Alias "g_simple_action_set_enabled" (action As Ptr, enabled As Int32)
+Private Optional Declare Function PopoverNew Lib "libgtk-4.so.1" Alias "gtk_popover_menu_new_from_model_full" (model As Ptr, nativeFlags As Int32) As Ptr
+Private Optional Declare Function AddCustomChild Lib "libgtk-4.so.1" Alias "gtk_popover_menu_add_child" (popover As Ptr, child As Ptr, id As String) As Int32
+Private Optional Declare Function ButtonNew Lib "libgtk-4.so.1" Alias "gtk_button_new" () As Ptr
+Private Optional Declare Function BoxNew Lib "libgtk-4.so.1" Alias "gtk_box_new" (orientation As Int32, spacing As Int32) As Ptr
+Private Optional Declare Sub BoxAppend Lib "libgtk-4.so.1" Alias "gtk_box_append" (box As Ptr, child As Ptr)
+Private Optional Declare Function ImageFromName Lib "libgtk-4.so.1" Alias "gtk_image_new_from_icon_name" (name As String) As Ptr
+Private Optional Declare Function ImageFromFile Lib "libgtk-4.so.1" Alias "gtk_image_new_from_file" (filePath As String) As Ptr
+Private Optional Declare Function LabelNew Lib "libgtk-4.so.1" Alias "gtk_label_new" (caption As String) As Ptr
+Private Optional Declare Sub ButtonChild Lib "libgtk-4.so.1" Alias "gtk_button_set_child" (button As Ptr, child As Ptr)
+Private Optional Declare Sub ActionName Lib "libgtk-4.so.1" Alias "gtk_actionable_set_action_name" (widget As Ptr, name As String)
+Private Optional Declare Sub CSSClass Lib "libgtk-4.so.1" Alias "gtk_widget_add_css_class" (widget As Ptr, name As String)
+Private Optional Declare Sub InsertGroup Lib "libgtk-4.so.1" Alias "gtk_widget_insert_action_group" (widget As Ptr, name As String, group As Ptr)
+Private Optional Declare Sub SetParent Lib "libgtk-4.so.1" Alias "gtk_widget_set_parent" (widget As Ptr, parent As Ptr)
+Private Optional Declare Sub Unparent Lib "libgtk-4.so.1" Alias "gtk_widget_unparent" (widget As Ptr)
+Private Optional Declare Sub SetArrow Lib "libgtk-4.so.1" Alias "gtk_popover_set_has_arrow" (popover As Ptr, value As Int32)
+Private Optional Declare Sub PointTo Lib "libgtk-4.so.1" Alias "gtk_popover_set_pointing_to" (popover As Ptr, ByRef rect As PopupRectangle)
+Private Optional Declare Sub Popup Lib "libgtk-4.so.1" Alias "gtk_popover_popup" (popover As Ptr)
+Private Optional Declare Sub Popdown Lib "libgtk-4.so.1" Alias "gtk_popover_popdown" (popover As Ptr)
+Private Optional Declare Function RefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (instance As Ptr) As Ptr
+Private Optional Declare Function Ref Lib "libgobject-2.0.so.0" Alias "g_object_ref" (instance As Ptr) As Ptr
+Private Optional Declare Function AddIdle Lib "libglib-2.0.so.0" Alias "g_idle_add_full" (priority As Int32, callback As IdleCallback, data As Ptr, destroy As DestroyCallback) As UInt32
+Private Optional Declare Sub Unref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (instance As Ptr)
+Private Optional Declare Sub Disconnect Lib "libgobject-2.0.so.0" Alias "g_signal_handler_disconnect" (instance As Ptr, signal As UInt64)
+Private Optional Declare Function ConnectAction Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As ActionCallback, data As Ptr, destroy As Ptr, nativeFlags As Int32) As UInt64
+Private Optional Declare Function ConnectClosed Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (instance As Ptr, signal As String, callback As ClosedCallback, data As Ptr, destroy As Ptr, nativeFlags As Int32) As UInt64
+#End If

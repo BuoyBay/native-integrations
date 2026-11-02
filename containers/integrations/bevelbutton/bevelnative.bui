@@ -1,0 +1,246 @@
+' Native queries only where Buoy 0.72 has no working equivalent.
+Public Class BevelNativeState
+    Public Property Attached As Boolean = False
+    Public Property Active As Boolean = False
+    Public Property Visible As Boolean = True
+    Public Property Enabled As Boolean = True
+    Public Property RightToLeft As Boolean = False
+End Class
+
+Public Function ReadBevelNativeState(widget As Ptr) As BevelNativeState
+    Dim state As New BevelNativeState()
+    If widget = Nil Then Return state
+    #If TargetLinux Then
+        Dim root As Ptr = GTKRoot(widget)
+        state.Attached = root <> Nil
+        If root <> Nil Then state.Active = GTKActive(root) <> 0
+        state.Visible = GTKMapped(widget) <> 0
+        state.Enabled = GTKSensitive(widget) <> 0
+        state.RightToLeft = GTKDirection(widget) = 2
+    #ElseIf TargetWindows Then
+        If WinIsWindow(widget) = 0 Then Return state
+        state.Attached = True
+        state.Active = WinAncestor(widget, 2) = WinForeground()
+        state.Visible = WinVisible(widget) <> 0
+        Dim parent As Ptr = widget
+        While parent <> Nil
+            If WinEnabled(parent) = 0 Then state.Enabled = False
+            parent = WinParent(parent)
+        End While
+        state.RightToLeft = (WinStyle(widget, -20) And 4194304) <> 0
+    #ElseIf TargetMac Then
+        Dim window As Ptr = MacWindow(widget)
+        state.Attached = window <> Nil
+        If window <> Nil Then
+            state.Active = MacActive(window)
+            state.Visible = MacVisible(window) And Not MacHidden(widget)
+        End If
+        state.RightToLeft = MacDirection(widget) = 1
+    #End If
+    Return state
+End Function
+
+Public Class BevelNativeTooltip
+    Private Property mWidget As Ptr = Nil
+    Private Property mText As String = ""
+    #If TargetWindows Then
+        Private Property mTooltip As Ptr = Nil
+        Private Property mBuffer As Bytes
+    #End If
+
+    Public Sub Apply(widget As Ptr, tipText As String)
+        If widget = Nil Then Return
+        If Me.mWidget = widget And Me.mText = tipText Then Return
+        #If TargetLinux Then
+            GTKTooltip(widget, tipText)
+        #ElseIf TargetMac Then
+            MacTooltip(widget, MacString(MacClass("NSString"), tipText))
+        #ElseIf TargetWindows Then
+            If Me.mWidget <> widget Then Me.Close()
+            If Me.mTooltip = Nil And tipText <> "" Then
+                Dim cls As Bytes = "tooltips_class32".AsUTF16LE()
+                cls.Append(0)
+                cls.Append(0)
+                Me.mTooltip = WinCreate(8, cls.DataPtr(), Nil, 2147483651, 0, 0, 0, 0, widget, Nil, Nil, Nil)
+                If Me.mTooltip = Nil Then Throw New RuntimeException("Could not create BevelButton tooltip")
+            End If
+            If Me.mTooltip <> Nil Then
+                Dim info As BevelToolInfo
+                info.Size = 72
+                info.NativeFlags = 17 ' TTF_IDISHWND | TTF_SUBCLASS
+                info.Window = widget
+                info.ID = CType(widget, Integer)
+                If Me.mBuffer <> Nil Then WinSend(Me.mTooltip, 1075, 0, CType(info, Ptr)) ' TTM_DELTOOLW
+                Me.mBuffer = tipText.AsUTF16LE()
+                Me.mBuffer.Append(0)
+                Me.mBuffer.Append(0)
+                info.Text = Me.mBuffer.DataPtr()
+                If tipText <> "" Then
+                    If WinSend(Me.mTooltip, 1074, 0, CType(info, Ptr)) = 0 Then
+                        Throw New RuntimeException("Could not register BevelButton tooltip")
+                    End If
+                End If
+            End If
+        #End If
+        Me.mWidget = widget
+        Me.mText = tipText
+    End Sub
+
+    Public Sub Close()
+        #If TargetWindows Then
+            If Me.mTooltip <> Nil Then
+                If WinIsWindow(Me.mTooltip) <> 0 Then WinDestroy(Me.mTooltip)
+            End If
+            Me.mTooltip = Nil
+            Me.mBuffer = Nil
+        #End If
+        Me.mWidget = Nil
+        Me.mText = ""
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
+
+#If TargetLinux Then
+Private Optional Declare Function GTKRoot Lib "libgtk-4.so.1" Alias "gtk_widget_get_root" (widget As Ptr) As Ptr
+Private Optional Declare Function GTKActive Lib "libgtk-4.so.1" Alias "gtk_window_is_active" (widget As Ptr) As Int32
+Private Optional Declare Function GTKMapped Lib "libgtk-4.so.1" Alias "gtk_widget_get_mapped" (widget As Ptr) As Int32
+Private Optional Declare Function GTKSensitive Lib "libgtk-4.so.1" Alias "gtk_widget_is_sensitive" (widget As Ptr) As Int32
+Private Optional Declare Function GTKDirection Lib "libgtk-4.so.1" Alias "gtk_widget_get_direction" (widget As Ptr) As Int32
+Private Optional Declare Sub GTKTooltip Lib "libgtk-4.so.1" Alias "gtk_widget_set_tooltip_text" (widget As Ptr, tipText As String)
+#ElseIf TargetWindows Then
+Sequential Structure BevelToolInfo
+    Size As UInt32
+    NativeFlags As UInt32
+    Window As Ptr
+    ID As UInt64
+    Left As Int32
+    Top As Int32
+    Right As Int32
+    Bottom As Int32
+    Instance As Ptr
+    Text As Ptr
+    Data As Int64
+    Reserved As Ptr
+End Structure
+Private Optional Declare Function WinIsWindow Lib "user32" Alias "IsWindow" (widget As Ptr) As Int32
+Private Optional Declare Function WinAncestor Lib "user32" Alias "GetAncestor" (widget As Ptr, ancestorFlags As UInt32) As Ptr
+Private Optional Declare Function WinForeground Lib "user32" Alias "GetForegroundWindow" () As Ptr
+Private Optional Declare Function WinParent Lib "user32" Alias "GetParent" (widget As Ptr) As Ptr
+Private Optional Declare Function WinVisible Lib "user32" Alias "IsWindowVisible" (widget As Ptr) As Int32
+Private Optional Declare Function WinEnabled Lib "user32" Alias "IsWindowEnabled" (widget As Ptr) As Int32
+Private Optional Declare Function WinStyle Lib "user32" Alias "GetWindowLongPtrW" (widget As Ptr, index As Int32) As Int64
+Private Optional Declare Function WinCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, parameter As Ptr) As Ptr
+Private Optional Declare Function WinSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Ptr) As Int64
+Private Optional Declare Function WinDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+#ElseIf TargetMac Then
+Private Declare Function MacWindow Lib "AppKit" Selector "window" (view As Ptr) As Ptr
+Private Declare Function MacActive Lib "AppKit" Selector "isKeyWindow" (window As Ptr) As Boolean
+Private Declare Function MacVisible Lib "AppKit" Selector "isVisible" (window As Ptr) As Boolean
+Private Declare Function MacHidden Lib "AppKit" Selector "isHiddenOrHasHiddenAncestor" (view As Ptr) As Boolean
+Private Declare Function MacDirection Lib "AppKit" Selector "userInterfaceLayoutDirection" (view As Ptr) As Integer
+Private Declare Sub MacTooltip Lib "AppKit" Selector "setToolTip:" (view As Ptr, text As Ptr)
+Private Declare Function MacString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Function MacClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+#End If
+
+' GTK's stock ContextMenu popup does not move focus into its first entry.
+Public Sub FocusBevelMenu(widget As Ptr)
+    #If TargetLinux Then
+        Dim root As Ptr = GTKRoot(widget)
+        If root <> Nil Then FocusBevelPopover(root)
+    #End If
+End Sub
+#If TargetLinux Then
+Private Function FocusBevelPopover(widget As Ptr) As Boolean
+    If GTKIsType(widget, GTKPopoverType()) <> 0 And GTKMapped(widget) <> 0 Then
+        Return FocusFirstBevelMenuButton(widget)
+    End If
+    Dim child As Ptr = GTKFirstChild(widget)
+    While child <> Nil
+        If FocusBevelPopover(child) Then Return True
+        child = GTKNextSibling(child)
+    End While
+    Return False
+End Function
+Private Function FocusFirstBevelMenuButton(widget As Ptr) As Boolean
+    If GTKIsType(widget, GTKButtonType()) <> 0 And GTKSensitive(widget) <> 0 Then
+        Return GTKGrabFocus(widget) <> 0
+    End If
+    Dim child As Ptr = GTKFirstChild(widget)
+    While child <> Nil
+        If FocusFirstBevelMenuButton(child) Then Return True
+        child = GTKNextSibling(child)
+    End While
+    Return False
+End Function
+#End If
+#If TargetLinux Then
+Private Optional Declare Function GTKFirstChild Lib "libgtk-4.so.1" Alias "gtk_widget_get_first_child" (widget As Ptr) As Ptr
+Private Optional Declare Function GTKNextSibling Lib "libgtk-4.so.1" Alias "gtk_widget_get_next_sibling" (widget As Ptr) As Ptr
+Private Optional Declare Function GTKPopoverType Lib "libgtk-4.so.1" Alias "gtk_popover_get_type" () As UInt64
+Private Optional Declare Function GTKIsType Lib "libgobject-2.0.so.0" Alias "g_type_check_instance_is_a" (instance As Ptr, typeID As UInt64) As Int32
+Private Optional Declare Function GTKButtonType Lib "libgtk-4.so.1" Alias "gtk_button_get_type" () As UInt64
+Private Optional Declare Function GTKGrabFocus Lib "libgtk-4.so.1" Alias "gtk_widget_grab_focus" (widget As Ptr) As Int32
+#End If
+
+' 0.72 ContextMenu.Show omits the callback registration done by right-click
+' menus. Keep native menu ABI details here, not in the public button API.
+Delegate Sub BevelMenuCallback(itemHandle As Ptr, data As Ptr)
+Private Declare Sub NativeMenuCallback Lib "buoy_ui" Alias "bui_ui_menu_set_on_menu_selected" (menu As Ptr, callback As BevelMenuCallback, data As Ptr)
+Private Declare Function NativeMenuObject Lib "buoy_ui" Alias "bui_ui_menuitem_get_buoy_object" (itemHandle As Ptr) As Ptr
+Private Class BevelMenuBinding
+    Public Property Menu As Weak ContextMenu
+    Public Property Owner As Weak UIControl
+    Public Property OwnerAddress As Ptr = Nil
+End Class
+Private Class BevelMenuBindings
+    Public Shared Property Items As Array Of BevelMenuBinding = []
+End Class
+
+Public Sub BindBevelMenu(menu As ContextMenu, owner As UIControl)
+    Dim index As Integer = -1
+    Dim empty As Integer = -1
+    For i As Integer = 0 To Array.LastIndex(BevelMenuBindings.Items)
+        Dim binding As BevelMenuBinding = BevelMenuBindings.Items(i)
+        If binding.Menu Is menu Then
+            index = i
+            Exit For
+        End If
+        If binding.Menu = Nil Then empty = i
+    Next
+    If index < 0 Then index = empty
+    If index < 0 Then
+        index = Array.Count(BevelMenuBindings.Items)
+        Array.Append(BevelMenuBindings.Items, New BevelMenuBinding())
+    End If
+    BevelMenuBindings.Items(index).Menu = menu
+    BevelMenuBindings.Items(index).Owner = owner
+    BevelMenuBindings.Items(index).OwnerAddress = CType(owner, Ptr)
+    NativeMenuCallback(menu.NativeHandle, AddressOf BevelMenuSelected, CType(index + 1, Ptr))
+End Sub
+
+' Called from a destructor too: a typed owner argument would retain/release
+' the dying object and re-enter its destructor. Compare its address only.
+Public Sub UnbindBevelMenus(ownerAddress As Ptr)
+    For Each binding As BevelMenuBinding In BevelMenuBindings.Items
+        If binding.OwnerAddress = ownerAddress Then
+            Dim menu As ContextMenu = binding.Menu
+            If menu <> Nil Then NativeMenuCallback(menu.NativeHandle, Nil, Nil)
+            binding.Owner = Nil
+            binding.OwnerAddress = Nil
+            binding.Menu = Nil
+        End If
+    Next
+End Sub
+
+Private Sub BevelMenuSelected(itemHandle As Ptr, data As Ptr)
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(BevelMenuBindings.Items) Then Return
+    Dim owner As UIControl = BevelMenuBindings.Items(index).Owner
+    If owner = Nil Or itemHandle = Nil Then Return
+    Dim item As MenuItem = CType(NativeMenuObject(itemHandle), MenuItem)
+    If item <> Nil Then owner.NotifyContextualMenuAction(item)
+End Sub

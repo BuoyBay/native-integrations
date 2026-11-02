@@ -1,0 +1,189 @@
+' Read-only BlueZ adapter snapshots over system D-Bus; no discovery is started.
+Public Class BluetoothAdapter
+    Public Property ObjectPath As String
+    Public Property Address As String
+    Public Property Name As Optional Of String
+    Public Property Alias As Optional Of String
+    Public Property Powered As Optional Of Boolean
+    Public Property Discovering As Optional Of Boolean
+    Public Property Discoverable As Optional Of Boolean
+End Class
+
+#If TargetLinux Then
+Sequential Structure NativeError
+    Domain As UInt32
+    Code As Int32
+    Message As Ptr
+End Structure
+Private Optional Declare Function NativeBus Lib "libgio-2.0.so.0" Alias "g_bus_get_sync" (busType As Int32, cancellable As Ptr, ByRef failure As Ptr) As Ptr
+Private Optional Declare Function NativeCall Lib "libgio-2.0.so.0" Alias "g_dbus_connection_call_sync" (connection As Ptr, busName As CString, objectPath As CString, interfaceName As CString, methodName As CString, parameters As Ptr, replyType As Ptr, callFlags As Int32, timeoutMilliseconds As Int32, cancellable As Ptr, ByRef failure As Ptr) As Ptr
+Private Optional Declare Sub NativeObjectUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (obj As Ptr)
+Private Optional Declare Sub NativeErrorFree Lib "libglib-2.0.so.0" Alias "g_error_free" (failure As Ptr)
+Private Optional Declare Function NativeErrorCopy Lib "c" Alias "memcpy" (ByRef record As NativeError, source As Ptr, count As UInt64) As Ptr
+Private Optional Declare Function NativeParse Lib "libglib-2.0.so.0" Alias "g_variant_parse" (expectedType As Ptr, text As CString, limit As Ptr, endPointer As Ptr, ByRef failure As Ptr) As Ptr
+Private Optional Declare Function NativeType Lib "libglib-2.0.so.0" Alias "g_variant_get_type_string" (value As Ptr) As CString
+Private Optional Declare Function NativeChild Lib "libglib-2.0.so.0" Alias "g_variant_get_child_value" (value As Ptr, index As UInt64) As Ptr
+Private Optional Declare Function NativeCount Lib "libglib-2.0.so.0" Alias "g_variant_n_children" (value As Ptr) As UInt64
+Private Optional Declare Function NativeLookup Lib "libglib-2.0.so.0" Alias "g_variant_lookup_value" (dictionary As Ptr, key As CString, expectedType As Ptr) As Ptr
+Private Optional Declare Function NativeString Lib "libglib-2.0.so.0" Alias "g_variant_get_string" (value As Ptr, length As Ptr) As CString
+Private Optional Declare Function NativeBoolean Lib "libglib-2.0.so.0" Alias "g_variant_get_boolean" (value As Ptr) As Int32
+Private Optional Declare Sub NativeUnref Lib "libglib-2.0.so.0" Alias "g_variant_unref" (value As Ptr)
+
+Private Sub Fail(operation As String, failure As Ptr)
+    If failure = Nil Then
+        Throw New RuntimeException(operation + " failed without a GError")
+    End If
+    Try
+        Dim record As NativeError
+        NativeErrorCopy(record, failure, 16)
+        Dim message As String = CType(CType(record.Message, CString), String)
+        Throw New RuntimeException(operation + ": " + message, record.Code)
+    Finally
+        NativeErrorFree(failure)
+    End Try
+End Sub
+
+Private Function StringProperty(properties As Ptr, key As String) As Optional Of String
+    Dim value As Ptr = NativeLookup(properties, CType(key, CString), Nil)
+    If value = Nil Then
+        Return None
+    End If
+    Try
+        If CType(NativeType(value), String) <> "s" Then
+            Throw New RuntimeException("BlueZ property " + key + " is not a string")
+        End If
+        Return Some(CType(NativeString(value, Nil), String))
+    Finally
+        NativeUnref(value)
+    End Try
+End Function
+
+Private Function BooleanProperty(properties As Ptr, key As String) As Optional Of Boolean
+    Dim value As Ptr = NativeLookup(properties, CType(key, CString), Nil)
+    If value = Nil Then
+        Return None
+    End If
+    Try
+        If CType(NativeType(value), String) <> "b" Then
+            Throw New RuntimeException("BlueZ property " + key + " is not boolean")
+        End If
+        Return Some(NativeBoolean(value) <> 0)
+    Finally
+        NativeUnref(value)
+    End Try
+End Function
+
+Private Function DecodeReply(reply As Ptr) As Array Of BluetoothAdapter
+    If CType(NativeType(reply), String) <> "(a{oa{sa{sv}}})" Then
+        Throw New InvalidArgumentException("Expected a BlueZ ObjectManager reply (a{oa{sa{sv}}})")
+    End If
+    Dim records As Array Of BluetoothAdapter = []
+    Dim objects As Ptr = NativeChild(reply, 0)
+    Try
+        Dim objectCount As Integer = NativeCount(objects)
+        For i As Integer = 0 To objectCount - 1
+            Dim pair As Ptr = NativeChild(objects, i)
+            Try
+                Dim key As Ptr = NativeChild(pair, 0)
+                Dim objectPath As String
+                Try
+                    objectPath = CType(NativeString(key, Nil), String)
+                Finally
+                    NativeUnref(key)
+                End Try
+                Dim interfaces As Ptr = NativeChild(pair, 1)
+                Try
+                    Dim properties As Ptr = NativeLookup(interfaces, CType("org.bluez.Adapter1", CString), Nil)
+                    If properties <> Nil Then
+                        Try
+                            Dim address As Optional Of String = StringProperty(properties, "Address")
+                            If Not address.HasValue Or address.Value = "" Then
+                                Throw New RuntimeException("BlueZ adapter is missing its Address")
+                            End If
+                            Dim info As New BluetoothAdapter
+                            info.ObjectPath = objectPath
+                            info.Address = address.Value
+                            info.Name = StringProperty(properties, "Name")
+                            info.Alias = StringProperty(properties, "Alias")
+                            info.Powered = BooleanProperty(properties, "Powered")
+                            info.Discovering = BooleanProperty(properties, "Discovering")
+                            info.Discoverable = BooleanProperty(properties, "Discoverable")
+                            Array.Append(records, info)
+                        Finally
+                            NativeUnref(properties)
+                        End Try
+                    End If
+                Finally
+                    NativeUnref(interfaces)
+                End Try
+            Finally
+                NativeUnref(pair)
+            End Try
+        Next
+        Return records
+    Finally
+        NativeUnref(objects)
+    End Try
+End Function
+#End If
+
+Public Function IsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Native libraries only; this does not claim that system D-Bus or BlueZ is running.
+Public Function IsAvailable() As Boolean
+#If TargetLinux Then
+    Return System.IsLibraryAvailable("libgio-2.0.so.0") And System.IsLibraryAvailable("libglib-2.0.so.0") And System.IsLibraryAvailable("libgobject-2.0.so.0")
+#Else
+    Return False
+#End If
+End Function
+
+''' Decode a recorded GetManagedObjects reply in GLib's GVariant text notation.
+Public Function DecodeManagedObjects(text As String) As Array Of BluetoothAdapter
+#If TargetLinux Then
+    Dim failure As Ptr = Nil
+    Dim reply As Ptr = NativeParse(Nil, CType(text, CString), Nil, Nil, failure)
+    If reply = Nil Then
+        Fail("Parsing Bluetooth snapshot", failure)
+    End If
+    Try
+        Return DecodeReply(reply)
+    Finally
+        NativeUnref(reply)
+    End Try
+#Else
+    Throw New UnsupportedOperationException("linuxbluetooth requires Linux")
+#End If
+End Function
+
+''' Query existing adapters once. Missing bus/service throws; zero adapters returns [].
+Public Function Adapters() As Array Of BluetoothAdapter
+#If TargetLinux Then
+    Dim failure As Ptr = Nil
+    Dim connection As Ptr = NativeBus(1, Nil, failure)
+    If connection = Nil Then
+        Fail("Connecting to system D-Bus", failure)
+    End If
+    Try
+        Dim reply As Ptr = NativeCall(connection, CType("org.bluez", CString), CType("/", CString), CType("org.freedesktop.DBus.ObjectManager", CString), CType("GetManagedObjects", CString), Nil, Nil, 1, 5000, Nil, failure)
+        If reply = Nil Then
+            Fail("Reading BlueZ adapters", failure)
+        End If
+        Try
+            Return DecodeReply(reply)
+        Finally
+            NativeUnref(reply)
+        End Try
+    Finally
+        NativeObjectUnref(connection)
+    End Try
+#Else
+    Throw New UnsupportedOperationException("linuxbluetooth requires Linux")
+#End If
+End Function

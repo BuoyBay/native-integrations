@@ -1,0 +1,455 @@
+' Native standalone segmented control hosted by a Buoy View.
+Public Enum SegmentSelectionStyle As Integer
+    Single
+    Multiple
+    None
+End Enum
+
+Private Class SegmentReference
+    Public Property Owner As Weak SegmentedButton
+End Class
+Private Class SegmentRegistry
+    Public Shared Property Items As Array Of SegmentReference = []
+End Class
+
+Public Class SegmentedButton Inherits View
+    Event Pressed(segmentIndex As Integer)
+    Private Property mCaptions As Array Of String = []
+    Private Property mSelected As Array Of Boolean = []
+    Private Property mEnabled As Array Of Boolean = []
+    Private Property mButtons As Array Of Ptr = []
+    Private Property mStyle As SegmentSelectionStyle = SegmentSelectionStyle.Single
+    Private Property mID As Integer = -1
+    Private Property mRoot As Ptr = Nil
+    Private Property mHost As Ptr = Nil
+    Private Property mHostDestroyed As Boolean = False
+    Private Property mUpdating As Boolean = False
+    Public Property LastNativeError As String = ""
+
+    Public Property SegmentCount As Integer
+        Get
+            Return Array.Count(Me.mCaptions)
+        End Get
+    End Property
+    Public Property LastSegmentIndex As Integer
+        Get
+            Return Me.SegmentCount - 1
+        End Get
+    End Property
+    Public Property SelectionStyle As SegmentSelectionStyle
+        Get
+            Return Me.mStyle
+        End Get
+        Set
+            If value <> SegmentSelectionStyle.Single And value <> SegmentSelectionStyle.Multiple And value <> SegmentSelectionStyle.None Then Throw New InvalidArgumentException("Invalid selection style")
+            Me.mStyle = value
+            Dim found As Boolean = False
+            For i As Integer = 0 To Me.LastSegmentIndex
+                If value = SegmentSelectionStyle.None Or (value = SegmentSelectionStyle.Single And found) Then Me.mSelected(i) = False
+                If Me.mSelected(i) Then found = True
+            Next
+            Me.Rebuild()
+        End Set
+    End Property
+    ' First selected index in Multiple mode; -1 means no selection.
+    Public Property SelectedSegmentIndex As Integer
+        Get
+            For i As Integer = 0 To Me.LastSegmentIndex
+                If Me.mSelected(i) Then Return i
+            Next
+            Return -1
+        End Get
+        Set
+            If value < -1 Or value >= Me.SegmentCount Then Throw New OutOfBoundsException("Invalid segment index")
+            For i As Integer = 0 To Me.LastSegmentIndex
+                Me.mSelected(i) = (i = value And Me.SelectionStyle <> SegmentSelectionStyle.None)
+            Next
+            Me.RefreshNative()
+        End Set
+    End Property
+
+    Private Sub CheckIndex(index As Integer)
+        If index < 0 Or index >= Me.SegmentCount Then Throw New OutOfBoundsException("Invalid segment index")
+    End Sub
+    Public Function CaptionAt(index As Integer) As String
+        Me.CheckIndex(index)
+        Return Me.mCaptions(index)
+    End Function
+    Public Sub SetCaptionAt(index As Integer, caption As String)
+        Me.CheckIndex(index)
+        Me.mCaptions(index) = caption
+        Me.RefreshNative()
+    End Sub
+    Public Function IsSelected(index As Integer) As Boolean
+        Me.CheckIndex(index)
+        Return Me.mSelected(index)
+    End Function
+    Public Sub SetSelected(index As Integer, selected As Boolean)
+        Me.CheckIndex(index)
+        If selected And Me.SelectionStyle = SegmentSelectionStyle.Single Then
+            Me.SelectedSegmentIndex = index
+            Return
+        End If
+        Me.mSelected(index) = selected And Me.SelectionStyle <> SegmentSelectionStyle.None
+        Me.RefreshNative()
+    End Sub
+    Public Function SegmentEnabled(index As Integer) As Boolean
+        Me.CheckIndex(index)
+        Return Me.mEnabled(index)
+    End Function
+    Public Sub SetSegmentEnabled(index As Integer, enabled As Boolean)
+        Me.CheckIndex(index)
+        Me.mEnabled(index) = enabled
+        Me.RefreshNative()
+    End Sub
+    Public Sub AddSegment(caption As String)
+        Me.AddSegmentAt(Me.SegmentCount, caption)
+    End Sub
+    Public Sub AddSegmentAt(index As Integer, caption As String)
+        If index < 0 Or index > Me.SegmentCount Then Throw New OutOfBoundsException("Invalid insertion index")
+        Array.Insert(Me.mCaptions, index, caption)
+        Array.Insert(Me.mSelected, index, False)
+        Array.Insert(Me.mEnabled, index, True)
+        Me.Rebuild()
+    End Sub
+    Public Sub RemoveSegmentAt(index As Integer)
+        Me.CheckIndex(index)
+        Array.RemoveAt(Me.mCaptions, index)
+        Array.RemoveAt(Me.mSelected, index)
+        Array.RemoveAt(Me.mEnabled, index)
+        Me.Rebuild()
+    End Sub
+    Public Sub RemoveAllSegments()
+        Array.Clear(Me.mCaptions)
+        Array.Clear(Me.mSelected)
+        Array.Clear(Me.mEnabled)
+        Me.Rebuild()
+    End Sub
+    ' Programmatic activation shares the native event's selection contract.
+    Public Sub Press(index As Integer)
+        Me.CheckIndex(index)
+        If Not Me.Enabled Or Not Me.Visible Or Not Me.mEnabled(index) Then Return
+        If Me.SelectionStyle = SegmentSelectionStyle.Single Then
+            Me.SelectedSegmentIndex = index
+        ElseIf Me.SelectionStyle = SegmentSelectionStyle.Multiple Then
+            Me.mSelected(index) = Not Me.mSelected(index)
+        End If
+        Me.RefreshNative()
+        RaiseEvent Pressed(index)
+    End Sub
+
+    ' Call after attaching this View to its Window (Windows creates HWNDs lazily).
+    Public Sub Open()
+        If Me.mHostDestroyed Then Throw New InvalidArgumentException("Native SegmentedButton host destroyed; create a new control")
+        Me.Close()
+        Me.LastNativeError = ""
+        Me.mHost = Me.NativeWidget
+        If Me.mHost = Nil Then Throw New InvalidArgumentException("Attach SegmentedButton to a window before Open")
+        For i As Integer = 0 To Array.LastIndex(SegmentRegistry.Items)
+            If SegmentRegistry.Items(i).Owner = Nil Then
+                Me.mID = i
+                Exit For
+            End If
+        Next
+        If Me.mID < 0 Then
+            Me.mID = Array.Count(SegmentRegistry.Items)
+            Array.Append(SegmentRegistry.Items, New SegmentReference())
+        End If
+        SegmentRegistry.Items(Me.mID).Owner = Me
+        Try
+            #If TargetWindows Then
+                If NativeSubclass(Me.mHost, AddressOf SegmentWindowsMessage, Me.mID + 1, 0) = 0 Then Throw New RuntimeException("Could not bind segment container")
+            #End If
+            Me.BuildNative()
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Public Sub Close()
+        If Me.mID < 0 Then Return
+        SegmentRegistry.Items(Me.mID).Owner = Nil
+        Me.DestroyNative()
+        #If TargetWindows Then
+            NativeUnsubclass(Me.mHost, AddressOf SegmentWindowsMessage, Me.mID + 1)
+        #End If
+        Me.mHost = Nil
+        Me.mID = -1
+    End Sub
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+    Private Sub Rebuild()
+        If Me.mID < 0 Then Return
+        Me.DestroyNative()
+        Try
+            Me.BuildNative()
+        Catch e As Exception
+            ' A partial native build must not remain bound to an inconsistent model.
+            Me.Close()
+            Throw e
+        End Try
+    End Sub
+    Private Sub DestroyNative()
+        Me.mUpdating = True
+        #If TargetLinux Then
+            If Me.mRoot <> Nil Then
+                Dim parent As Ptr = NativeParent(Me.mRoot)
+                If parent <> Nil Then NativeFixedRemove(parent, Me.mRoot)
+                NativeUnref(Me.mRoot)
+            End If
+        #ElseIf TargetWindows Then
+            For Each button As Ptr In Me.mButtons
+                NativeDestroy(button)
+            Next
+        #ElseIf TargetMac Then
+            If Me.mRoot <> Nil Then
+                NativeTarget(Me.mRoot, Nil)
+                NativeRemove(Me.mRoot)
+                NativeRelease(Me.mRoot)
+            End If
+        #End If
+        Me.mRoot = Nil
+        Array.Clear(Me.mButtons)
+        Me.mUpdating = False
+    End Sub
+    Private Sub BuildNative()
+        Me.mUpdating = True
+        #If TargetLinux Then
+            Me.mRoot = NativeBox(0, 0)
+            NativeRefSink(Me.mRoot)
+            NativeCSS(Me.mRoot, "linked")
+            NativeHomogeneous(Me.mRoot, 1)
+            NativeFixedPut(Me.mHost, Me.mRoot, 0, 0)
+            For i As Integer = 0 To Me.LastSegmentIndex
+                Dim button As Ptr
+                If Me.SelectionStyle = SegmentSelectionStyle.None Then
+                    button = NativeButton(Me.mCaptions(i))
+                Else
+                    button = NativeToggle(Me.mCaptions(i))
+                    If Me.SelectionStyle = SegmentSelectionStyle.Single And i > 0 Then NativeGroup(button, Me.mButtons(0))
+                End If
+                Array.Append(Me.mButtons, button)
+                NativeBoxAppend(Me.mRoot, button)
+                NativeConnect(button, "clicked", AddressOf SegmentLinuxClicked, CType(Me.mID + 1, Ptr), Nil, 0)
+            Next
+        #ElseIf TargetWindows Then
+            Dim cls As Bytes = "BUTTON".AsUTF16LE()
+            cls.Append(0)
+            cls.Append(0)
+            For i As Integer = 0 To Me.LastSegmentIndex
+                Dim caption As Bytes = Me.mCaptions(i).AsUTF16LE()
+                caption.Append(0)
+                caption.Append(0)
+                ' Native pushlike radios/check boxes; ordinary buttons in momentary mode.
+                Dim style As Integer = 1342242816 ' WS_CHILD | WS_VISIBLE | WS_TABSTOP
+                If i = 0 Then style += 131072 ' WS_GROUP
+                If Me.SelectionStyle = SegmentSelectionStyle.Single Then style += 4100
+                If Me.SelectionStyle = SegmentSelectionStyle.Multiple Then style += 4098
+                Dim button As Ptr = NativeCreate(0, cls.DataPtr(), caption.DataPtr(), style, 0, 0, 1, 1, Me.mHost, CType(i + 1, Ptr), Nil, Nil)
+                If button = Nil Then Throw New RuntimeException("Could not create native segment")
+                Array.Append(Me.mButtons, button)
+                NativeSend(button, 48, NativeStockFont(17), 1) ' WM_SETFONT / DEFAULT_GUI_FONT
+            Next
+        #ElseIf TargetMac Then
+            Dim cls As Ptr = SegmentMacClass()
+            Me.mRoot = NativeInit(NativeAlloc(cls))
+            NativeCount(Me.mRoot, Me.SegmentCount)
+            NativeTarget(Me.mRoot, Me.mRoot)
+            NativeAction(Me.mRoot, NativeSelector("buoySegmentPressed:"))
+            NativeAddSubview(Me.mHost, Me.mRoot)
+            NativeAutoresizing(Me.mRoot, 18) ' width + height
+        #End If
+        Me.mUpdating = False
+        Me.RefreshNative()
+    End Sub
+    ' Call after resizing through Move or layout constraints. No polling timer.
+    Public Sub RefreshNative()
+        If Me.mID < 0 Then Return
+        Me.mUpdating = True
+        #If TargetLinux Then
+            NativeSize(Me.mRoot, Me.Width, Me.Height)
+        #ElseIf TargetMac Then
+            NativeTracking(NativeCell(Me.mRoot), CType(Me.SelectionStyle, Integer))
+            Dim frame As SegmentRect
+            frame.X = 0
+            frame.Y = 0
+            frame.Width = Me.Width
+            frame.Height = Me.Height
+            NativeFrame(Me.mRoot, frame)
+        #End If
+        For i As Integer = 0 To Me.LastSegmentIndex
+            #If TargetLinux Then
+                NativeLabel(Me.mButtons(i), Me.mCaptions(i))
+                If Me.SelectionStyle <> SegmentSelectionStyle.None Then NativeActive(Me.mButtons(i), CType(Me.mSelected(i), Int32))
+                NativeSensitive(Me.mButtons(i), CType(Me.mEnabled(i) And Me.Enabled, Int32))
+            #ElseIf TargetWindows Then
+                Dim caption As Bytes = Me.mCaptions(i).AsUTF16LE()
+                caption.Append(0)
+                caption.Append(0)
+                NativeText(Me.mButtons(i), caption.DataPtr())
+                NativeSend(Me.mButtons(i), 241, CType(Me.mSelected(i), Integer), 0) ' BM_SETCHECK
+                NativeEnable(Me.mButtons(i), CType(Me.mEnabled(i) And Me.Enabled, Int32))
+                Dim scale As Double = NativeDPI(Me.mHost) / 96.0
+                Dim left As Integer = i * Me.Width * scale / Me.SegmentCount
+                Dim right As Integer = (i + 1) * Me.Width * scale / Me.SegmentCount
+                Dim height As Integer = Me.Height * scale
+                NativeMove(Me.mButtons(i), left, 0, right - left, height, 1)
+            #ElseIf TargetMac Then
+                NativeSegmentLabel(Me.mRoot, NativeString(NativeClass("NSString"), Me.mCaptions(i)), i)
+                NativeSegmentSelected(Me.mRoot, Me.mSelected(i), i)
+                NativeSegmentEnabled(Me.mRoot, Me.mEnabled(i) And Me.Enabled, i)
+                NativeSegmentWidth(Me.mRoot, (Me.Width * 1.0) / Me.SegmentCount, i)
+            #End If
+        Next
+        Me.mUpdating = False
+    End Sub
+    ' Windows sends WM_NCDESTROY even when an application omits explicit Close.
+    ' Forget child HWNDs before Windows can recycle their handle values.
+    Public Sub NativeHostDestroyed(widget As Ptr)
+        #If TargetWindows Then
+            If Me.mHost <> widget Or Me.mID < 0 Then Return
+            Me.mHostDestroyed = True
+            SegmentRegistry.Items(Me.mID).Owner = Nil
+            Array.Clear(Me.mButtons)
+            Me.mHost = Nil
+            Me.mID = -1
+            Me.mUpdating = False
+        #End If
+    End Sub
+
+    ' Callback entry, exceptions are contained before returning to the OS.
+    Public Sub NativePressed(widget As Ptr, index As Integer = -1)
+        If Me.mUpdating Or Me.mID < 0 Then Return
+        #If TargetMac Then
+            If widget <> Me.mRoot Then Return
+        #End If
+        Try
+            #If TargetMac Then
+                index = NativeSelected(Me.mRoot)
+            #Else
+                Dim nativeIndex As Integer = -1
+                For i As Integer = 0 To Array.LastIndex(Me.mButtons)
+                    If Me.mButtons(i) = widget Then nativeIndex = i
+                Next
+                ' Reject stale/foreign native children, including explicitly supplied indices.
+                If nativeIndex < 0 Or (index >= 0 And index <> nativeIndex) Then Return
+                index = nativeIndex
+            #End If
+            If index >= 0 And index < Me.SegmentCount Then
+                If Not Me.Enabled Or Not Me.Visible Or Not Me.mEnabled(index) Then
+                    ' A synthetic native activation can toggle an insensitive GTK button.
+                    ' Restore the model instead of leaving its native state divergent.
+                    Me.RefreshNative()
+                    Return
+                End If
+                Me.Press(index)
+            End If
+        Catch e As Exception
+            Me.LastNativeError = e.Message
+        End Try
+    End Sub
+End Class
+
+Private Function SegmentOwner(data As Ptr) As SegmentedButton
+    Dim index As Integer = CType(data, Integer) - 1
+    If index < 0 Or index >= Array.Count(SegmentRegistry.Items) Then Return Nil
+    Return SegmentRegistry.Items(index).Owner
+End Function
+
+#If TargetLinux Then
+Delegate Sub SegmentLinuxCallback(widget As Ptr, data As Ptr)
+Private Optional Declare Function NativeRefSink Lib "libgobject-2.0.so.0" Alias "g_object_ref_sink" (widget As Ptr) As Ptr
+Private Optional Declare Sub NativeUnref Lib "libgobject-2.0.so.0" Alias "g_object_unref" (widget As Ptr)
+Private Optional Declare Function NativeParent Lib "libgtk-4.so.1" Alias "gtk_widget_get_parent" (widget As Ptr) As Ptr
+Private Optional Declare Function NativeBox Lib "libgtk-4.so.1" Alias "gtk_box_new" (orientation As Int32, spacing As Int32) As Ptr
+Private Optional Declare Sub NativeCSS Lib "libgtk-4.so.1" Alias "gtk_widget_add_css_class" (widget As Ptr, name As String)
+Private Optional Declare Sub NativeHomogeneous Lib "libgtk-4.so.1" Alias "gtk_box_set_homogeneous" (widget As Ptr, enabled As Int32)
+Private Optional Declare Sub NativeFixedPut Lib "libgtk-4.so.1" Alias "gtk_fixed_put" (host As Ptr, widget As Ptr, x As Double, y As Double)
+Private Optional Declare Sub NativeFixedRemove Lib "libgtk-4.so.1" Alias "gtk_fixed_remove" (host As Ptr, widget As Ptr)
+Private Optional Declare Function NativeButton Lib "libgtk-4.so.1" Alias "gtk_button_new_with_label" (caption As String) As Ptr
+Private Optional Declare Sub NativeGroup Lib "libgtk-4.so.1" Alias "gtk_toggle_button_set_group" (button As Ptr, group As Ptr)
+Private Optional Declare Function NativeToggle Lib "libgtk-4.so.1" Alias "gtk_toggle_button_new_with_label" (caption As String) As Ptr
+Private Optional Declare Sub NativeBoxAppend Lib "libgtk-4.so.1" Alias "gtk_box_append" (host As Ptr, widget As Ptr)
+Private Optional Declare Sub NativeSize Lib "libgtk-4.so.1" Alias "gtk_widget_set_size_request" (widget As Ptr, width As Int32, height As Int32)
+Private Optional Declare Sub NativeLabel Lib "libgtk-4.so.1" Alias "gtk_button_set_label" (widget As Ptr, caption As String)
+Private Optional Declare Sub NativeActive Lib "libgtk-4.so.1" Alias "gtk_toggle_button_set_active" (widget As Ptr, active As Int32)
+Private Optional Declare Sub NativeSensitive Lib "libgtk-4.so.1" Alias "gtk_widget_set_sensitive" (widget As Ptr, enabled As Int32)
+Private Optional Declare Function NativeConnect Lib "libgobject-2.0.so.0" Alias "g_signal_connect_data" (widget As Ptr, signal As String, callback As SegmentLinuxCallback, data As Ptr, destroy As Ptr, connectFlags As Int32) As UInt64
+Private Sub SegmentLinuxClicked(widget As Ptr, data As Ptr)
+    Dim owner As SegmentedButton = SegmentOwner(data)
+    If owner <> Nil Then owner.NativePressed(widget)
+End Sub
+#ElseIf TargetWindows Then
+Delegate Function SegmentWindowsCallback(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+Private Optional Declare Function NativeSubclass Lib "comctl32" Alias "SetWindowSubclass" (widget As Ptr, callback As SegmentWindowsCallback, id As UInt64, data As UInt64) As Int32
+Private Optional Declare Function NativeUnsubclass Lib "comctl32" Alias "RemoveWindowSubclass" (widget As Ptr, callback As SegmentWindowsCallback, id As UInt64) As Int32
+Private Optional Declare Function NativeDefault Lib "comctl32" Alias "DefSubclassProc" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function NativeCreate Lib "user32" Alias "CreateWindowExW" (extended As UInt32, cls As Ptr, title As Ptr, style As UInt32, x As Int32, y As Int32, width As Int32, height As Int32, parent As Ptr, menu As Ptr, instance As Ptr, parameter As Ptr) As Ptr
+Private Optional Declare Function NativeDestroy Lib "user32" Alias "DestroyWindow" (widget As Ptr) As Int32
+Private Optional Declare Function NativeSend Lib "user32" Alias "SendMessageW" (widget As Ptr, message As UInt32, word As UInt64, param As Int64) As Int64
+Private Optional Declare Function NativeText Lib "user32" Alias "SetWindowTextW" (widget As Ptr, caption As Ptr) As Int32
+Private Optional Declare Function NativeEnable Lib "user32" Alias "EnableWindow" (widget As Ptr, enabled As Int32) As Int32
+Private Optional Declare Function NativeMove Lib "user32" Alias "MoveWindow" (widget As Ptr, x As Int32, y As Int32, width As Int32, height As Int32, repaint As Int32) As Int32
+Private Optional Declare Function NativeDPI Lib "user32" Alias "GetDpiForWindow" (widget As Ptr) As UInt32
+Private Optional Declare Function NativeStockFont Lib "gdi32" Alias "GetStockObject" (index As Int32) As UInt64
+Private Function SegmentWindowsMessage(widget As Ptr, message As UInt32, word As UInt64, param As Int64, id As UInt64, data As UInt64) As Int64
+    Dim callbackID As Integer = id
+    Dim owner As SegmentedButton = SegmentOwner(CType(callbackID, Ptr))
+    If message = 130 Then ' WM_NCDESTROY: native parent destruction invalidates all child handles.
+        NativeUnsubclass(widget, AddressOf SegmentWindowsMessage, id)
+        If owner <> Nil Then owner.NativeHostDestroyed(widget)
+    ElseIf message = 273 And param <> 0 And (word >> 16) = 0 Then ' WM_COMMAND / BN_CLICKED
+        Dim senderAddress As Integer = param
+        If owner <> Nil Then owner.NativePressed(CType(senderAddress, Ptr))
+    End If
+    Return NativeDefault(widget, message, word, param)
+End Function
+#ElseIf TargetMac Then
+Sequential Structure SegmentRect
+    X As Double
+    Y As Double
+    Width As Double
+    Height As Double
+End Structure
+Delegate Sub SegmentMacAction(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+Private Declare Function NativeClass Lib "objc" Alias "objc_getClass" (name As String) As Ptr
+Private Declare Function NativeAllocateClass Lib "objc" Alias "objc_allocateClassPair" (parent As Ptr, name As String, extra As Integer) As Ptr
+Private Declare Sub NativeRegisterClass Lib "objc" Alias "objc_registerClassPair" (cls As Ptr)
+Private Declare Function NativeAddMethod Lib "objc" Alias "class_addMethod" (cls As Ptr, methodSelector As Ptr, callback As Ptr, encoding As String) As UInt8
+Private Declare Function NativeSelector Lib "objc" Alias "sel_registerName" (name As String) As Ptr
+Private Declare Function NativeAlloc Lib "AppKit" Selector "alloc" (cls As Ptr) As Ptr
+Private Declare Function NativeInit Lib "AppKit" Selector "init" (widget As Ptr) As Ptr
+Private Declare Sub NativeRelease Lib "AppKit" Selector "release" (widget As Ptr)
+Private Declare Sub NativeRemove Lib "AppKit" Selector "removeFromSuperview" (widget As Ptr)
+Private Declare Sub NativeAddSubview Lib "AppKit" Selector "addSubview:" (host As Ptr, widget As Ptr)
+Private Declare Sub NativeAutoresizing Lib "AppKit" Selector "setAutoresizingMask:" (widget As Ptr, mask As Integer)
+Private Declare Sub NativeCount Lib "AppKit" Selector "setSegmentCount:" (widget As Ptr, count As Integer)
+Private Declare Function NativeCell Lib "AppKit" Selector "cell" (widget As Ptr) As Ptr
+Private Declare Sub NativeTracking Lib "AppKit" Selector "setTrackingMode:" (cell As Ptr, mode As Integer)
+Private Declare Sub NativeFrame Lib "AppKit" Selector "setFrame:" (widget As Ptr, frame As SegmentRect)
+Private Declare Sub NativeSegmentLabel Lib "AppKit" Selector "setLabel:forSegment:" (widget As Ptr, caption As Ptr, index As Integer)
+Private Declare Sub NativeSegmentSelected Lib "AppKit" Selector "setSelected:forSegment:" (widget As Ptr, selected As Boolean, index As Integer)
+Private Declare Sub NativeSegmentEnabled Lib "AppKit" Selector "setEnabled:forSegment:" (widget As Ptr, enabled As Boolean, index As Integer)
+Private Declare Sub NativeSegmentWidth Lib "AppKit" Selector "setWidth:forSegment:" (widget As Ptr, width As Double, index As Integer)
+Private Declare Function NativeSelected Lib "AppKit" Selector "selectedSegment" (widget As Ptr) As Integer
+Private Declare Function NativeString Lib "Foundation" Selector "stringWithUTF8String:" (cls As Ptr, value As String) As Ptr
+Private Declare Sub NativeTarget Lib "AppKit" Selector "setTarget:" (widget As Ptr, target As Ptr)
+Private Declare Sub NativeAction Lib "AppKit" Selector "setAction:" (widget As Ptr, methodSelector As Ptr)
+Private Function SegmentMacClass() As Ptr
+    Dim cls As Ptr = NativeClass("BuoyStandaloneSegmentedControl")
+    If cls <> Nil Then Return cls
+    cls = NativeAllocateClass(NativeClass("NSSegmentedControl"), "BuoyStandaloneSegmentedControl", 0)
+    If cls = Nil Then Throw New RuntimeException("Could not allocate segmented control class")
+    Dim callback As SegmentMacAction = AddressOf SegmentMacPressed
+    If NativeAddMethod(cls, NativeSelector("buoySegmentPressed:"), CType(callback, Ptr), "v@:@") = 0 Then Throw New RuntimeException("Could not install segment action")
+    NativeRegisterClass(cls)
+    Return cls
+End Function
+Private Sub SegmentMacPressed(receiver As Ptr, methodSelector As Ptr, sender As Ptr)
+    For Each reference As SegmentReference In SegmentRegistry.Items
+        Dim owner As SegmentedButton = reference.Owner
+        If owner <> Nil Then owner.NativePressed(receiver)
+    Next
+End Sub
+#End If
