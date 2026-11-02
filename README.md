@@ -1,4 +1,4 @@
-# Canvas- and View-based native controls — Cocoa, GTK, Win32
+# Canvas and View native controls
 
 This collection adds reusable Canvas- and View-based controls and desktop adapters built on Cocoa,
 GTK and Win32 APIs. Use them when an application needs native behavior beyond
