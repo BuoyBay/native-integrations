@@ -34,12 +34,4 @@ For Linux UI-bridge lifecycle requirements, use the
 platform libraries and desktop sessions remain requirements of the relevant
 component rather than dependencies of every application using this collection.
 
-## Local Buoy setup
-
-On your own machine, install Buoy and run:
-
-```sh
-buoy ai init --both
-```
-
 [Contributing](CONTRIBUTING.md) · [License](LICENSE)
